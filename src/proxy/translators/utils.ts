@@ -273,7 +273,7 @@ export function normalizeToolArgs(
 
   const config = TOOL_PARAM_NORMALIZATION[name];
   if (!config) {
-    return applyUniversalPathFallback(args);
+    return args;
   }
 
   const normalized: Record<string, unknown> = {};

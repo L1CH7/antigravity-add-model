@@ -259,7 +259,7 @@ function normalizeToolArgs(name, args) {
     }
     const config = TOOL_PARAM_NORMALIZATION[name];
     if (!config) {
-        return applyUniversalPathFallback(args);
+        return args;
     }
     const normalized = {};
     const usedKeys = new Set();
