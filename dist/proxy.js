@@ -348,7 +348,11 @@ function handleCustomModelRequest(res, model, geminiBody, isStream, retryCount =
     const payload = registry.translateRequest(provider, geminiBody, model.externalModelName);
     const headers = registry.getProviderHeaders(provider, model.apiKey);
     if (isStream && registry.supportsStreaming(provider)) {
-        payload.stream = true;
+        // Only OpenAI-compatible providers expect "stream: true" inside JSON payload.
+        // Google AI Studio native endpoints reject "stream" field (streaming is determined by :streamGenerateContent URL method).
+        if (provider !== "google") {
+            payload.stream = true;
+        }
     }
     let finalUrlStr = model.apiUrl;
     // P3-15: Google AI Studio uses dynamic URL construction for streaming vs non-streaming

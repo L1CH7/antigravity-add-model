@@ -29,6 +29,7 @@ interface GeminiCandidate {
   finishReason?: string;
   index?: number;
   safetyRatings?: unknown[];
+  groundingMetadata?: unknown;
 }
 
 interface GeminiStreamChunk {
@@ -108,6 +109,7 @@ export function mapGoogleChunkToGemini(chunk: unknown, _modelName: string): Gemi
         content: { parts: [], role: 'model' },
         finishReason: candidate.finishReason,
         index: candidate.index ?? 0,
+        groundingMetadata: candidate.groundingMetadata,
       };
     }
     return null;
@@ -118,6 +120,7 @@ export function mapGoogleChunkToGemini(chunk: unknown, _modelName: string): Gemi
     finishReason: candidate.finishReason || 'OTHER',
     index: candidate.index ?? 0,
     safetyRatings: candidate.safetyRatings,
+    groundingMetadata: candidate.groundingMetadata,
   };
 }
 
@@ -151,7 +154,7 @@ export function getGoogleApiUrl(baseUrl: string, modelName: string, isStream: bo
     } else if (modelName) {
       // Append full path with model name
       const method = isStream ? ':streamGenerateContent' : ':generateContent';
-      url += `models/${modelName}${method}`;
+      url += `/models/${modelName}${method}`; // Added leading slash to prevent /v1betamodels 404
     } else {
       // Fallback: assume the URL is already complete
       log.warn('[GoogleTranslator] Could not determine model name for URL construction');

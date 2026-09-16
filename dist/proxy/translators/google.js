@@ -64,6 +64,7 @@ function mapGoogleChunkToGemini(chunk, _modelName) {
                 content: { parts: [], role: 'model' },
                 finishReason: candidate.finishReason,
                 index: candidate.index ?? 0,
+                groundingMetadata: candidate.groundingMetadata,
             };
         }
         return null;
@@ -73,6 +74,7 @@ function mapGoogleChunkToGemini(chunk, _modelName) {
         finishReason: candidate.finishReason || 'OTHER',
         index: candidate.index ?? 0,
         safetyRatings: candidate.safetyRatings,
+        groundingMetadata: candidate.groundingMetadata,
     };
 }
 // ─── URL Helpers ──────────────────────────────────────────────────────────
@@ -102,7 +104,7 @@ function getGoogleApiUrl(baseUrl, modelName, isStream) {
         else if (modelName) {
             // Append full path with model name
             const method = isStream ? ':streamGenerateContent' : ':generateContent';
-            url += `models/${modelName}${method}`;
+            url += `/models/${modelName}${method}`; // Added leading slash to prevent /v1betamodels 404
         }
         else {
             // Fallback: assume the URL is already complete

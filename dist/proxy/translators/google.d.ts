@@ -34,6 +34,7 @@ interface GeminiCandidate {
     finishReason?: string;
     index?: number;
     safetyRatings?: unknown[];
+    groundingMetadata?: unknown;
 }
 interface GeminiRequestBody {
     model?: string;
