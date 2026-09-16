@@ -3,39 +3,6 @@
  * Shared translator utility functions.
  * Extracted from proxy.js to avoid duplication across translator modules.
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -44,7 +11,6 @@ exports.normalizeToolArgs = normalizeToolArgs;
 exports.fixParamTypes = fixParamTypes;
 exports.translateToolCallToNative = translateToolCallToNative;
 exports.formatTranslatedResponse = formatTranslatedResponse;
-const path = __importStar(require("path"));
 const electron_log_1 = __importDefault(require("electron-log"));
 // ─── Tool Parameter Normalization ──────────────────────────────────────────
 const TOOL_PARAM_NORMALIZATION = {
@@ -385,77 +351,8 @@ function fixParamTypes(properties) {
  * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
  */
 function translateToolCallToNative(name, args) {
-    if (name !== 'run_command' || !args || !args.CommandLine) {
-        return { name, args: args };
-    }
-    const cmd = args.CommandLine.trim();
-    const cwd = args.Cwd || process.cwd();
-    // 1. list_dir translation
-    const isListDir = /^(ls|dir)(\s+[\w\-\/\.\*]+)*$/i.test(cmd);
-    if (isListDir) {
-        let dirPath = cwd;
-        const tokens = cmd.split(/\s+/).slice(1);
-        const pathToken = tokens.find((t) => !t.startsWith('-') && !t.startsWith('/'));
-        if (pathToken) {
-            dirPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-        }
-        electron_log_1.default.info(`[Proxy] Translating run_command "${cmd}" to list_dir on "${dirPath}"`);
-        return { name: 'list_dir', args: { DirectoryPath: dirPath } };
-    }
-    // 2. view_file translation
-    const catMatch = /^(cat|type)\s+(["']?)(.*?)\2$/i.exec(cmd);
-    if (catMatch) {
-        const filePath = catMatch[3].trim();
-        const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-        electron_log_1.default.info(`[Proxy] Translating run_command "${cmd}" to view_file on "${absPath}"`);
-        return { name: 'view_file', args: { AbsolutePath: absPath } };
-    }
-    // 2b. write_file translation (echo redirect)
-    const echoRedirectMatch = /^(echo|printf)\s+(.+?)\s*>\s*(.+)$/i.exec(cmd);
-    if (echoRedirectMatch) {
-        const content = echoRedirectMatch[2].replace(/^["']|["']$/g, '');
-        const filePath = echoRedirectMatch[3].trim();
-        const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-        electron_log_1.default.info(`[Proxy] Translating run_command "${cmd}" to write_file on "${absPath}"`);
-        return { name: 'write_file', args: { AbsolutePath: absPath, Content: content, Append: cmd.includes('>>') } };
-    }
-    // 3. grep_search translation
-    if (cmd.toLowerCase().startsWith('grep') || cmd.toLowerCase().startsWith('findstr')) {
-        let query = '';
-        let searchPath = cwd;
-        const regexQuotes = /"([^"]+)"|'([^']+)'/g;
-        const quotesFound = [...cmd.matchAll(regexQuotes)];
-        if (quotesFound.length > 0) {
-            query = quotesFound[0][1] || quotesFound[0][2];
-        }
-        else {
-            const tokens = cmd.split(/\s+/);
-            query = tokens[tokens.length - 1];
-        }
-        const tokens = cmd.split(/\s+/);
-        const pathToken = tokens.find((t, idx) => idx > 0 && !t.startsWith('-') && !t.startsWith('/') && !t.includes('"') && !t.includes("'") && t !== query);
-        if (pathToken) {
-            searchPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-        }
-        if (query) {
-            electron_log_1.default.info(`[Proxy] Translating run_command "${cmd}" to grep_search (Query: "${query}", Path: "${searchPath}")`);
-            return {
-                name: 'grep_search',
-                args: {
-                    Query: query,
-                    SearchPath: searchPath,
-                    CaseInsensitive: cmd.includes('-i') || cmd.toLowerCase().includes('/i'),
-                    IsRegex: false,
-                    MatchPerLine: true,
-                },
-            };
-        }
-    }
     return { name, args: args };
 }
-/**
- * Formats native file tool outputs (JSON/Array) back into standard textual command-line outputs.
- */
 function formatTranslatedResponse(translatedInfo, responseData) {
     const { translatedName, cmd } = translatedInfo;
     electron_log_1.default.info(`[Proxy] Formatting native response back to CLI for translated tool "${translatedName}" (Cmd: "${cmd}")`);

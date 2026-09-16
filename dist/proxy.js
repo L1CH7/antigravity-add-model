@@ -853,7 +853,7 @@ function handleRequest(req, res) {
         return;
     }
     // P0-4: Enforce maximum request body size to prevent memory exhaustion DoS
-    const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+    const MAX_BODY_SIZE = 150 * 1024 * 1024; // 150 MB (Support large Agentic workspaces/indices)
     let bodyLength = 0;
     let bodyRejected = false;
     const bodyChunks = [];

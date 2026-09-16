@@ -418,86 +418,9 @@ export function fixParamTypes(properties: Record<string, unknown> | undefined): 
  * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
  */
 export function translateToolCallToNative(name: string, args: ToolCallArgs): TranslatedToolCall {
-  if (name !== 'run_command' || !args || !args.CommandLine) {
-    return { name, args: args as Record<string, unknown> };
-  }
-
-  const cmd = args.CommandLine.trim();
-  const cwd = args.Cwd || process.cwd();
-
-  // 1. list_dir translation
-  const isListDir = /^(ls|dir)(\s+[\w\-\/\.\*]+)*$/i.test(cmd);
-  if (isListDir) {
-    let dirPath = cwd;
-    const tokens = cmd.split(/\s+/).slice(1);
-    const pathToken = tokens.find((t) => !t.startsWith('-') && !t.startsWith('/'));
-    if (pathToken) {
-      dirPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-    }
-    log.info(`[Proxy] Translating run_command "${cmd}" to list_dir on "${dirPath}"`);
-    return { name: 'list_dir', args: { DirectoryPath: dirPath } };
-  }
-
-  // 2. view_file translation
-  const catMatch = /^(cat|type)\s+(["']?)(.*?)\2$/i.exec(cmd);
-  if (catMatch) {
-    const filePath = catMatch[3].trim();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-    log.info(`[Proxy] Translating run_command "${cmd}" to view_file on "${absPath}"`);
-    return { name: 'view_file', args: { AbsolutePath: absPath } };
-  }
-
-  // 2b. write_file translation (echo redirect)
-  const echoRedirectMatch = /^(echo|printf)\s+(.+?)\s*>\s*(.+)$/i.exec(cmd);
-  if (echoRedirectMatch) {
-    const content = echoRedirectMatch[2].replace(/^["']|["']$/g, '');
-    const filePath = echoRedirectMatch[3].trim();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-    log.info(`[Proxy] Translating run_command "${cmd}" to write_file on "${absPath}"`);
-    return { name: 'write_file', args: { AbsolutePath: absPath, Content: content, Append: cmd.includes('>>') } };
-  }
-
-  // 3. grep_search translation
-  if (cmd.toLowerCase().startsWith('grep') || cmd.toLowerCase().startsWith('findstr')) {
-    let query = '';
-    let searchPath = cwd;
-    const regexQuotes = /"([^"]+)"|'([^']+)'/g;
-    const quotesFound = [...cmd.matchAll(regexQuotes)];
-    if (quotesFound.length > 0) {
-      query = quotesFound[0][1] || quotesFound[0][2];
-    } else {
-      const tokens = cmd.split(/\s+/);
-      query = tokens[tokens.length - 1];
-    }
-    const tokens = cmd.split(/\s+/);
-    const pathToken = tokens.find(
-      (t, idx) =>
-        idx > 0 && !t.startsWith('-') && !t.startsWith('/') && !t.includes('"') && !t.includes("'") && t !== query,
-    );
-    if (pathToken) {
-      searchPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-    }
-    if (query) {
-      log.info(`[Proxy] Translating run_command "${cmd}" to grep_search (Query: "${query}", Path: "${searchPath}")`);
-      return {
-        name: 'grep_search',
-        args: {
-          Query: query,
-          SearchPath: searchPath,
-          CaseInsensitive: cmd.includes('-i') || cmd.toLowerCase().includes('/i'),
-          IsRegex: false,
-          MatchPerLine: true,
-        },
-      };
-    }
-  }
-
   return { name, args: args as Record<string, unknown> };
 }
 
-/**
- * Formats native file tool outputs (JSON/Array) back into standard textual command-line outputs.
- */
 export function formatTranslatedResponse(translatedInfo: TranslatedCallInfo, responseData: unknown): string {
   const { translatedName, cmd } = translatedInfo;
   log.info(`[Proxy] Formatting native response back to CLI for translated tool "${translatedName}" (Cmd: "${cmd}")`);

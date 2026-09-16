@@ -53,8 +53,5 @@ export declare function fixParamTypes(properties: Record<string, unknown> | unde
  * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
  */
 export declare function translateToolCallToNative(name: string, args: ToolCallArgs): TranslatedToolCall;
-/**
- * Formats native file tool outputs (JSON/Array) back into standard textual command-line outputs.
- */
 export declare function formatTranslatedResponse(translatedInfo: TranslatedCallInfo, responseData: unknown): string;
 //# sourceMappingURL=utils.d.ts.map
