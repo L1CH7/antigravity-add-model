@@ -67,13 +67,13 @@ const listen_1 = require("./proxy/listen");
 const cryptoStore = require('./cryptoStore');
 // ─── Model Helpers ────────────────────────────────────────────────────────
 function generateModelPlaceholderId(model) {
-    const input = (model.displayName || model.name || 'custom-model').toLowerCase();
+    const input = `${model.externalModelName || model.name || ""}:${model.displayName || ""}`.toLowerCase();
     let hash = 5381;
     for (let i = 0; i < input.length; i++) {
         hash = (hash << 5) + hash + input.charCodeAt(i);
         hash = hash & hash; // Force 32-bit integer
     }
-    const placeholderNum = 400 + (Math.abs(hash) % 200);
+    const placeholderNum = 400 + (Math.abs(hash) % 500);
     return `MODEL_PLACEHOLDER_M${placeholderNum}`;
 }
 function getCustomModelsPath() {

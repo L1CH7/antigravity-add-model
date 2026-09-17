@@ -1202,7 +1202,7 @@ window.addEventListener('DOMContentLoaded', () => {
                     maxTokens: 1048576,
                     maxOutputTokens: 4096,
                     tokenizerType: 'LLAMA_WITH_SPECIAL',
-                    model: 'MODEL_PLACEHOLDER_M' + (400 + (Math.abs(hashCodeStr(m.displayName || m.name || '') as number) % 200)),
+                    model: 'MODEL_PLACEHOLDER_M' + (400 + (Math.abs(hashCodeStr(`${(m.externalModelName || m.name || '')}:${(m.displayName || '')}`) as number) % 500)),
                     apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                     modelProvider: 'MODEL_PROVIDER_GOOGLE',
                   };
@@ -1250,7 +1250,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 maxTokens: 1048576,
                 maxOutputTokens: 4096,
                 tokenizerType: 'LLAMA_WITH_SPECIAL',
-                model: 'MODEL_PLACEHOLDER_M' + (400 + (Math.abs(hashCodeStr(m.displayName || m.name || '') as number) % 200)),
+                model: 'MODEL_PLACEHOLDER_M' + (400 + (Math.abs(hashCodeStr(`${(m.externalModelName || m.name || '')}:${(m.displayName || '')}`) as number) % 500)),
                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
               };

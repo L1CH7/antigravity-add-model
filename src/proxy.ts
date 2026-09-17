@@ -78,13 +78,13 @@ const cryptoStore = require('./cryptoStore');
 // ─── Model Helpers ────────────────────────────────────────────────────────
 
 function generateModelPlaceholderId(model: CustomModel): string {
-  const input = (model.displayName || model.name || 'custom-model').toLowerCase();
+  const input = `${model.externalModelName || model.name || ""}:${model.displayName || ""}`.toLowerCase();
   let hash = 5381;
   for (let i = 0; i < input.length; i++) {
     hash = (hash << 5) + hash + input.charCodeAt(i);
     hash = hash & hash; // Force 32-bit integer
   }
-  const placeholderNum = 400 + (Math.abs(hash) % 200);
+  const placeholderNum = 400 + (Math.abs(hash) % 500);
   return `MODEL_PLACEHOLDER_M${placeholderNum}`;
 }
 
@@ -389,7 +389,11 @@ function handleCustomModelRequest(
   const headers = registry.getProviderHeaders(provider, model.apiKey);
 
   if (isStream && registry.supportsStreaming(provider)) {
-    (payload as Record<string, unknown>).stream = true;
+    // Only OpenAI-compatible providers expect "stream: true" inside JSON payload.
+    // Google AI Studio native endpoints reject "stream" field (streaming is determined by :streamGenerateContent URL method).
+    if (provider !== "google") {
+      (payload as Record<string, unknown>).stream = true;
+    }
   }
 
   let finalUrlStr = model.apiUrl;
