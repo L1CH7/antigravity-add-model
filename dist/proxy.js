@@ -207,9 +207,11 @@ function proxyToGoogle(req, res, reqBody) {
         headers: headers,
     };
     const proxyReq = https.request(parsedUrl, options, (proxyRes) => {
-        // P0-5: Timeout for Google proxy requests (60s)
-        proxyReq.setTimeout(60000, () => {
-            electron_log_1.default.error('[Proxy] Google proxy request timed out after 60s');
+        // For generation requests (streaming & thinking models), allow up to 15 minutes
+        // and refresh timeout on every data chunk. For metadata requests, use 60s.
+        const timeoutMs = isGeneration ? 900000 : 60000;
+        proxyReq.setTimeout(timeoutMs, () => {
+            electron_log_1.default.error(`[Proxy] Google proxy ${isGeneration ? 'generation' : 'metadata'} request timed out after ${timeoutMs / 1000}s`);
             proxyReq.destroy();
             if (!res.headersSent) {
                 res.writeHead(504, { 'Content-Type': 'application/json' });
@@ -218,7 +220,10 @@ function proxyToGoogle(req, res, reqBody) {
         });
         if (shouldBufferAndModify) {
             const responseChunks = [];
-            proxyRes.on('data', (chunk) => responseChunks.push(chunk));
+            proxyRes.on('data', (chunk) => {
+                proxyReq.setTimeout(timeoutMs);
+                responseChunks.push(chunk);
+            });
             proxyRes.on('end', () => {
                 const fullResBody = Buffer.concat(responseChunks);
                 let text;
@@ -252,6 +257,9 @@ function proxyToGoogle(req, res, reqBody) {
         }
         else {
             res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+            proxyRes.on('data', () => {
+                proxyReq.setTimeout(timeoutMs);
+            });
             proxyRes.pipe(res);
         }
     });
@@ -345,7 +353,8 @@ function parseRetryAfter(headers) {
 function handleCustomModelRequest(res, model, geminiBody, isStream, retryCount = 0) {
     // P3-18: Configurable max retries per model (default 3, min 0, max 5)
     const MAX_RETRIES = Math.min(Math.max(model.maxRetries ?? 3, 0), 5);
-    const REQUEST_TIMEOUT_MS = model.timeout || 120000;
+    // For streaming & thinking models, allow up to 15 minutes by default; for non-streaming 2 minutes
+    const REQUEST_TIMEOUT_MS = model.timeout || (isStream ? 900000 : 120000);
     const provider = model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
     const payload = registry.translateRequest(provider, geminiBody, model.externalModelName);
     const headers = registry.getProviderHeaders(provider, model.apiKey);
@@ -426,6 +435,7 @@ function handleCustomModelRequest(res, model, geminiBody, isStream, retryCount =
             });
             let buffer = '';
             apiRes.on('data', (chunk) => {
+                request.setTimeout(REQUEST_TIMEOUT_MS);
                 buffer += chunk.toString('utf-8');
                 const lines = buffer.split('\n');
                 buffer = lines.pop() || '';
