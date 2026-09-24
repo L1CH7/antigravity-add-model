@@ -88,21 +88,23 @@ const electronNativeAPI = {
     close: () => electron_1.ipcRenderer.invoke('window:close'),
     toggleDevTools: () => electron_1.ipcRenderer.invoke('window:toggle-devtools'),
     zoomIn: () => {
-        const current = electron_1.webFrame.getZoomLevel();
-        electron_1.webFrame.setZoomLevel(current + 0.5);
+        void electron_1.ipcRenderer.invoke('window:zoom-in');
     },
     zoomOut: () => {
-        const current = electron_1.webFrame.getZoomLevel();
-        electron_1.webFrame.setZoomLevel(current - 0.5);
+        void electron_1.ipcRenderer.invoke('window:zoom-out');
     },
     resetZoom: () => {
-        electron_1.webFrame.setZoomLevel(0);
+        void electron_1.ipcRenderer.invoke('window:reset-zoom');
     },
     openExternal: (url) => electron_1.ipcRenderer.invoke('shell:open-external', url),
     revealInFilePicker: (path) => electron_1.ipcRenderer.invoke('shell:reveal-in-file-picker', path),
 };
 const ideAPI = {
     isInstalled: () => electron_1.ipcRenderer.invoke('ide:is-installed'),
+};
+const wslAPI = {
+    getState: () => electron_1.ipcRenderer.invoke('wsl:get-state'),
+    connect: (distro) => electron_1.ipcRenderer.invoke('wsl:connect', distro),
 };
 // ─── Expose all APIs via contextBridge ──────────────────────────────────────
 electron_1.contextBridge.exposeInMainWorld('electronUpdater', updaterAPI);
@@ -115,6 +117,7 @@ electron_1.contextBridge.exposeInMainWorld('deepLink', deepLinkAPI);
 electron_1.contextBridge.exposeInMainWorld('agent', agentAPI);
 electron_1.contextBridge.exposeInMainWorld('electronNative', electronNativeAPI);
 electron_1.contextBridge.exposeInMainWorld('ide', ideAPI);
+electron_1.contextBridge.exposeInMainWorld('wsl', wslAPI);
 // ─── Custom Models UI Injection ─────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
     function findRefreshButton() {

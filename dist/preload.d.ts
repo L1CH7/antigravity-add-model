@@ -82,6 +82,10 @@ interface ElectronNativeAPI {
 interface IdeAPI {
     isInstalled: () => Promise<boolean>;
 }
+interface WslAPI {
+    getState: () => Promise<unknown>;
+    connect: (distro: string) => Promise<unknown>;
+}
 interface CustomModelEntry {
     name: string;
     displayName?: string;
@@ -118,6 +122,7 @@ declare global {
         agent: AgentAPI;
         electronNative: ElectronNativeAPI;
         ide: IdeAPI;
+        wsl: WslAPI;
     }
 }
 export {};

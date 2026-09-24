@@ -93,6 +93,11 @@ interface IdeAPI {
   isInstalled: () => Promise<boolean>;
 }
 
+interface WslAPI {
+  getState: () => Promise<unknown>;
+  connect: (distro: string) => Promise<unknown>;
+}
+
 interface CustomModelEntry {
   name: string;
   displayName?: string;
@@ -211,15 +216,13 @@ const electronNativeAPI: ElectronNativeAPI = {
   close: () => ipcRenderer.invoke('window:close'),
   toggleDevTools: () => ipcRenderer.invoke('window:toggle-devtools'),
   zoomIn: () => {
-    const current = webFrame.getZoomLevel();
-    webFrame.setZoomLevel(current + 0.5);
+    void ipcRenderer.invoke('window:zoom-in');
   },
   zoomOut: () => {
-    const current = webFrame.getZoomLevel();
-    webFrame.setZoomLevel(current - 0.5);
+    void ipcRenderer.invoke('window:zoom-out');
   },
   resetZoom: () => {
-    webFrame.setZoomLevel(0);
+    void ipcRenderer.invoke('window:reset-zoom');
   },
   openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
   revealInFilePicker: (path) => ipcRenderer.invoke('shell:reveal-in-file-picker', path),
@@ -227,6 +230,11 @@ const electronNativeAPI: ElectronNativeAPI = {
 
 const ideAPI: IdeAPI = {
   isInstalled: () => ipcRenderer.invoke('ide:is-installed'),
+};
+
+const wslAPI: WslAPI = {
+  getState: () => ipcRenderer.invoke('wsl:get-state'),
+  connect: (distro: string) => ipcRenderer.invoke('wsl:connect', distro),
 };
 
 // ─── Expose all APIs via contextBridge ──────────────────────────────────────
@@ -241,6 +249,7 @@ contextBridge.exposeInMainWorld('deepLink', deepLinkAPI);
 contextBridge.exposeInMainWorld('agent', agentAPI);
 contextBridge.exposeInMainWorld('electronNative', electronNativeAPI);
 contextBridge.exposeInMainWorld('ide', ideAPI);
+contextBridge.exposeInMainWorld('wsl', wslAPI);
 
 // ─── Renderer Augmentations (for TypeScript global type declarations) ──────
 
@@ -256,6 +265,7 @@ declare global {
     agent: AgentAPI;
     electronNative: ElectronNativeAPI;
     ide: IdeAPI;
+    wsl: WslAPI;
   }
 }
 
