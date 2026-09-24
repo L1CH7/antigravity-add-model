@@ -50,6 +50,23 @@ export const REQUIRED_BUILD_FILES = [
   'proxy/translators/utils.js',
   'services/settingsService.js',
 ];
+export const MODULAR_BUILD_FILES = [
+  'loader.js',
+  'customModelIpc.js',
+  'preload.js',
+  'proxy.js',
+  'cryptoStore.js',
+  'schemaValidator.js',
+  'proxy/registry.js',
+  'proxy/shared.js',
+  'proxy/translators/openai.js',
+  'proxy/translators/anthropic.js',
+  'proxy/translators/google.js',
+  'proxy/translators/ollama.js',
+  'proxy/listen.js',
+  'proxy/modelUtils.js',
+  'proxy/translators/utils.js',
+];
 
 function fail(code, message) {
   const error = new Error(`${code}: ${message}`);
@@ -226,13 +243,13 @@ function inspectArchive(archive) {
   if (main.startsWith('out/') || entries.some(({ name }) => name === 'out/vs/workbench/workbench.desktop.main.js'))
     unsupported();
   if (
-    main !== 'dist/main.js' ||
+    (main !== 'dist/main.js' && main !== 'dist/loader.js') ||
     !entries.some(({ name, entry }) => name === 'dist/preload.js' && !('files' in entry))
   ) {
-    fail('UNSUPPORTED_LAYOUT', 'Expected standalone package main=dist/main.js and dist/preload.js. No files changed.');
+    fail('UNSUPPORTED_LAYOUT', 'Expected standalone package main=dist/main.js or dist/loader.js and dist/preload.js. No files changed.');
   }
   extractFile(archive, 'dist/main.js');
-  return { version: String(pkg.version || 'unknown'), entries };
+  return { version: String(pkg.version || 'unknown'), entries, main };
 }
 function readState(resources) {
   const filename = path.join(resources, STATE_DIR, 'state.json');
@@ -302,7 +319,8 @@ export function preflight(options = {}) {
   const current = fingerprint(resources);
   const dist = path.resolve(options.dist || path.join(PROJECT, 'dist'));
   if (!options.restore) {
-    for (const item of REQUIRED_BUILD_FILES) {
+    const requiredFiles = options.modular ? MODULAR_BUILD_FILES : REQUIRED_BUILD_FILES;
+    for (const item of requiredFiles) {
       const filename = path.join(dist, item);
       if (!exists(filename) || !fs.statSync(filename).isFile() || fs.statSync(filename).size === 0)
         fail('BUILD_MISSING', `Missing compiled patch ${filename}. Run npm ci and npm run build first.`);
@@ -482,7 +500,20 @@ export async function deploy(options = {}, operations = {}) {
       const source = path.join(staging, 'source');
       // Extract CURRENT app, never app.asar.backup from an older release.
       asar.extractAll(files.archive, source);
-      fs.cpSync(info.dist, path.join(source, 'dist'), { recursive: true, force: true });
+      if (options.modular) {
+        for (const file of MODULAR_BUILD_FILES) {
+          const srcFile = path.join(info.dist, file);
+          const destFile = path.join(source, 'dist', file);
+          fs.mkdirSync(path.dirname(destFile), { recursive: true });
+          fs.copyFileSync(srcFile, destFile);
+        }
+        const pkgFile = path.join(source, 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+        pkg.main = 'dist/loader.js';
+        fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + '\n');
+      } else {
+        fs.cpSync(info.dist, path.join(source, 'dist'), { recursive: true, force: true });
+      }
       const marker = path.join(source, 'antigravity-proxy.json');
       if (info.plan.mode === 'fixed') fs.writeFileSync(marker, JSON.stringify({ requiredPort: 50999 }) + '\n');
       if (info.plan.mode === 'dynamic' && exists(marker)) removeOwned(source, marker);
@@ -493,9 +524,15 @@ export async function deploy(options = {}, operations = {}) {
       fs.chmodSync(candidate.archive, fs.statSync(files.archive).mode & 0o777);
       inspectArchive(candidate.archive);
       verifyArchiveIntegrity(candidate.archive);
-      for (const file of REQUIRED_BUILD_FILES) {
+      const verifyFiles = options.modular ? MODULAR_BUILD_FILES : REQUIRED_BUILD_FILES;
+      for (const file of verifyFiles) {
         if (!extractFile(candidate.archive, `dist/${file}`).equals(fs.readFileSync(path.join(info.dist, file))))
           fail('PACK_INVALID', `Packaged patch does not match the build: ${file}`);
+      }
+      if (options.modular) {
+        const candidatePkg = JSON.parse(extractFile(candidate.archive, 'package.json').toString());
+        if (candidatePkg.main !== 'dist/loader.js')
+          fail('PACK_INVALID', 'Packaged patch does not set package.json main to dist/loader.js');
       }
       copyIfPresent(files.binary, candidate.binary);
       if (info.plan.bytes) {
@@ -543,6 +580,7 @@ export async function deploy(options = {}, operations = {}) {
       version: info.version,
       binaryMode: info.plan?.mode,
       backup: originalBackup,
+      modular: Boolean(options.modular),
     };
   } catch (error) {
     keepStaging = Boolean(error.keepStaging);
@@ -563,6 +601,8 @@ export function parseArgs(argv) {
     } else if (arg === '--check') options.check = true;
     else if (arg === '--restore') options.restore = true;
     else if (arg === '--patch-language-server') options.patchLanguageServer = true;
+    else if (arg === '--modular') options.modular = true;
+    else if (arg === '--legacy') options.modular = false;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else fail('USAGE', `Unknown argument: ${arg}`);
   }
@@ -575,14 +615,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     const options = parseArgs(process.argv.slice(2));
     if (options.help)
       console.log(
-        'Usage: node scripts/deploy.mjs [--resources PATH] [--check|--restore] [--patch-language-server]\nClose Antigravity before applying/restoring; reopen it manually afterward.',
+        'Usage: node scripts/deploy.mjs [--resources PATH] [--check|--restore] [--patch-language-server] [--modular|--legacy]\nClose Antigravity before applying/restoring; reopen it manually afterward.',
       );
     else {
       if (!options.check)
         console.log('Close Antigravity before deploying. This installer does not stop or launch applications.');
+      if (options.modular === undefined && !options.restore) options.modular = true;
       const result = await deploy(options);
       console.log(
-        `${result.action === 'check' ? 'CHECK PASSED (no files changed)' : result.action === 'restore' ? 'RESTORED' : 'PATCH INSTALLED'}: standalone ${result.version} at ${result.resources}`,
+        `${result.action === 'check' ? 'CHECK PASSED (no files changed)' : result.action === 'restore' ? 'RESTORED' : 'PATCH INSTALLED'}: ${result.modular ? 'modular' : 'standalone'} ${result.version} at ${result.resources}`,
       );
       if (result.backup) console.log(`Original backup: ${result.backup}`);
       if (result.binaryMode === 'fixed')

@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import * as asar from '@electron/asar';
-import { deploy, fingerprint, parseArgs, preflight, REQUIRED_BUILD_FILES } from '../../scripts/deploy.mjs';
+import { deploy, fingerprint, parseArgs, preflight, REQUIRED_BUILD_FILES, MODULAR_BUILD_FILES } from '../../scripts/deploy.mjs';
 
 const roots: string[] = [];
 const installer = fileURLToPath(new URL('../../scripts/deploy.mjs', import.meta.url));
@@ -390,9 +390,63 @@ describe('optional fixed-port Windows language-server patch', () => {
       check: true,
       patchLanguageServer: true,
     });
+    expect(parseArgs(['--resources', 'App With Spaces', '--modular'])).toEqual({
+      resources: 'App With Spaces',
+      modular: true,
+    });
+    expect(parseArgs(['--resources', 'App With Spaces', '--legacy'])).toEqual({
+      resources: 'App With Spaces',
+      modular: false,
+    });
     expect(() => parseArgs(['--resources'])).toThrow('USAGE');
     expect(() => parseArgs(['--check', '--restore'])).toThrow('USAGE');
     expect(() => parseArgs(['--restore', '--patch-language-server'])).toThrow('USAGE');
     expect(() => parseArgs(['--unknown'])).toThrow('USAGE');
+  });
+});
+
+describe('modular loader deployment mode', () => {
+  async function modularFixture() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'antigravity-deployment-test-'));
+    roots.push(root);
+    const resources = path.join(root, 'App With Spaces', 'resources');
+    const dist = path.join(root, 'build');
+    for (const file of MODULAR_BUILD_FILES) put(path.join(dist, file), `// patch ${file}\n`);
+    put(path.join(dist, 'main.js'), '// patch main.js that should NOT be used\n');
+    await installVendor(root, resources, '2.17.0');
+    return { root, resources, dist };
+  }
+
+  it('injects modular files and updates package.json main to dist/loader.js without touching vendor dist/main.js', async () => {
+    const f = await modularFixture();
+    const originalVendorMain = readArchive(f.resources, 'dist/main.js');
+    const result = await deploy({ ...f, modular: true });
+
+    expect(result.action).toBe('apply');
+    expect(result.modular).toBe(true);
+
+    const pkg = JSON.parse(readArchive(f.resources, 'package.json'));
+    expect(pkg.main).toBe('dist/loader.js');
+    expect(pkg.vendorField).toBe('retain me');
+
+    expect(readArchive(f.resources, 'dist/main.js')).toBe(originalVendorMain);
+    expect(readArchive(f.resources, 'dist/loader.js')).toBe('// patch loader.js\n');
+    expect(readArchive(f.resources, 'dist/customModelIpc.js')).toBe('// patch customModelIpc.js\n');
+    expect(readArchive(f.resources, 'dist/proxy.js')).toBe('// patch proxy.js\n');
+
+    const checkResult = await deploy({ resources: f.resources, dist: f.dist, check: true, modular: true });
+    expect(checkResult.action).toBe('check');
+
+    await deploy({ resources: f.resources, restore: true });
+    const restoredPkg = JSON.parse(readArchive(f.resources, 'package.json'));
+    expect(restoredPkg.main).toBe('dist/main.js');
+    expect(readArchive(f.resources, 'dist/main.js')).toBe(originalVendorMain);
+  });
+
+  it('rejects an incomplete modular build missing loader.js', async () => {
+    const f = await modularFixture();
+    fs.unlinkSync(path.join(f.dist, 'loader.js'));
+    await expect(deploy({ ...f, modular: true })).rejects.toThrow('BUILD_MISSING');
+    expect(fs.existsSync(path.join(f.resources, '.antigravity-model-patch'))).toBe(false);
   });
 });
