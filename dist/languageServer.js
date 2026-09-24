@@ -204,6 +204,8 @@ function startLanguageServer(port, csrf, headless) {
         // We need to pass the override flags because the LS is running in standalone mode
         const args = [
             '--standalone',
+            '--persistent_mode=true',
+            '--disable_telemetry=true',
             '--override_ide_name',
             'antigravity',
             '--subclient_type',
@@ -250,10 +252,7 @@ function startLanguageServer(port, csrf, headless) {
             stdio: ['pipe', 'pipe', 'pipe'],
             env: env,
         });
-        if (!headless) {
-            // Close stdin immediately — the LS may block waiting for metadata on stdin.
-            _lsProcess.stdin?.end();
-        }
+        // Keep stdin pipe open — closing stdin can trigger EOF exit in language server daemons
         const combined = new stream_1.PassThrough();
         _lsProcess.stdout?.pipe(combined, { end: false });
         _lsProcess.stderr?.pipe(combined, { end: false });
@@ -380,9 +379,11 @@ function monitorLsCrashInternal(handle, port, csrf, options) {
             return;
         }
         try {
-            const newHandle = await startLanguageServer(port, csrf);
+            const restartPort = _lsPort > 0 ? _lsPort : port;
+            const newHandle = await startLanguageServer(restartPort, csrf, options.headless);
+            const oldPort = _lsPort;
             _lsPort = newHandle.port;
-            if (options.onPortChanged) {
+            if (_lsPort !== oldPort && options.onPortChanged) {
                 options.onPortChanged(_lsPort);
             }
             // Recurse
