@@ -10,7 +10,7 @@ type State = { type: string; update?: { version: string } };
 // Execute the production CommonJS modules with an explicit Electron boundary.
 // No app, updater, shell, filesystem write, or network operation runs in this fixture.
 const compiled = new Map(
-  ['updater', 'ipcHandlers', 'preload'].map((name) => [
+  ['updater', 'ipcHandlers', 'preload', 'customModelIpc'].map((name) => [
     name,
     ts.transpileModule(readFileSync(path.resolve('src', `${name}.ts`), 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
@@ -91,8 +91,9 @@ function createFixture() {
     './tray': {},
     './ideInstall/constants': { getIdeInstallPath: () => idePath },
   };
+  const customModelIpc = loadModule('customModelIpc', dependencies);
   const updater = loadModule('updater', dependencies);
-  const ipc = loadModule('ipcHandlers', { ...dependencies, './updater': updater });
+  const ipc = loadModule('ipcHandlers', { ...dependencies, './updater': updater, './customModelIpc': customModelIpc });
   ipc.registerIpcHandlers({});
   loadModule('preload', dependencies, { window: { addEventListener: vi.fn() } });
   return {
