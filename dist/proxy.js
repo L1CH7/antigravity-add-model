@@ -1293,11 +1293,21 @@ function handleRequest(req, res) {
                 const modelName = reqJson.model;
                 const modelId = (reqJson.modelId || reqJson.model_id);
                 electron_log_1.default.info(`[Proxy] Cloud Code generation request model: ${modelName}, modelId: ${modelId}, url: ${req.url}, bodyKeys: ${Object.keys(reqJson).join(',')}`);
-                if (modelName) {
+                if (modelName || modelId) {
                     const customModels = loadCustomModels();
+                    const cleanModelName = (modelName || '').replace(/^models\//, '');
                     const matchedCustomModel = customModels.find((m) => {
                         const enumName = generateModelPlaceholderId(m);
-                        return m.name === modelName || toSlug(m) === modelName || enumName === modelName || enumName === modelId;
+                        const slug = toSlug(m);
+                        return (m.name === modelName ||
+                            m.name === cleanModelName ||
+                            slug === modelName ||
+                            slug === cleanModelName ||
+                            'models/' + slug === modelName ||
+                            enumName === modelName ||
+                            enumName === cleanModelName ||
+                            'models/' + enumName === modelName ||
+                            enumName === modelId);
                     });
                     if (matchedCustomModel) {
                         electron_log_1.default.info(`[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`);
