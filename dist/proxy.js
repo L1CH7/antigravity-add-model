@@ -756,6 +756,64 @@ function encodeModelEntryForGetModels(name, displayName, mapping) {
     }
     return encodeProtoBuf(fields);
 }
+let lastKnownGetModelsRawBuf = null;
+function buildSyntheticGetModelsResponse(customModels) {
+    const fieldMapping = new Map([
+        [1, 'string'],
+        [2, 'string'],
+    ]);
+    const parts = [];
+    const modelTag = (1 << 3) | 2; // Tag 1, length-delimited (wireType 2)
+    for (const m of customModels) {
+        const placeholderId = generateModelPlaceholderId(m);
+        const entry = encodeModelEntryForGetModels('models/' + placeholderId, m.displayName, fieldMapping);
+        parts.push(encodeVarint(modelTag), encodeVarint(entry.length), entry);
+    }
+    const msgBody = Buffer.concat(parts);
+    const header = Buffer.alloc(5);
+    header[0] = 0;
+    header.writeUInt32BE(msgBody.length, 1);
+    return Buffer.concat([header, msgBody]);
+}
+function injectCustomModelsIntoProto(responseBuf, customModels) {
+    if (customModels.length === 0 || responseBuf.length <= 5) {
+        return responseBuf;
+    }
+    try {
+        const flags = responseBuf[0];
+        const msgLen = responseBuf.readUInt32BE(1);
+        if (5 + msgLen <= responseBuf.length) {
+            const msgBody = responseBuf.subarray(5, 5 + msgLen);
+            const parsed = parseProto(msgBody, 0, msgBody.length);
+            const modelTag = findModelEntryFieldTag(parsed) ?? ((1 << 3) | 2);
+            const sampleEntry = parsed.find((f) => f.tag === modelTag && Array.isArray(f.value));
+            const fieldMapping = sampleEntry && Array.isArray(sampleEntry.value)
+                ? extractFieldMapping(sampleEntry.value)
+                : new Map([
+                    [1, 'string'],
+                    [2, 'string'],
+                ]);
+            const newParts = [msgBody];
+            for (const m of customModels) {
+                const placeholderId = generateModelPlaceholderId(m);
+                const entry = encodeModelEntryForGetModels('models/' + placeholderId, m.displayName, fieldMapping);
+                const tagBuf = encodeVarint(modelTag);
+                const lenBuf = encodeVarint(entry.length);
+                newParts.push(tagBuf, lenBuf, entry);
+                electron_log_1.default.info(`[Proxy] Injected into GetAvailableModels: ${m.displayName} => ${placeholderId}`);
+            }
+            const newMsgBody = Buffer.concat(newParts);
+            const newHeader = Buffer.alloc(5);
+            newHeader[0] = flags;
+            newHeader.writeUInt32BE(newMsgBody.length, 1);
+            return Buffer.concat([newHeader, newMsgBody]);
+        }
+    }
+    catch (err) {
+        electron_log_1.default.error('[Proxy] Failed to inject models into GetAvailableModels:', err);
+    }
+    return responseBuf;
+}
 // ─── GetAvailableModels Proxy Handler ───────────────────────────────────────
 function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
     const lsParsed = new URL(lsUrl);
@@ -772,47 +830,34 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
         },
         rejectUnauthorized: false,
     };
+    const sendFallbackModels = (reason) => {
+        if (res.headersSent)
+            return;
+        electron_log_1.default.warn(`[Proxy] GetAvailableModels ${reason}, serving offline fallback with custom models`);
+        const customModels = loadCustomModels();
+        let fallbackBuf;
+        if (lastKnownGetModelsRawBuf && lastKnownGetModelsRawBuf.length > 5) {
+            fallbackBuf = injectCustomModelsIntoProto(lastKnownGetModelsRawBuf, customModels);
+        }
+        else {
+            fallbackBuf = buildSyntheticGetModelsResponse(customModels);
+        }
+        res.writeHead(200, {
+            'Content-Type': 'application/grpc-web+proto',
+            'Content-Length': String(fallbackBuf.length),
+        });
+        res.end(fallbackBuf);
+    };
     const lsReq = client.request(options, (lsRes) => {
         const chunks = [];
         lsRes.on('data', (chunk) => chunks.push(chunk));
         lsRes.on('end', () => {
             const responseBuf = Buffer.concat(chunks);
-            const customModels = loadCustomModels();
-            let modifiedBuf = responseBuf;
-            if (customModels.length > 0 && responseBuf.length > 6) {
-                try {
-                    const flags = responseBuf[0];
-                    const msgLen = responseBuf.readUInt32BE(1);
-                    if (5 + msgLen <= responseBuf.length) {
-                        const msgBody = responseBuf.subarray(5, 5 + msgLen);
-                        const parsed = parseProto(msgBody, 0, msgBody.length);
-                        const modelTag = findModelEntryFieldTag(parsed);
-                        if (modelTag !== null) {
-                            const sampleEntry = parsed.find((f) => f.tag === modelTag && Array.isArray(f.value));
-                            if (sampleEntry && Array.isArray(sampleEntry.value)) {
-                                const fieldMapping = extractFieldMapping(sampleEntry.value);
-                                const newParts = [msgBody];
-                                for (const m of customModels) {
-                                    const placeholderId = generateModelPlaceholderId(m);
-                                    const entry = encodeModelEntryForGetModels('models/' + placeholderId, m.displayName, fieldMapping);
-                                    const tagBuf = encodeVarint(modelTag);
-                                    const lenBuf = encodeVarint(entry.length);
-                                    newParts.push(tagBuf, lenBuf, entry);
-                                    electron_log_1.default.info(`[Proxy] Injected into GetAvailableModels: ${m.displayName} => ${placeholderId}`);
-                                }
-                                const newMsgBody = Buffer.concat(newParts);
-                                const newHeader = Buffer.alloc(5);
-                                newHeader[0] = flags;
-                                newHeader.writeUInt32BE(newMsgBody.length, 1);
-                                modifiedBuf = Buffer.concat([newHeader, newMsgBody]);
-                            }
-                        }
-                    }
-                }
-                catch (err) {
-                    electron_log_1.default.error('[Proxy] Failed to inject models into GetAvailableModels:', err);
-                }
+            if (lsRes.statusCode === 200 && responseBuf.length > 5) {
+                lastKnownGetModelsRawBuf = responseBuf;
             }
+            const customModels = loadCustomModels();
+            const modifiedBuf = injectCustomModelsIntoProto(responseBuf, customModels);
             res.writeHead(lsRes.statusCode || 200, {
                 'Content-Type': 'application/grpc-web+proto',
                 'Content-Length': String(modifiedBuf.length),
@@ -821,26 +866,17 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
         });
         lsRes.on('error', (err) => {
             electron_log_1.default.error('[Proxy] LS error for GetAvailableModels:', err.message);
-            if (!res.headersSent) {
-                res.writeHead(502);
-                res.end();
-            }
+            sendFallbackModels('LS response error');
         });
     });
-    lsReq.setTimeout(30000, () => {
-        electron_log_1.default.error('[Proxy] GetAvailableModels forward timed out');
+    lsReq.setTimeout(10000, () => {
+        electron_log_1.default.warn('[Proxy] GetAvailableModels forward timed out (10s)');
         lsReq.destroy();
-        if (!res.headersSent) {
-            res.writeHead(504);
-            res.end();
-        }
+        sendFallbackModels('forward timeout');
     });
     lsReq.on('error', (err) => {
         electron_log_1.default.error('[Proxy] GetAvailableModels forward error:', err.message);
-        if (!res.headersSent) {
-            res.writeHead(502);
-            res.end();
-        }
+        sendFallbackModels('forward error');
     });
     lsReq.write(reqBody);
     lsReq.end();
@@ -1035,9 +1071,13 @@ function handleRequest(req, res) {
                                             'application/x-ipynb+json': true,
                                         };
                                     }
+                                    const placeholderId = generateModelPlaceholderId(m);
                                     result[slug] = entry;
+                                    result[`models/${slug}`] = entry;
+                                    result[placeholderId] = entry;
+                                    result[`models/${placeholderId}`] = entry;
                                     m._slug = slug;
-                                    electron_log_1.default.info(`[Proxy] Custom model "${m.displayName}" => slug: ${slug} => model: ${generateModelPlaceholderId(m)} => thinking: ${cap.isThinking} => images: ${cap.supportsImages}`);
+                                    electron_log_1.default.info(`[Proxy] Custom model "${m.displayName}" => slug: ${slug} => placeholder: ${placeholderId} (registered all aliases)`);
                                 });
                                 return result;
                             }
@@ -1060,16 +1100,21 @@ function handleRequest(req, res) {
                             const modelsMap = {};
                             customModels.forEach((m) => {
                                 const slug = toSlug(m);
-                                modelsMap[slug] = {
+                                const placeholderId = generateModelPlaceholderId(m);
+                                const entry = {
                                     displayName: m.displayName,
                                     recommended: true,
                                     maxTokens: 1048576,
                                     maxOutputTokens: 4096,
                                     tokenizerType: 'LLAMA_WITH_SPECIAL',
-                                    model: generateModelPlaceholderId(m),
+                                    model: placeholderId,
                                     apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                                     modelProvider: 'MODEL_PROVIDER_GOOGLE',
                                 };
+                                modelsMap[slug] = entry;
+                                modelsMap[`models/${slug}`] = entry;
+                                modelsMap[placeholderId] = entry;
+                                modelsMap[`models/${placeholderId}`] = entry;
                                 m._slug = slug;
                             });
                             googleJson.models = modelsMap;
@@ -1102,14 +1147,19 @@ function handleRequest(req, res) {
                         const mappedCustom = {};
                         customModels.forEach((m) => {
                             const slug = toSlug(m);
-                            mappedCustom[slug] = {
+                            const placeholderId = generateModelPlaceholderId(m);
+                            const entry = {
                                 displayName: m.displayName,
                                 maxTokens: 1048576,
                                 maxOutputTokens: 4096,
-                                model: generateModelPlaceholderId(m),
+                                model: placeholderId,
                                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
                             };
+                            mappedCustom[slug] = entry;
+                            mappedCustom[`models/${slug}`] = entry;
+                            mappedCustom[placeholderId] = entry;
+                            mappedCustom[`models/${placeholderId}`] = entry;
                         });
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ models: mappedCustom }));
@@ -1122,14 +1172,19 @@ function handleRequest(req, res) {
                 const mappedCustom = {};
                 customModels.forEach((m) => {
                     const slug = toSlug(m);
-                    mappedCustom[slug] = {
+                    const placeholderId = generateModelPlaceholderId(m);
+                    const entry = {
                         displayName: m.displayName,
                         maxTokens: 1048576,
                         maxOutputTokens: 4096,
-                        model: generateModelPlaceholderId(m),
+                        model: placeholderId,
                         apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                         modelProvider: 'MODEL_PROVIDER_GOOGLE',
                     };
+                    mappedCustom[slug] = entry;
+                    mappedCustom[`models/${slug}`] = entry;
+                    mappedCustom[placeholderId] = entry;
+                    mappedCustom[`models/${placeholderId}`] = entry;
                 });
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ models: mappedCustom }));
@@ -1272,6 +1327,7 @@ function handleRequest(req, res) {
                 const enumName = generateModelPlaceholderId(m);
                 return (m.name === matchedModelName ||
                     toSlug(m) === matchedModelName ||
+                    'models/' + toSlug(m) === matchedModelName ||
                     enumName === matchedModelName ||
                     'models/' + enumName === matchedModelName);
             });
