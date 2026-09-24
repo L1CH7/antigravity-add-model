@@ -77,20 +77,20 @@ const cryptoStore = require('./cryptoStore');
 
 // ─── Model Helpers ────────────────────────────────────────────────────────
 
-function generateModelPlaceholderId(model: CustomModel): string {
-  const input = `${model.externalModelName || model.name || ""}:${model.displayName || ""}`.toLowerCase();
-  let hash = 5381;
-  for (let i = 0; i < input.length; i++) {
-    hash = (hash << 5) + hash + input.charCodeAt(i);
-    hash = hash & hash; // Force 32-bit integer
-  }
-  const placeholderNum = 400 + (Math.abs(hash) % 500);
-  return `MODEL_PLACEHOLDER_M${placeholderNum}`;
+function getCustomModelsPath(): string {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
 }
 
-function getCustomModelsPath(): string {
-  const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity');
-  return path.join(geminiDir, 'custom_models.json');
+function generateModelPlaceholderId(model: CustomModel): string {
+  const ext = (model.externalModelName || model.name || "custom").toLowerCase();
+  const disp = (model.displayName || "model").toLowerCase();
+  let h1 = 5381;
+  for (let i = 0; i < ext.length; i++) h1 = ((h1 << 5) + h1 + ext.charCodeAt(i)) & 0xFFFFFFFF;
+  let h2 = 5381;
+  for (let i = 0; i < disp.length; i++) h2 = ((h2 << 5) + h2 + disp.charCodeAt(i)) & 0xFFFFFFFF;
+  const num = 10 + (Math.abs((h1 * 7) + h2) % 500);
+  return `MODEL_PLACEHOLDER_M${num}`;
 }
 
 function toSlug(model: CustomModel): string {

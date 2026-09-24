@@ -71,64 +71,64 @@ describe('normalizeToolArgs', () => {
     expect(normalizeToolArgs('view_file', undefined)).toEqual({});
   });
 
-  it('should normalize view_file args using aliases', () => {
-    expect(normalizeToolArgs('view_file', { file_path: '/test.js' })).toEqual({ AbsolutePath: '/test.js' });
-    expect(normalizeToolArgs('view_file', { filePath: '/a/b.ts' })).toEqual({ AbsolutePath: '/a/b.ts' });
+  it('should preserve view_file args', () => {
+    expect(normalizeToolArgs('view_file', { file_path: '/test.js' })).toEqual({ file_path: '/test.js' });
+    expect(normalizeToolArgs('view_file', { filePath: '/a/b.ts' })).toEqual({ filePath: '/a/b.ts' });
     expect(normalizeToolArgs('view_file', { AbsolutePath: '/x.txt' })).toEqual({ AbsolutePath: '/x.txt' });
   });
 
-  it('should normalize list_dir args', () => {
-    expect(normalizeToolArgs('list_dir', { directory: '/src' })).toEqual({ DirectoryPath: '/src' });
-    expect(normalizeToolArgs('list_dir', { dir: '/tmp' })).toEqual({ DirectoryPath: '/tmp' });
+  it('should preserve list_dir args', () => {
+    expect(normalizeToolArgs('list_dir', { directory: '/src' })).toEqual({ directory: '/src' });
+    expect(normalizeToolArgs('list_dir', { dir: '/tmp' })).toEqual({ dir: '/tmp' });
     expect(normalizeToolArgs('list_dir', { DirectoryPath: '/a' })).toEqual({ DirectoryPath: '/a' });
   });
 
-  it('should normalize run_command args', () => {
+  it('should preserve run_command args', () => {
     const result = normalizeToolArgs('run_command', { cmd: 'ls -la' });
-    expect(result).toEqual({ CommandLine: 'ls -la' });
+    expect(result).toEqual({ cmd: 'ls -la' });
   });
 
-  it('should normalize run_command.Cwd sub-key', () => {
+  it('should preserve run_command.Cwd sub-key', () => {
     const result = normalizeToolArgs('run_command', { CommandLine: 'ls', cwd: '/home' });
-    expect(result).toEqual({ CommandLine: 'ls', Cwd: '/home' });
+    expect(result).toEqual({ CommandLine: 'ls', cwd: '/home' });
   });
 
-  it('should normalize grep_search args', () => {
+  it('should preserve grep_search args', () => {
     const result = normalizeToolArgs('grep_search', { pattern: 'TODO', directory: '/src' });
-    expect(result).toEqual({ Query: 'TODO', SearchPath: '/src' });
+    expect(result).toEqual({ pattern: 'TODO', directory: '/src' });
   });
 
-  it('should normalize replace_file_content args', () => {
-    expect(normalizeToolArgs('replace_file_content', { file: '/a.ts' })).toEqual({ TargetFile: '/a.ts' });
+  it('should preserve replace_file_content args', () => {
+    expect(normalizeToolArgs('replace_file_content', { file: '/a.ts' })).toEqual({ file: '/a.ts' });
     expect(normalizeToolArgs('replace_file_content', { TargetFile: '/b.ts' })).toEqual({ TargetFile: '/b.ts' });
   });
 
-  it('should normalize write_file args', () => {
-    expect(normalizeToolArgs('write_file', { path: '/out.ts' })).toEqual({ AbsolutePath: '/out.ts' });
-    expect(normalizeToolArgs('write_file', { target: '/out2.ts' })).toEqual({ AbsolutePath: '/out2.ts' });
+  it('should preserve write_file args', () => {
+    expect(normalizeToolArgs('write_file', { path: '/out.ts' })).toEqual({ path: '/out.ts' });
+    expect(normalizeToolArgs('write_file', { target: '/out2.ts' })).toEqual({ target: '/out2.ts' });
   });
 
-  it('should normalize search_files args', () => {
+  it('should preserve search_files args', () => {
     const result = normalizeToolArgs('search_files', { directory: '/src' });
-    expect(result).toEqual({ SearchPath: '/src' });
+    expect(result).toEqual({ directory: '/src' });
   });
 
-  it('should normalize create_directory args', () => {
-    expect(normalizeToolArgs('create_directory', { path: '/new' })).toEqual({ DirectoryPath: '/new' });
+  it('should preserve create_directory args', () => {
+    expect(normalizeToolArgs('create_directory', { path: '/new' })).toEqual({ path: '/new' });
   });
 
-  it('should normalize delete_file args', () => {
-    expect(normalizeToolArgs('delete_file', { file: '/old.js' })).toEqual({ AbsolutePath: '/old.js' });
+  it('should preserve delete_file args', () => {
+    expect(normalizeToolArgs('delete_file', { file: '/old.js' })).toEqual({ file: '/old.js' });
   });
 
-  it('should normalize move_file args', () => {
-    expect(normalizeToolArgs('move_file', { source: '/a' })).toEqual({ SourcePath: '/a' });
-    expect(normalizeToolArgs('move_file', { src: '/b' })).toEqual({ SourcePath: '/b' });
+  it('should preserve move_file args', () => {
+    expect(normalizeToolArgs('move_file', { source: '/a' })).toEqual({ source: '/a' });
+    expect(normalizeToolArgs('move_file', { src: '/b' })).toEqual({ src: '/b' });
   });
 
-  it('should use universal fallback for unknown tool names', () => {
+  it('should preserve unknown tool args without mangling', () => {
     const result = normalizeToolArgs('unknown_tool', { file_path: '/test.txt' });
-    expect(result).toEqual({ AbsolutePath: '/test.txt' });
+    expect(result).toEqual({ file_path: '/test.txt' });
   });
 
   it('should return original args for unknown tool without path-like keys', () => {
@@ -136,9 +136,9 @@ describe('normalizeToolArgs', () => {
     expect(result).toEqual({ foo: 'bar' });
   });
 
-  it('should handle array args for known tools', () => {
+  it('should handle array args gracefully', () => {
     const result = normalizeToolArgs('view_file', ['/single.js'] as unknown as Record<string, unknown>);
-    expect(result).toEqual({ AbsolutePath: '/single.js' });
+    expect(result).toEqual(['/single.js']);
   });
 });
 
@@ -150,66 +150,64 @@ describe('translateToolCallToNative', () => {
     expect(result).toEqual({ name: 'view_file', args: { AbsolutePath: '/x.ts' } });
   });
 
-  it('should translate ls to list_dir', () => {
+  it('should pass through run_command calls with ls without mangling', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'ls /home/user',
       Cwd: '/tmp',
     });
-    expect(result.name).toBe('list_dir');
-    expect(result.args).toHaveProperty('DirectoryPath');
+    expect(result.name).toBe('run_command');
+    expect(result.args).toHaveProperty('CommandLine', 'ls /home/user');
   });
 
-  it('should translate dir to list_dir (Windows)', () => {
+  it('should pass through run_command calls with dir without mangling', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'dir src',
       Cwd: 'C:\\project',
     });
-    expect(result.name).toBe('list_dir');
+    expect(result.name).toBe('run_command');
+    expect(result.args).toHaveProperty('CommandLine', 'dir src');
   });
 
-  it('should translate cat to view_file', () => {
+  it('should pass through run_command calls with cat without mangling', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'cat /etc/hosts',
       Cwd: '/',
     });
-    expect(result.name).toBe('view_file');
-    expect(result.args).toHaveProperty('AbsolutePath');
+    expect(result.name).toBe('run_command');
+    expect(result.args).toHaveProperty('CommandLine', 'cat /etc/hosts');
   });
 
-  it('should translate type to view_file (Windows)', () => {
+  it('should pass through run_command calls with type without mangling', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'type C:\\file.txt',
       Cwd: 'C:\\',
     });
-    expect(result.name).toBe('view_file');
+    expect(result.name).toBe('run_command');
   });
 
-  it('should translate echo redirect to write_file', () => {
+  it('should pass through run_command calls with echo redirect', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'echo hello > /tmp/out.txt',
       Cwd: '/',
     });
-    expect(result.name).toBe('write_file');
-    expect(result.args).toHaveProperty('AbsolutePath');
+    expect(result.name).toBe('run_command');
   });
 
-  it('should translate grep to grep_search', () => {
+  it('should pass through run_command calls with grep', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'grep -i "TODO" /src',
       Cwd: '/',
     });
-    expect(result.name).toBe('grep_search');
-    expect(result.args).toHaveProperty('Query', 'TODO');
-    expect(result.args).toHaveProperty('CaseInsensitive', true);
+    expect(result.name).toBe('run_command');
+    expect(result.args).toHaveProperty('CommandLine', 'grep -i "TODO" /src');
   });
 
-  it('should handle findstr (Windows grep)', () => {
+  it('should pass through findstr', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'findstr /i TODO *.ts',
       Cwd: 'C:\\src',
     });
-    expect(result.name).toBe('grep_search');
-    expect(result.args).toHaveProperty('CaseInsensitive', true);
+    expect(result.name).toBe('run_command');
   });
 
   it('should pass through unknown commands', () => {
