@@ -37,8 +37,20 @@ async function installVendor(
 ) {
   const source = fs.mkdtempSync(path.join(root, 'vendor-'));
   put(path.join(source, 'package.json'), JSON.stringify({ version, main, vendorField: 'retain me' }));
-  put(path.join(source, main), `// original ${version}\n`);
-  put(path.join(source, 'dist/preload.js'), '// original preload\n');
+  put(
+    path.join(source, main),
+    `// original ${version}\nconst electron_1 = require('electron');\nelectron_1.app.whenReady().then(async () => { /* vendor boot */ });\n`,
+  );
+  put(
+    path.join(source, 'dist/preload.js'),
+    `// original preload\nconst electron_1 = require('electron');\nelectron_1.contextBridge.exposeInMainWorld('wsl', { getState: () => electron_1.ipcRenderer.invoke('wsl:get-state') });\n`,
+  );
+  put(
+    path.join(source, 'dist/languageServer.js'),
+    `// original server\nfunction startLanguageServer(port, csrf, options = {}) {\n const { headless, wsl } = options;\n return new Promise((resolve, reject) => {\n const args = ['--https_server_port', String(port), '--api_server_url', 'https://generativelanguage.googleapis.com', '--cloud_code_endpoint', 'https://daily-cloudcode-pa.googleapis.com', '--enable_sidecars'];\n resolve({ port, args });\n });\n}\n`,
+  );
+  put(path.join(source, 'dist/ipcHandlers.js'), '// vendor WSL and IPC handlers\n');
+  put(path.join(source, 'dist/utils.js'), '// vendor window and certificate settings\n');
   put(path.join(source, 'dist/vendor-only.js'), `// vendor ${version}\n`);
   put(path.join(source, 'native/helper.dat'), `native ${version}`);
   put(path.join(source, 'node_modules/vendor/index.js'), '// vendor dependency\n');
@@ -82,11 +94,16 @@ describe('standalone deployment with real ASAR fixtures', () => {
     expect(fs.existsSync(path.join(f.resources, '.antigravity-model-patch'))).toBe(false);
   });
 
-  it('overlays the current app, preserving vendor dist, dependencies, and every unpacked file', async () => {
+  it('adds hooks while preserving current vendor APIs, dependencies, and every unpacked file', async () => {
     const f = await fixture();
     const original = fingerprint(f.resources);
     await deploy(f);
-    expect(readArchive(f.resources, 'dist/main.js')).toBe('// patch main.js\n');
+    expect(readArchive(f.resources, 'dist/main.js')).toContain('// original 2.0.1');
+    expect(readArchive(f.resources, 'dist/main.js')).toContain('modelPatch/desktop');
+    expect(readArchive(f.resources, 'dist/preload.js')).toContain("exposeInMainWorld('wsl'");
+    expect(readArchive(f.resources, 'dist/ipcHandlers.js')).toBe('// vendor WSL and IPC handlers\n');
+    expect(readArchive(f.resources, 'dist/utils.js')).toBe('// vendor window and certificate settings\n');
+    expect(readArchive(f.resources, 'dist/modelPatch/desktop.js')).toBe('// patch desktop.js\n');
     expect(readArchive(f.resources, 'dist/vendor-only.js')).toBe('// vendor 2.0.1\n');
     expect(readArchive(f.resources, 'node_modules/vendor/index.js')).toBe('// vendor dependency\n');
     expect(JSON.parse(readArchive(f.resources, 'package.json')).vendorField).toBe('retain me');
@@ -107,10 +124,10 @@ describe('standalone deployment with real ASAR fixtures', () => {
     await installVendor(f.root, f.resources, '2.0.1', 'dist/main.js', '{native,dist}');
     await deploy(f);
     const archive = path.join(f.resources, 'app.asar');
-    const helper = path.normalize('dist/proxy/listen.js');
+    const helper = path.normalize('dist/modelPatch/proxy/listen.js');
     expect(asar.statFile(archive, helper).unpacked).toBe(true);
     expect(fs.readFileSync(path.join(`${archive}.unpacked`, helper), 'utf8')).toBe('// patch proxy/listen.js\n');
-    expect(readArchive(f.resources, 'dist/main.js')).toBe('// patch main.js\n');
+    expect(readArchive(f.resources, 'dist/main.js')).toContain('// original 2.0.1');
   });
 
   it('rejects an absolute unpacked link before it can write through to live files', async () => {
@@ -187,14 +204,57 @@ describe('standalone deployment with real ASAR fixtures', () => {
     const original = fingerprint(f.resources);
     await deploy(f);
     const first = state(f.resources);
-    put(path.join(f.dist, 'main.js'), '// second patch\n');
+    put(path.join(f.dist, 'desktop.js'), '// second patch\n');
     await deploy(f);
     expect(state(f.resources).backupId).toBe(first.backupId);
     expect(state(f.resources).original).toEqual(original);
-    expect(readArchive(f.resources, 'dist/main.js')).toBe('// second patch\n');
+    expect(readArchive(f.resources, 'dist/modelPatch/desktop.js')).toBe('// second patch\n');
+    expect(readArchive(f.resources, 'dist/main.js').match(/modelPatch\/desktop/g)).toHaveLength(1);
     await deploy({ resources: f.resources, restore: true });
     expect(fingerprint(f.resources)).toEqual(original);
     expect(fs.existsSync(path.join(f.resources, '.antigravity-model-patch/state.json'))).toBe(false);
+  });
+
+  it('recovers the vendor runtime when upgrading a recorded legacy overlay installation', async () => {
+    const f = await fixture();
+    const original = fingerprint(f.resources);
+    await deploy(f);
+    const manifest = state(f.resources);
+    // Model the previous installer's recorded overlay: the current main/preload
+    // are stale, but the verified original archive still belongs to this version.
+    const oldOverlay = path.join(f.root, 'old-overlay');
+    asar.extractAll(path.join(f.resources, 'app.asar'), oldOverlay);
+    put(path.join(oldOverlay, 'dist/main.js'), '// obsolete desktop entry\n');
+    put(path.join(oldOverlay, 'dist/preload.js'), '// obsolete renderer bridge\n');
+    await asar.createPackageWithOptions(oldOverlay, path.join(f.resources, 'app.asar'), { unpackDir: 'native' });
+    asar.uncacheAll();
+    put(
+      path.join(f.resources, '.antigravity-model-patch/state.json'),
+      JSON.stringify({
+        ...manifest,
+        patched: fingerprint(f.resources),
+      }),
+    );
+    await deploy(f);
+    expect(readArchive(f.resources, 'dist/main.js')).toContain('// original 2.0.1');
+    expect(readArchive(f.resources, 'dist/preload.js')).toContain("exposeInMainWorld('wsl'");
+    expect(state(f.resources).backupId).toBe(manifest.backupId);
+    await deploy({ resources: f.resources, restore: true });
+    expect(fingerprint(f.resources)).toEqual(original);
+  });
+
+  it('refuses an unfamiliar runtime during preflight without creating state or changing bytes', async () => {
+    const f = await fixture();
+    const unknown = path.join(f.root, 'unknown-runtime');
+    asar.extractAll(path.join(f.resources, 'app.asar'), unknown);
+    put(path.join(unknown, 'dist/languageServer.js'), '// new upstream startup architecture\n');
+    await asar.createPackageWithOptions(unknown, path.join(f.resources, 'app.asar'), { unpackDir: 'native' });
+    asar.uncacheAll();
+    const before = fingerprint(f.resources);
+    await expect(deploy({ ...f, check: true })).rejects.toThrow('UNSUPPORTED_RUNTIME');
+    await expect(deploy(f)).rejects.toThrow('UNSUPPORTED_RUNTIME');
+    expect(fingerprint(f.resources)).toEqual(before);
+    expect(fs.existsSync(path.join(f.resources, '.antigravity-model-patch'))).toBe(false);
   });
 
   it('a failed pack leaves archive, unpacked files, and binary byte-identical', async () => {
@@ -328,7 +388,7 @@ describe('standalone deployment with real ASAR fixtures', () => {
     expect(fs.existsSync(path.join(f.resources, '.antigravity-model-patch'))).toBe(false);
   });
 
-  it.each(['proxy/listen.js', 'updater.js', 'ideInstall/constants.js'])(
+  it.each(['proxy/listen.js', 'customIpc.js', 'customPreload.js', 'desktop.js'])(
     'rejects an incomplete build missing %s',
     async (filename) => {
       const f = await fixture();

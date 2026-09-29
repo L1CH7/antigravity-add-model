@@ -10,7 +10,7 @@ type State = { type: string; update?: { version: string } };
 // Execute the production CommonJS modules with an explicit Electron boundary.
 // No app, updater, shell, filesystem write, or network operation runs in this fixture.
 const compiled = new Map(
-  ['updater', 'ipcHandlers', 'preload'].map((name) => [
+  ['updater', 'ipcHandlers', 'customIpc', 'preload', 'customPreload'].map((name) => [
     name,
     ts.transpileModule(readFileSync(path.resolve('src', `${name}.ts`), 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
@@ -35,11 +35,18 @@ function loadModule(name: string, dependencies: Record<string, unknown>, globals
   return module.exports;
 }
 
-function createFixture() {
+function createFixture(customOnly = false) {
   const handlers = new Map<string, Handler>();
   const listeners = new Map<string, Set<Handler>>();
   const exposed: Record<string, Record<string, Handler>> = {};
   const stat = vi.fn();
+  const homePath = path.resolve('fixture', 'home');
+  let savedModels = '{"models":[]}';
+  const readFile = vi.fn(async () => savedModels);
+  const writeFile = vi.fn(async (_filename: string, contents: string) => {
+    savedModels = contents;
+  });
+  const mkdir = vi.fn();
   const showOpenDialog = vi.fn();
   const showItemInFolder = vi.fn();
   let responseStatus = 200;
@@ -53,7 +60,7 @@ function createFixture() {
     for (const callback of listeners.get(channel) || []) callback({}, ...args);
   });
   const electron = {
-    app: { isPackaged: false },
+    app: { isPackaged: false, getPath: () => homePath },
     BrowserWindow: { getAllWindows: () => [{ webContents: { send } }] },
     dialog: { showOpenDialog },
     shell: { showItemInFolder },
@@ -83,19 +90,35 @@ function createFixture() {
     child_process: {},
     'electron-updater': { autoUpdater: {} },
     'electron-log/main': {},
-    'fs/promises': { stat },
+    'fs/promises': { stat, readFile, writeFile, mkdir },
     http: { request },
     https: { request },
-    './cryptoStore': {},
+    './cryptoStore': {
+      encryptString: (value: string) => `encrypted:${value}`,
+      decryptString: (value: string) => value.replace(/^encrypted:/, ''),
+    },
     './customScheme': { extensionAuthorities: new Map() },
     './tray': {},
     './ideInstall/constants': { getIdeInstallPath: () => idePath },
   };
   const updater = loadModule('updater', dependencies);
-  const ipc = loadModule('ipcHandlers', { ...dependencies, './updater': updater });
-  ipc.registerIpcHandlers({});
-  loadModule('preload', dependencies, { window: { addEventListener: vi.fn() } });
+  const customIpc = loadModule('customIpc', dependencies);
+  if (customOnly) {
+    customIpc.registerCustomModelHandlers();
+  } else {
+    const ipc = loadModule('ipcHandlers', { ...dependencies, './updater': updater, './customIpc': customIpc });
+    ipc.registerIpcHandlers({});
+  }
+  const globals = { window: { addEventListener: vi.fn() } };
+  const customPreload = loadModule('customPreload', dependencies, globals);
+  if (!customOnly) loadModule('preload', { ...dependencies, './customPreload': customPreload }, globals);
   return {
+    handlers,
+    invoke: electron.ipcRenderer.invoke,
+    readFile,
+    writeFile,
+    mkdir,
+    homePath,
     exposed,
     updater,
     stat,
@@ -245,4 +268,59 @@ describe('renderer compatibility IPC contracts', () => {
       ).resolves.toEqual({ success: true, status, message: `Endpoint reachable (HTTP ${status})` });
     },
   );
+});
+
+describe('standalone custom model addon', () => {
+  it('registers only its four channels and exposes no replacement renderer APIs', () => {
+    const fixture = createFixture(true);
+    expect([...fixture.handlers.keys()]).toEqual([
+      'storage:get-custom-models',
+      'storage:save-custom-model',
+      'storage:delete-custom-model',
+      'storage:test-model-connection',
+    ]);
+    expect(fixture.exposed).toEqual({});
+  });
+
+  it('persists, masks, edits and deletes models using the existing configuration location', async () => {
+    const fixture = createFixture(true);
+    const model = {
+      name: 'my-model',
+      displayName: 'My model',
+      provider: 'openai',
+      apiUrl: 'https://provider.example/v1',
+      apiKey: 'secret-long-api-key',
+      externalModelName: 'provider-model',
+    };
+    await expect(fixture.invoke('storage:save-custom-model', { ...model })).resolves.toEqual({ success: true });
+    const filename = path.join(fixture.homePath, '.gemini', 'antigravity', 'custom_models.json');
+    expect(fixture.writeFile).toHaveBeenCalledWith(filename, expect.any(String), 'utf-8');
+    const persisted = JSON.parse(fixture.writeFile.mock.lastCall![1]);
+    expect(persisted.models).toEqual([{ ...model, apiKey: 'encrypted:secret-long-api-key', encrypted: true }]);
+
+    const models = (await fixture.invoke('storage:get-custom-models')) as Array<typeof model>;
+    expect(models[0].apiKey).toBe('secr...-key');
+    await fixture.invoke('storage:save-custom-model', { ...models[0], displayName: 'Renamed model' });
+    const edited = JSON.parse(fixture.writeFile.mock.lastCall![1]);
+    expect(edited.models).toHaveLength(1);
+    expect(edited.models[0]).toMatchObject({
+      displayName: 'Renamed model',
+      apiKey: 'encrypted:secret-long-api-key',
+      encrypted: true,
+    });
+
+    await expect(fixture.invoke('storage:delete-custom-model', model.name)).resolves.toEqual({ success: true });
+    await expect(fixture.invoke('storage:get-custom-models')).resolves.toEqual([]);
+  });
+
+  it('keeps provider connectivity failures available through its own IPC handler', async () => {
+    const fixture = createFixture(true);
+    fixture.setResponseStatus(403);
+    await expect(
+      fixture.invoke('storage:test-model-connection', {
+        apiUrl: 'https://provider.example/v1',
+        provider: 'openai',
+      }),
+    ).resolves.toMatchObject({ success: false, status: 403, error: expect.stringContaining('Access denied') });
+  });
 });

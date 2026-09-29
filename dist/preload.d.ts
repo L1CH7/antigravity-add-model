@@ -120,5 +120,6 @@ declare global {
         ide: IdeAPI;
     }
 }
+import './customPreload';
 export {};
 //# sourceMappingURL=preload.d.ts.map

@@ -4,6 +4,12 @@ This repository contains a patch for **Google Antigravity** that enables externa
 
 > **Compatibility:** This patch targets the standalone Electron desktop agent. The separate VS Code-based Antigravity IDE (including macOS 2.1.1) is not supported; the installer now detects it before changing files. See [compatibility and recovery](docs/compatibility.md).
 
+The installer preserves the installed desktop runtime, including the WSL bridge
+and certificate handling introduced in newer releases such as 2.17.0. It adds
+custom-model hooks instead of replacing the vendor's main process and preload
+with older copies. Custom-model routing currently applies to local sessions;
+WSL sessions retain their original vendor routing.
+
 ## How It Works
 
 ### Architecture
@@ -44,10 +50,10 @@ Antigravity standalone desktop agent
 #### UI & App Integration
 | File | Role |
 |---|---|
-| [preload.ts](src/preload.ts) | UI injection: Custom Models dashboard in Settings → Models, inline Add Model modal with animations, connectivity test button |
-| [main.ts](src/main.ts) | App lifecycle: intercepts and blocks `SetCloudCodeURL` requests to prevent the frontend from overriding the proxy endpoint |
-| [ipcHandlers.ts](src/ipcHandlers.ts) | Backend IPC: `storage:get-custom-models`, `storage:save-custom-model`, `storage:delete-custom-model`, `storage:test-model-connection` |
-| [languageServer.ts](src/languageServer.ts) | Modified language server manager, starts proxy on app launch |
+| [customPreload.ts](src/customPreload.ts) | Custom Models dashboard, appended to the vendor preload without replacing its APIs |
+| [desktop.ts](src/desktop.ts) | Scoped local model-list routing, endpoint protection, and load-error diagnostics |
+| [customIpc.ts](src/customIpc.ts) | Custom model CRUD and connectivity test handlers, alongside vendor IPC |
+| [runtime-patch.mjs](scripts/runtime-patch.mjs) | Validates and adds startup, language-server endpoint, and preload hooks to the installed runtime |
 
 #### Deployment Scripts
 | File | Platform |
@@ -58,7 +64,7 @@ Antigravity standalone desktop agent
 | [repack.ps1](repack.ps1) | Compatibility wrapper for the same transactional installer |
 
 > [!NOTE]
-> The codebase was migrated from JavaScript (`dist/`) to **TypeScript** (`src/`) in v2.0.3. All source code lives under `src/` and compiles to `dist/` via `npx tsc`. The compiled `dist/` files are what get packed into `app.asar`.
+> The codebase was migrated from JavaScript (`dist/`) to **TypeScript** (`src/`) in v2.0.3. Sources compile to `dist/` via `npx tsc`. The installer copies only custom-model modules into `app.asar/dist/modelPatch`; legacy desktop shell sources are retained for reference and are not deployed over vendor files.
 
 ### Cloud Code API Reverse Engineering
 
@@ -103,7 +109,7 @@ The proxy differentiates between **metadata requests** (which need buffering for
 
 ### SetCloudCodeURL Blocking
 
-The Antigravity frontend periodically attempts to call `SetCloudCodeURL` which would override the local proxy endpoint with the default Google API URL. The `main.ts` process intercepts and **cancels** these requests via `webRequest.onBeforeRequest`, ensuring the language server always routes through the local proxy.
+The Antigravity frontend periodically attempts to call `SetCloudCodeURL` which would override the local proxy endpoint with the default Google API URL. The `desktop.ts` addon cancels this RPC only on the active local language-server origin while the custom-model proxy is running. Other origins and WSL sessions keep their normal routing.
 
 ### DSML Tool Call Parser
 
@@ -144,7 +150,7 @@ server.on('error', (e) => {
 });
 ```
 
-For an unpatched language-server binary, an occupied port `50999` triggers fallback to an available port. `languageServer.ts` waits for the listener and passes its actual port through `--api_server_url`. The optional Windows binary patch requires port `50999`; its archive marker disables fallback, and a port conflict stops startup with an actionable error.
+For an unpatched language-server binary, an occupied port `50999` triggers fallback to an available port. The validated language-server hook waits for the listener and passes its actual port through the endpoint arguments. The optional Windows binary patch requires port `50999`; its archive marker disables fallback, and a port conflict stops startup with an actionable error.
 
 ### Parallel Request Isolation
 
@@ -209,12 +215,15 @@ antigravity-add-model/
 │   │       ├── anthropic.ts       # Anthropic ↔ Gemini translator
 │   │       ├── google.ts          # Google AI Studio passthrough + stream routing
 │   │       └── utils.ts           # Shared translator utilities (DSML, tool calls)
-│   ├── languageServer.ts          # Modified language server manager
-│   ├── ipcHandlers.ts             # Custom model CRUD + connectivity test IPC
+│   ├── desktop.ts                 # Addon lifecycle and local RPC routing
+│   ├── customIpc.ts               # Custom model CRUD + connectivity test IPC
+│   ├── customPreload.ts           # UI addon appended to vendor preload
+│   ├── languageServer.ts          # Legacy desktop runtime reference
+│   ├── ipcHandlers.ts             # Legacy desktop IPC reference
 │   ├── cryptoStore.ts             # AES-256-GCM API key encryption/decryption
 │   ├── schemaValidator.ts         # Runtime schema validation for responses & models
-│   ├── preload.ts                 # Settings UI injection (inline Add Model dashboard)
-│   ├── main.ts                    # App lifecycle + SetCloudCodeURL blocking
+│   ├── preload.ts                 # Legacy desktop preload reference
+│   ├── main.ts                    # Legacy desktop lifecycle reference
 │   ├── constants.ts               # Port & cert constants
 │   ├── paths.ts                   # Path utilities
 │   ├── storage.ts                 # StorageManager class
@@ -534,7 +543,7 @@ npx tsc --watch      # Watch mode for development
    - `map<Provider>ChunkToGemini(chunk, modelName)` → streaming chunk handler
 2. The registry auto-discovers new translator modules, so no config changes are needed
 3. Add provider to `getProviderHeaders()` in `registry.ts` if authentication differs
-4. Add provider option to UI dropdown in `src/preload.ts`
+4. Add provider option to UI dropdown in `src/customPreload.ts`
 5. Update `supportsStreaming()` in `registry.ts` if applicable
 
 ### TypeScript Architecture
@@ -554,6 +563,12 @@ Set `DEBUG=antigravity:*` for verbose logging (debug level captures stream parse
 ---
 
 ## Changelog
+
+### Unreleased — Antigravity 2.17.0 compatibility
+- Reproduced the Windows black screen as `ERR_CERT_AUTHORITY_INVALID` with the old runtime overlay.
+- Preserve the installed vendor runtime, including its certificate handling, WSL bridge, updater, and host bridge; add custom-model support through validated hooks.
+- Recover recorded overlay installations from verified originals and reject unfamiliar runtime layouts before changing application files.
+- Verified local UI startup with the official Windows 2.17.0 executable and language server in an isolated test profile. Authenticated model generation was not tested.
 
 ### v2.1.1
 - **Critical Fix**: Fixed a startup crash (`a.getState is not a function`) when launching with Antigravity v2.12.2.

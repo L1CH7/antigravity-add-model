@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 
-const preload = ts.transpileModule(readFileSync(path.resolve('src/preload.ts'), 'utf8'), {
+const preload = ts.transpileModule(readFileSync(path.resolve('src/customPreload.ts'), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText;
 const modelsUrl = 'http://localhost:50999/fetchAvailableModels';
@@ -12,6 +12,8 @@ const customModel = { name: 'example', displayName: 'Example', externalModelName
 
 function createFixture(response: Response, models: unknown[] = [customModel]) {
   let onDomLoaded = () => {};
+  const exposeInMainWorld = vi.fn();
+  const vendorStorage = Object.freeze({ getItems: vi.fn(), updateItems: vi.fn() });
   const nativeFetch = vi.fn().mockResolvedValue(response);
   const getModels = vi.fn().mockResolvedValue(models);
   const nativeOpen = vi.fn();
@@ -43,6 +45,7 @@ function createFixture(response: Response, models: unknown[] = [customModel]) {
     }
   }
   const window = {
+    nativeStorage: vendorStorage,
     fetch: nativeFetch as typeof fetch,
     addEventListener: (name: string, callback: () => void) => {
       if (name === 'DOMContentLoaded') onDomLoaded = callback;
@@ -53,7 +56,7 @@ function createFixture(response: Response, models: unknown[] = [customModel]) {
     require: (id: string) => {
       if (id !== 'electron') throw new Error(`Unexpected preload dependency: ${id}`);
       return {
-        contextBridge: { exposeInMainWorld: vi.fn() },
+        contextBridge: { exposeInMainWorld },
         ipcRenderer: { invoke: getModels },
         webFrame: {},
       };
@@ -69,10 +72,17 @@ function createFixture(response: Response, models: unknown[] = [customModel]) {
     console,
   });
   onDomLoaded();
-  return { window, nativeFetch, getModels, TestXHR, nativeOpen, nativeSend };
+  return { window, nativeFetch, getModels, TestXHR, nativeOpen, nativeSend, exposeInMainWorld, vendorStorage };
 }
 
 describe('preload model-response compatibility', () => {
+  it('runs with Electron alone and preserves APIs exposed by the vendor preload', () => {
+    const fixture = createFixture(new Response());
+    expect(fixture.exposeInMainWorld).not.toHaveBeenCalled();
+    expect(fixture.window.nativeStorage).toBe(fixture.vendorStorage);
+    expect(Object.keys(fixture.window.nativeStorage)).toEqual(['getItems', 'updateItems']);
+  });
+
   it.each(['string', 'URL', 'Request'])('accepts %s fetch input and injects plain JSON model lists', async (kind) => {
     const original = new Response('{"models":{"existing":{"displayName":"Existing"}}}', {
       headers: { 'content-type': 'Application/JSON; charset=utf-8' },
