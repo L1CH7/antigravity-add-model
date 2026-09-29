@@ -16,11 +16,10 @@
 </p>
 
 <p align="center">
-  <a href="#installation">Install</a> ·
-  <a href="#add-your-first-model">First model</a> ·
-  <a href="#optional-gateway-and-web-dashboard">Gateway</a> ·
+  <a href="#installation"><strong>Quick start</strong></a> ·
+  <a href="#quick-links">Quick links</a> ·
   <a href="#documentation">Documentation</a> ·
-  <a href="CHANGELOG.md">Changelog</a>
+  <a href="https://github.com/vahapogut/antigravity-add-model/issues/new">Report an issue</a>
 </p>
 
 ---
@@ -29,6 +28,15 @@ Add external API providers and local models alongside Antigravity's built-in mod
 
 > [!IMPORTANT]
 > This project targets the **standalone Electron desktop agent**. The separate **VS Code-based Antigravity IDE is not supported**. Custom-model routing applies to local desktop sessions; the vendor's WSL routing is preserved. Check [compatibility](docs/compatibility.md) before installing.
+
+## Quick links
+
+| Get started | Configure and connect | Help and project |
+| --- | --- | --- |
+| [Installation](#installation) | [Gateway and web dashboard](#optional-gateway-and-web-dashboard) | [Troubleshooting and recovery](#updates-diagnostics-and-recovery) |
+| [Add your first model](#add-your-first-model) | [Connect from another computer](#connect-from-another-computer) | [Supported app versions and layouts](docs/compatibility.md) |
+| [Provider options](#providers-and-advanced-options) | [Model configuration](docs/configuration.md) | [Changelog](CHANGELOG.md) |
+| [Development and contributing](#development-and-contributing) | [Google account setup](docs/configuration.md#google-cloud-code-account-pools) | [Browse existing issues](https://github.com/vahapogut/antigravity-add-model/issues) |
 
 ## What you can do
 
@@ -292,3 +300,5 @@ For a new provider, start with [the preset catalog](src/providers.ts) and [proto
 [Apache License 2.0](LICENSE). Adapted gateway components retain their [MIT license](gateway/LICENSE.upstream) and [upstream attribution](gateway/UPSTREAM.md).
 
 Maintained by **[vahapogut](https://github.com/vahapogut)** · [LinkedIn](https://www.linkedin.com/in/abdulvahap-ogut-343992398/)
+
+<p align="center"><a href="#quick-links">↑ Back to quick links</a></p>
