@@ -157,7 +157,10 @@ eligibility decision. Replacing a preload or repeatedly reinstalling the patch
 does not change it. Check the provider's supported locations and account access.
 A 404 needs the configured API URL and model/route availability checked.
 
-The connection-test button reports 401, 403, 404, 405, 429 and server failures as
-unsuccessful, with a specific explanation. A 405 means the endpoint rejects the
-lightweight HEAD probe, so that probe cannot verify access. Even a successful
-reachability probe does not prove that authenticated model generation will work.
+The connection-test button requests the provider's model list with the saved
+credentials and custom headers. It reports 401, 403, 404, 405, 429 and server
+failures as unsuccessful, and checks whether the selected model is advertised.
+An endpoint without a model-list API may still support generation; configure it
+manually if necessary. A successful listing does not prove that model generation
+will work or that the account has sufficient quota. For Google Cloud Code, the
+account editor also offers an explicit authorization/quota check.

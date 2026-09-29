@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import * as asar from '@electron/asar';
 import { deploy, fingerprint, parseArgs, preflight, REQUIRED_BUILD_FILES } from '../../scripts/deploy.mjs';
+
+// Real ASAR packing can exceed the default 5 seconds on a busy Windows disk.
+// Allow it to finish before cleanup removes files still being packed.
+vi.setConfig({ testTimeout: 20000 });
 
 const roots: string[] = [];
 const installer = fileURLToPath(new URL('../../scripts/deploy.mjs', import.meta.url));
@@ -85,6 +89,19 @@ afterEach(() => {
 });
 
 describe('standalone deployment with real ASAR fixtures', () => {
+  it('includes every relative runtime dependency in the deployed addon', () => {
+    const packaged = new Set(REQUIRED_BUILD_FILES);
+    for (const file of REQUIRED_BUILD_FILES) {
+      const filename = path.resolve('dist', file);
+      expect(fs.existsSync(filename), `Run npm run build: ${file}`).toBe(true);
+      const contents = fs.readFileSync(filename, 'utf8');
+      for (const match of contents.matchAll(/require\(["'](\.[^"']+)["']\)/g)) {
+        let dependency = path.posix.normalize(path.posix.join(path.posix.dirname(file), match[1]));
+        if (!dependency.endsWith('.js')) dependency += '.js';
+        expect(packaged.has(dependency), `${file} requires missing addon module ${dependency}`).toBe(true);
+      }
+    }
+  });
   it('checks a recognized install without writing anything', async () => {
     const f = await fixture();
     const before = fingerprint(f.resources);

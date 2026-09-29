@@ -1,14 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createModelManager } from '../modelManagement';
 import * as path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
+
+const fixtureHomes: string[] = [];
+afterEach(() => {
+  for (const home of fixtureHomes.splice(0)) rmSync(home, { recursive: true, force: true });
+});
 
 type Handler = (...args: unknown[]) => unknown;
 type State = { type: string; update?: { version: string } };
 
 // Execute the production CommonJS modules with an explicit Electron boundary.
-// No app, updater, shell, filesystem write, or network operation runs in this fixture.
+// No app, updater, shell or network operation runs here; model files use isolated temporary homes.
 const compiled = new Map(
   ['updater', 'ipcHandlers', 'customIpc', 'preload', 'customPreload'].map((name) => [
     name,
@@ -40,7 +47,8 @@ function createFixture(customOnly = false) {
   const listeners = new Map<string, Set<Handler>>();
   const exposed: Record<string, Record<string, Handler>> = {};
   const stat = vi.fn();
-  const homePath = path.resolve('fixture', 'home');
+  const homePath = mkdtempSync(path.join(tmpdir(), 'antigravity-ipc-'));
+  fixtureHomes.push(homePath);
   let savedModels = '{"models":[]}';
   const readFile = vi.fn(async () => savedModels);
   const writeFile = vi.fn(async (_filename: string, contents: string) => {
@@ -87,6 +95,8 @@ function createFixture(customOnly = false) {
   const dependencies = {
     electron,
     path,
+    'node:path': path,
+    './modelManagement': { createModelManager },
     child_process: {},
     'electron-updater': { autoUpdater: {} },
     'electron-log/main': {},
@@ -230,54 +240,32 @@ describe('renderer compatibility IPC contracts', () => {
     await expect(fixture.exposed.ide.isInstalled()).resolves.toBe(false);
   });
 
-  it.each([
-    [401, 'Authentication rejected'],
-    [403, 'Access denied'],
-    [404, 'Endpoint not found'],
-    [405, 'cannot verify model access'],
-    [429, 'Rate limited'],
-    [500, 'Server returned HTTP 500'],
-  ])('does not report HTTP %i as a successful model connection', async (status, message) => {
-    fixture.setResponseStatus(status as number);
-    await expect(
-      fixture.exposed.nativeStorage.testModelConnection({
-        apiUrl: 'https://provider.example/v1',
-        provider: 'openai',
-      }),
-    ).resolves.toEqual({ success: false, status, error: expect.stringContaining(message as string) });
-    expect(fixture.request).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: 'HEAD',
-        hostname: 'provider.example',
-        path: '/v1/chat/completions',
-        rejectUnauthorized: true,
-      }),
-      expect.any(Function),
-    );
-  });
-
-  it.each([200, 204, 301])(
-    'describes HTTP %i as endpoint reachability, without claiming generation succeeded',
-    async (status) => {
-      fixture.setResponseStatus(status);
-      await expect(
-        fixture.exposed.nativeStorage.testModelConnection({
-          apiUrl: 'https://provider.example/v1',
-          provider: 'openai',
-        }),
-      ).resolves.toEqual({ success: true, status, message: `Endpoint reachable (HTTP ${status})` });
-    },
-  );
+  // Provider HTTP status/body/credential behavior is exercised against real local
+  // servers in model-management.test.ts.
 });
 
 describe('standalone custom model addon', () => {
-  it('registers only its four channels and exposes no replacement renderer APIs', () => {
+  it('registers only addon storage channels and exposes no replacement renderer APIs', () => {
     const fixture = createFixture(true);
     expect([...fixture.handlers.keys()]).toEqual([
       'storage:get-custom-models',
       'storage:save-custom-model',
       'storage:delete-custom-model',
       'storage:test-model-connection',
+      'storage:get-provider-presets',
+      'storage:discover-models',
+      'storage:discover-local',
+      'storage:export-custom-models',
+      'storage:import-custom-models',
+      'storage:get-gateway',
+      'storage:save-gateway',
+      'storage:test-gateway',
+      'storage:import-gateway-models',
+      'storage:open-gateway-dashboard',
+      'storage:google-login',
+      'storage:google-login-cancel',
+      'storage:google-test-account',
+      'storage:google-pool-status',
     ]);
     expect(fixture.exposed).toEqual({});
   });
@@ -285,7 +273,7 @@ describe('standalone custom model addon', () => {
   it('persists, masks, edits and deletes models using the existing configuration location', async () => {
     const fixture = createFixture(true);
     const model = {
-      name: 'my-model',
+      name: 'models/my-model',
       displayName: 'My model',
       provider: 'openai',
       apiUrl: 'https://provider.example/v1',
@@ -294,14 +282,13 @@ describe('standalone custom model addon', () => {
     };
     await expect(fixture.invoke('storage:save-custom-model', { ...model })).resolves.toEqual({ success: true });
     const filename = path.join(fixture.homePath, '.gemini', 'antigravity', 'custom_models.json');
-    expect(fixture.writeFile).toHaveBeenCalledWith(filename, expect.any(String), 'utf-8');
-    const persisted = JSON.parse(fixture.writeFile.mock.lastCall![1]);
+    const persisted = JSON.parse(readFileSync(filename, 'utf8'));
     expect(persisted.models).toEqual([{ ...model, apiKey: 'encrypted:secret-long-api-key', encrypted: true }]);
 
     const models = (await fixture.invoke('storage:get-custom-models')) as Array<typeof model>;
-    expect(models[0].apiKey).toBe('secr...-key');
+    expect(models[0].apiKey).toBe('********');
     await fixture.invoke('storage:save-custom-model', { ...models[0], displayName: 'Renamed model' });
-    const edited = JSON.parse(fixture.writeFile.mock.lastCall![1]);
+    const edited = JSON.parse(readFileSync(filename, 'utf8'));
     expect(edited.models).toHaveLength(1);
     expect(edited.models[0]).toMatchObject({
       displayName: 'Renamed model',
@@ -315,12 +302,12 @@ describe('standalone custom model addon', () => {
 
   it('keeps provider connectivity failures available through its own IPC handler', async () => {
     const fixture = createFixture(true);
-    fixture.setResponseStatus(403);
+
     await expect(
       fixture.invoke('storage:test-model-connection', {
-        apiUrl: 'https://provider.example/v1',
+        apiUrl: 'file:///not-an-api',
         provider: 'openai',
       }),
-    ).resolves.toMatchObject({ success: false, status: 403, error: expect.stringContaining('Access denied') });
+    ).resolves.toMatchObject({ success: false, error: expect.stringContaining('HTTP(S)') });
   });
 });

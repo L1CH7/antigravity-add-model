@@ -1,9 +1,4 @@
-/**
- * Custom-model UI addon appended to the installed application's own preload.
- * Keep this module standalone: sandboxed preloads can only require Electron.
- * The vendor preload remains responsible for exposing its renderer APIs.
- */
-
+/** Custom-model UI, appended to the vendor preload. Sandboxed preloads require Electron only. */
 import { ipcRenderer } from 'electron';
 
 interface CustomModelEntry {
@@ -14,915 +9,1456 @@ interface CustomModelEntry {
   apiKey: string;
   apiUrl: string;
   externalModelName: string;
+  apiFormat?: string;
+  enabled?: boolean;
   allowUnauthorized?: boolean;
   encrypted?: boolean;
   [key: string]: unknown;
 }
-
-interface TestModelParams {
-  apiUrl: string;
-  provider: string;
-  apiKey?: string;
-  allowUnauthorized?: boolean;
+interface ProviderPreset {
+  id: string;
+  label: string;
+  defaultUrl: string;
+  apiFormat: string;
+  keyRequired: boolean;
 }
-
-interface ConnectionTestResult {
+interface ModelChoice {
+  id: string;
+  displayName?: string;
+}
+interface ActionResult {
   success: boolean;
-  status?: number;
-  message?: string;
   error?: string;
+  message?: string;
+  count?: number;
+  status?: number;
 }
-
-interface CustomStorageAPI {
-  getCustomModels: () => Promise<CustomModelEntry[]>;
-  saveCustomModel: (model: CustomModelEntry) => Promise<{ success: boolean; error?: string }>;
-  deleteCustomModel: (modelName: string) => Promise<{ success: boolean; error?: string }>;
-  testModelConnection: (model: TestModelParams) => Promise<ConnectionTestResult>;
+interface DiscoveryResult extends ActionResult {
+  models?: ModelChoice[];
 }
-
-const storageAPI: CustomStorageAPI = {
-  getCustomModels: () => ipcRenderer.invoke('storage:get-custom-models'),
-  saveCustomModel: (model) => ipcRenderer.invoke('storage:save-custom-model', model),
-  deleteCustomModel: (modelName) => ipcRenderer.invoke('storage:delete-custom-model', modelName),
-  testModelConnection: (model) => ipcRenderer.invoke('storage:test-model-connection', model),
+interface GatewayConfig {
+  url: string;
+  token: string;
+  dashboardUrl: string;
+}
+interface GoogleAccountEntry {
+  id: string;
+  label?: string;
+  refreshToken?: string;
+  accessToken?: string;
+  expiresAt?: number;
+  clientId?: string;
+  clientSecret?: string;
+  project?: string;
+  enabled?: boolean;
+}
+const storageAPI = {
+  getCustomModels: (): Promise<CustomModelEntry[]> => ipcRenderer.invoke('storage:get-custom-models'),
+  saveCustomModel: (model: CustomModelEntry): Promise<ActionResult> =>
+    ipcRenderer.invoke('storage:save-custom-model', model),
+  deleteCustomModel: (name: string): Promise<ActionResult> => ipcRenderer.invoke('storage:delete-custom-model', name),
+  testModelConnection: (model: Partial<CustomModelEntry>): Promise<ActionResult> =>
+    ipcRenderer.invoke('storage:test-model-connection', model),
+  getPresets: (): Promise<ProviderPreset[]> => ipcRenderer.invoke('storage:get-provider-presets'),
+  discoverModels: (params: Partial<CustomModelEntry>): Promise<DiscoveryResult> =>
+    ipcRenderer.invoke('storage:discover-models', params),
 };
 
-// ─── Custom Models UI Injection ─────────────────────────────────────────────
-
 window.addEventListener('DOMContentLoaded', () => {
-  function findRefreshButton(): HTMLButtonElement | null {
-    const buttons = Array.from(document.querySelectorAll('button'));
-    return (buttons.find((b) => b.textContent?.trim() === 'Refresh') as HTMLButtonElement) || null;
+  let modelList: CustomModelEntry[] = [];
+  let renderVersion = 0;
+  let searchTerm = '';
+  let cancelModalOperation: (() => void) | undefined;
+  const requireSuccess = (result: ActionResult): ActionResult => {
+    if (!result?.success) throw new Error(result?.error || 'The operation could not be completed.');
+    return result;
+  };
+  function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text = ''): HTMLElementTagNameMap[K] {
+    const node = document.createElement(tag);
+    node.className = className;
+    if (text) node.textContent = text;
+    return node;
   }
-
-  interface McpLayout {
-    mainContainer: Node;
-    headerRow: Element;
-    contentBlock: Element | null;
+  function setStatus(target: HTMLElement, text: string, error = false): void {
+    target.textContent = text;
+    target.className = `agy-status${error ? ' agy-error' : ''}`;
   }
-
-  function findMcpSectionContainer(): McpLayout | null {
-    const refreshBtn = findRefreshButton();
-    if (!refreshBtn) return null;
-
-    const btnGroup = refreshBtn.parentNode;
-    if (!btnGroup) return null;
-
-    const headerRow = btnGroup.parentNode as Element;
-    if (!headerRow) return null;
-
-    const mainContainer = headerRow.parentNode;
-    if (!mainContainer) return null;
-
-    const contentBlock = headerRow.nextElementSibling;
-
-    return {
-      mainContainer,
-      headerRow,
-      contentBlock,
+  function statusNode(): HTMLElement {
+    const node = element('div', 'agy-status');
+    node.setAttribute('role', 'status');
+    node.setAttribute('aria-live', 'polite');
+    return node;
+  }
+  function button(
+    label: string,
+    action: () => void | Promise<void>,
+    status?: HTMLElement,
+    primary = false,
+  ): HTMLButtonElement {
+    const node = element('button', `agy-btn${primary ? ' agy-primary' : ''}`, label);
+    node.type = 'button';
+    node.addEventListener('click', async () => {
+      if (node.disabled) return;
+      node.disabled = true;
+      try {
+        await action();
+      } catch (error) {
+        const target = status || document.getElementById('agy-main-status');
+        if (target) setStatus(target, error instanceof Error ? error.message : String(error), true);
+      } finally {
+        node.disabled = false;
+      }
+    });
+    return node;
+  }
+  function field(parent: HTMLElement, title: string, id: string, value = '', type = 'text'): HTMLInputElement {
+    const label = element('label', 'agy-field');
+    label.htmlFor = id;
+    label.append(element('span', '', title));
+    const input = element('input');
+    input.id = id;
+    input.type = type;
+    input.value = value;
+    input.autocomplete = 'off';
+    label.append(input);
+    parent.append(label);
+    return input;
+  }
+  function selectField(
+    parent: HTMLElement,
+    title: string,
+    id: string,
+    options: [string, string][],
+    value: string,
+  ): HTMLSelectElement {
+    const label = element('label', 'agy-field');
+    label.htmlFor = id;
+    label.append(element('span', '', title));
+    const select = element('select');
+    select.id = id;
+    for (const [key, caption] of options) {
+      const option = element('option', '', caption);
+      option.value = key;
+      select.append(option);
+    }
+    select.value = value;
+    label.append(select);
+    parent.append(label);
+    return select;
+  }
+  function jsonField(parent: HTMLElement, title: string, id: string, value: unknown): HTMLTextAreaElement {
+    const label = element('label', 'agy-field');
+    label.htmlFor = id;
+    label.append(element('span', '', title));
+    const input = element('textarea');
+    input.id = id;
+    input.rows = 3;
+    input.spellcheck = false;
+    input.value = value ? JSON.stringify(value, null, 2) : '';
+    input.placeholder = '{}';
+    label.append(input);
+    parent.append(label);
+    return input;
+  }
+  function readJson(input: HTMLTextAreaElement, title: string): Record<string, unknown> | undefined {
+    if (!input.value.trim()) return undefined;
+    try {
+      const value = JSON.parse(input.value);
+      if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error();
+      return value;
+    } catch {
+      throw new Error(`${title} must be a JSON object.`);
+    }
+  }
+  function readNumber(input: HTMLInputElement, title: string, minimum = 0): number | undefined {
+    if (!input.value.trim()) return undefined;
+    const value = Number(input.value);
+    if (!Number.isSafeInteger(value) || value < minimum)
+      throw new Error(`${title} must be a whole number of at least ${minimum}.`);
+    return value;
+  }
+  function validUrl(value: string): string {
+    let url: URL;
+    try {
+      url = new URL(value.trim());
+    } catch {
+      throw new Error('Enter a complete http:// or https:// API URL.');
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password)
+      throw new Error('Use an HTTP or HTTPS URL. Enter credentials in the API key field.');
+    return value.trim();
+  }
+  function installStyles(): void {
+    if (document.getElementById('agy-manager-style')) return;
+    const style = element('style');
+    style.id = 'agy-manager-style';
+    style.textContent = `
+      #agy-custom-models-section,#agy-modal-overlay{font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e4e4e7;box-sizing:border-box}
+      #agy-custom-models-section *,#agy-modal-overlay *{box-sizing:border-box}
+      #agy-custom-models-section [hidden],#agy-modal-overlay [hidden]{display:none!important}
+      #agy-custom-models-section{margin:24px 0;padding:20px;border:1px solid #303036;border-radius:12px;background:#18181b;min-width:0}
+      #agy-custom-models-section h2,#agy-modal-overlay h2{font-size:18px;margin:0;color:#fafafa;font-weight:600}
+      #agy-custom-models-section h3{font-size:13px;margin:0;color:#f4f4f5}
+      .agy-toolbar,.agy-actions,.agy-group-heading,.agy-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+      .agy-toolbar{justify-content:space-between;margin-bottom:12px}.agy-actions{margin:10px 0}
+      .agy-muted{color:#a1a1aa;font-size:12px;overflow-wrap:anywhere}.agy-group{margin-top:16px;border-top:1px solid #303036;padding-top:14px}
+      .agy-group-heading{justify-content:space-between}.agy-row{justify-content:space-between;border:1px solid #303036;border-radius:8px;padding:12px;margin-top:8px;background:#202024}
+      .agy-row-info{flex:1;min-width:150px;overflow-wrap:anywhere}.agy-row[data-enabled="false"] .agy-row-info{opacity:.55}
+      #agy-custom-models-section .agy-btn,#agy-modal-overlay .agy-btn{appearance:none;font:inherit;color:#e4e4e7;background:#27272c;border:1px solid #414149;border-radius:6px;padding:6px 10px;cursor:pointer;white-space:nowrap}
+      #agy-custom-models-section .agy-primary,#agy-modal-overlay .agy-primary{background:#e4e4e7;color:#18181b;border-color:#e4e4e7;font-weight:600}
+      #agy-custom-models-section .agy-btn:hover,#agy-modal-overlay .agy-btn:hover{filter:brightness(1.12)}
+      #agy-custom-models-section .agy-btn:disabled,#agy-modal-overlay .agy-btn:disabled{opacity:.5;cursor:wait}
+      #agy-custom-models-section :focus-visible,#agy-modal-overlay :focus-visible{outline:2px solid #a78bfa;outline-offset:3px}
+      .agy-status{color:#86efac;font-size:12px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}.agy-status:empty{display:none}.agy-error{color:#fca5a5}
+      .agy-field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;min-width:0;color:#a1a1aa}
+      #agy-custom-models-section input,#agy-modal-overlay input,#agy-modal-overlay select,#agy-modal-overlay textarea{font:inherit;width:100%;background:#25252a;border:1px solid #414149;border-radius:6px;color:#fafafa;padding:8px 10px;min-width:0}
+      #agy-modal-overlay textarea{font-family:ui-monospace,monospace;resize:vertical}#agy-modal-overlay input[type=checkbox]{width:auto;accent-color:#a78bfa}
+      #agy-modal-overlay{position:fixed;inset:0;z-index:999999;background:#000a;display:flex;align-items:center;justify-content:center;padding:20px}
+      #agy-modal-card{width:680px;max-width:100%;max-height:90vh;overflow:auto;background:#18181b;border:1px solid #414149;border-radius:12px;padding:24px;box-shadow:0 24px 80px #0008}
+      .agy-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.agy-discovery{max-height:240px;overflow:auto;margin:12px 0}
+      .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 0;overflow-wrap:anywhere}.agy-choice span{min-width:0}
+      #agy-modal-overlay details{border:1px solid #303036;border-radius:8px;margin:12px 0;padding:12px}#agy-modal-overlay summary{cursor:pointer;margin-bottom:10px;font-weight:500}
+      @media(max-width:600px){.agy-grid{grid-template-columns:1fr}#agy-modal-card{padding:16px}.agy-row .agy-actions{width:100%}}
+    `;
+    document.head.append(style);
+  }
+  function openModal(title: string): { body: HTMLElement; status: HTMLElement; close: () => void } {
+    cancelModalOperation?.();
+    cancelModalOperation = undefined;
+    document.getElementById('agy-modal-overlay')?.remove();
+    const previousFocus = document.activeElement as HTMLElement | null;
+    const overlay = element('div');
+    overlay.id = 'agy-modal-overlay';
+    const card = element('div');
+    card.id = 'agy-modal-card';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+    card.setAttribute('aria-labelledby', 'agy-modal-title');
+    const header = element('div', 'agy-toolbar');
+    const heading = element('h2', '', title);
+    heading.id = 'agy-modal-title';
+    const close = () => {
+      cancelModalOperation?.();
+      cancelModalOperation = undefined;
+      overlay.remove();
+      if (previousFocus?.isConnected) previousFocus.focus();
     };
+    header.append(heading, button('Close', close));
+    const body = element('div');
+    const status = statusNode();
+    card.append(header, body, status);
+    overlay.append(card);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) close();
+    });
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      }
+      if (event.key !== 'Tab') return;
+      const controls = Array.from(
+        card.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select,textarea,summary'),
+      );
+      const first = controls[0],
+        last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    });
+    document.body.append(overlay);
+    header.querySelector('button')?.focus();
+    return { body, status, close };
   }
 
-  // ─── Provider Icons & Status Helpers ──────────────────────────────
-  const PROVIDER_ICONS: Record<string, string> = {
-    openai: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M2 17l10 5 10-5" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M2 12l10 5 10-5" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>`,
-    anthropic: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="3" y="8" width="4" height="8" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="10" y="5" width="4" height="14" rx="1" stroke="currentColor" stroke-width="1.5"/><rect x="17" y="2" width="4" height="20" rx="1" stroke="currentColor" stroke-width="1.5"/></svg>`,
-    google: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.5"/><path d="M12 4a8 8 0 0 1 5.66 13.66L12 12V4z" fill="currentColor" fill-opacity="0.2"/></svg>`,
-    ollama: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.5"/><circle cx="9" cy="10" r="1.5" fill="currentColor"/><circle cx="15" cy="10" r="1.5" fill="currentColor"/><path d="M8 15c1 1.5 3 2 4 2s3-.5 4-2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
-    openrouter: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="12" cy="12" r="3" fill="currentColor" fill-opacity="0.3"/></svg>`,
-    custom: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="7" stroke="currentColor" stroke-width="1.5"/><path d="M12 8v8M8 12h8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
-  };
-
-  const PROVIDER_COLORS: Record<string, string> = {
-    openai: '#10a37f',
-    anthropic: '#d97757',
-    google: '#4285f4',
-    ollama: '#f0f0f0',
-    openrouter: '#ff7a45',
-    custom: '#a855f7',
-  };
-
-  function getProviderIcon(provider: string): string {
-    return PROVIDER_ICONS[provider] || PROVIDER_ICONS.custom;
+  function createGoogleAccountPanel(
+    parent: HTMLElement,
+    initialAccounts: GoogleAccountEntry[],
+    modelName?: string,
+  ): () => GoogleAccountEntry[] {
+    let accounts = initialAccounts.map((account) => ({ ...account }));
+    const locallyEdited = new Set<string>();
+    const panel = element('details');
+    panel.open = true;
+    panel.append(element('summary', '', 'Google accounts'));
+    panel.append(
+      element(
+        'p',
+        'agy-muted',
+        'Add accounts you own using your Desktop OAuth client or a credential file. Save the model to retain changes. Existing secrets stay masked.',
+      ),
+    );
+    const list = element('div');
+    list.id = 'agy-google-accounts-list';
+    const editor = element('div');
+    const status = statusNode();
+    const randomId = () => `account-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const addAccount = (account: GoogleAccountEntry) => {
+      if (!account.id || (!account.refreshToken && !account.accessToken))
+        throw new Error('An account needs an ID and a refresh token or access token.');
+      if (account.refreshToken && !account.clientId)
+        throw new Error('An OAuth client ID is required with a refresh token.');
+      const index = accounts.findIndex((value) => value.id === account.id);
+      if (index < 0) {
+        if (accounts.length >= 50) throw new Error('A model can contain at most 50 Google accounts.');
+        accounts.push(account);
+      } else accounts[index] = account;
+      locallyEdited.add(account.id);
+      renderAccounts();
+    };
+    function editAccount(account?: GoogleAccountEntry): void {
+      editor.replaceChildren();
+      editor.append(element('h3', '', account ? 'Edit account' : 'Add account credentials'));
+      const accountGrid = element('div', 'agy-grid');
+      const id = field(accountGrid, 'Account ID', 'agy-account-id', account?.id || randomId());
+      const label = field(accountGrid, 'Label', 'agy-account-label', account?.label || '');
+      const clientId = field(accountGrid, 'Desktop OAuth client ID', 'agy-account-client-id', account?.clientId || '');
+      const clientSecret = field(
+        accountGrid,
+        'OAuth client secret (if required)',
+        'agy-account-client-secret',
+        account?.clientSecret || '',
+        'password',
+      );
+      const refresh = field(
+        accountGrid,
+        'Refresh token',
+        'agy-account-refresh-token',
+        account?.refreshToken || '',
+        'password',
+      );
+      const access = field(
+        accountGrid,
+        'Access token (optional with refresh token)',
+        'agy-account-access-token',
+        account?.accessToken || '',
+        'password',
+      );
+      const expires = field(
+        accountGrid,
+        'Access token expiry (Unix milliseconds)',
+        'agy-account-expires-at',
+        account?.expiresAt != null ? String(account.expiresAt) : '',
+        'number',
+      );
+      const project = field(accountGrid, 'Cloud project (optional)', 'agy-account-project', account?.project || '');
+      editor.append(accountGrid);
+      const actions = element('div', 'agy-actions');
+      actions.append(
+        button(
+          'Apply account',
+          () => {
+            const accountId = id.value.trim();
+            if (account && accountId !== account.id && accounts.some((value) => value.id === accountId))
+              throw new Error('That account ID already exists.');
+            const updated: GoogleAccountEntry = {
+              id: accountId,
+              label: label.value.trim(),
+              clientId: clientId.value.trim(),
+              clientSecret: clientSecret.value.trim(),
+              refreshToken: refresh.value.trim(),
+              accessToken: access.value.trim(),
+              expiresAt: readNumber(expires, 'Token expiry', 1),
+              project: project.value.trim(),
+              enabled: account?.enabled !== false,
+            };
+            // IDs bind masked secrets to their stored record, so changing an existing ID requires fresh credentials.
+            if (
+              account &&
+              accountId !== account.id &&
+              [updated.refreshToken, updated.accessToken, updated.clientSecret].some((value) => value?.includes('***'))
+            )
+              throw new Error('Keep the account ID unchanged when using masked credentials.');
+            addAccount(updated);
+            if (account && accountId !== account.id) accounts = accounts.filter((value) => value.id !== account.id);
+            editor.replaceChildren();
+            renderAccounts();
+            setStatus(status, 'Account updated. Save the model to keep these changes.');
+          },
+          status,
+        ),
+        button('Cancel account edit', () => editor.replaceChildren(), status),
+      );
+      editor.append(actions);
+    }
+    function renderAccounts(): void {
+      list.replaceChildren();
+      if (!accounts.length) list.append(element('p', 'agy-muted', 'No Google accounts configured.'));
+      for (const account of accounts) {
+        const row = element('div', 'agy-row');
+        const info = element('div', 'agy-row-info');
+        info.append(
+          element('strong', '', account.label || account.id),
+          element(
+            'div',
+            'agy-muted',
+            `${account.id} · ${account.enabled === false ? 'Disabled' : 'Enabled'}${account.project ? ` · ${account.project}` : ''}`,
+          ),
+        );
+        const actions = element('div', 'agy-actions');
+        actions.append(
+          button('Edit account', () => editAccount(account), status),
+          button(
+            account.enabled === false ? 'Enable account' : 'Disable account',
+            () => {
+              account.enabled = account.enabled === false;
+              renderAccounts();
+            },
+            status,
+          ),
+          button(
+            'Test account',
+            async () => {
+              setStatus(status, 'Checking account access and quota…');
+              const result = await ipcRenderer.invoke(
+                'storage:google-test-account',
+                modelName && !locallyEdited.has(account.id)
+                  ? { modelName, accountId: account.id }
+                  : { account, ...(modelName ? { modelName } : {}) },
+              );
+              requireSuccess(result);
+              setStatus(
+                status,
+                result.message ||
+                  (result.quota
+                    ? `Account verified. Quota: ${JSON.stringify(result.quota)}`
+                    : 'Account verified. Generation was not tested.'),
+              );
+            },
+            status,
+          ),
+          button(
+            'Remove account',
+            () => {
+              accounts = accounts.filter((value) => value.id !== account.id);
+              locallyEdited.delete(account.id);
+              renderAccounts();
+            },
+            status,
+          ),
+        );
+        row.append(info, actions);
+        list.append(row);
+      }
+    }
+    const actions = element('div', 'agy-actions');
+    actions.append(
+      button('Add account', () => editAccount(), status),
+      button(
+        'Pool status',
+        async () => {
+          const result = await ipcRenderer.invoke('storage:google-pool-status');
+          if (result?.success === false) requireSuccess(result);
+          setStatus(status, JSON.stringify(result, null, 2));
+        },
+        status,
+      ),
+    );
+    const login = element('details');
+    login.append(element('summary', '', 'Sign in with your OAuth client'));
+    login.append(
+      element(
+        'p',
+        'agy-muted',
+        'Enter a Desktop OAuth client from your Google Cloud project. The browser opens only when you choose Sign in. Your project and account must be eligible for Cloud Code.',
+      ),
+    );
+    const loginLabel = field(login, 'Account label', 'agy-google-login-label');
+    const loginClient = field(login, 'Desktop OAuth client ID', 'agy-google-login-client-id');
+    const loginSecret = field(
+      login,
+      'OAuth client secret (if required)',
+      'agy-google-login-client-secret',
+      '',
+      'password',
+    );
+    const loginActions = element('div', 'agy-actions');
+    loginActions.append(
+      button(
+        'Sign in with Google',
+        async () => {
+          if (!loginClient.value.trim()) throw new Error('Enter your Desktop OAuth client ID.');
+          const cancel = () => {
+            void ipcRenderer.invoke('storage:google-login-cancel').catch(() => {});
+          };
+          cancelModalOperation = cancel;
+          setStatus(status, 'Complete consent in your browser. This login expires after two minutes.');
+          try {
+            const result = await ipcRenderer.invoke('storage:google-login', {
+              clientId: loginClient.value.trim(),
+              clientSecret: loginSecret.value.trim() || undefined,
+              label: loginLabel.value.trim() || undefined,
+            });
+            requireSuccess(result);
+            if (!panel.isConnected) return;
+            if (!result.account) throw new Error('Google login did not return an account.');
+            addAccount(result.account as GoogleAccountEntry);
+            loginSecret.value = '';
+            setStatus(
+              status,
+              'Account authorized. Save the model within 10 minutes to retain it; otherwise sign in again.',
+            );
+          } finally {
+            if (cancelModalOperation === cancel) cancelModalOperation = undefined;
+          }
+        },
+        status,
+      ),
+      button(
+        'Cancel Google login',
+        async () => {
+          requireSuccess(await ipcRenderer.invoke('storage:google-login-cancel'));
+          cancelModalOperation = undefined;
+          setStatus(status, 'Google login cancelled.');
+        },
+        status,
+      ),
+    );
+    login.append(loginActions);
+    const importer = element('details');
+    importer.append(element('summary', '', 'Import account credentials'));
+    importer.append(
+      element(
+        'p',
+        'agy-muted',
+        'Import your own authorized_user JSON, an account object, or an accounts array. Importing does not open a browser or make network requests.',
+      ),
+    );
+    const accountJson = jsonField(importer, 'Account JSON', 'agy-google-account-json', undefined);
+    const file = field(importer, 'Credential JSON file', 'agy-google-account-file', '', 'file');
+    file.accept = '.json,application/json';
+    file.addEventListener('change', async () => {
+      try {
+        const selected = file.files?.[0];
+        if (!selected) return;
+        if (selected.size > 512 * 1024) throw new Error('Account files must be smaller than 512 KB.');
+        accountJson.value = await selected.text();
+      } catch (error) {
+        setStatus(status, String(error), true);
+      }
+    });
+    importer.append(
+      button(
+        'Import accounts',
+        () => {
+          let data: unknown;
+          try {
+            data = JSON.parse(accountJson.value);
+          } catch {
+            throw new Error('Account credentials must be valid JSON.');
+          }
+          const root = data as { accounts?: unknown[]; googleAccounts?: unknown[] };
+          const values = Array.isArray(data) ? data : root?.accounts || root?.googleAccounts || [data];
+          if (!Array.isArray(values) || !values.length || values.length + accounts.length > 50)
+            throw new Error('Import between 1 and 50 accounts.');
+          const incoming = values.map((value) => {
+            if (!value || typeof value !== 'object' || Array.isArray(value))
+              throw new Error('Each account must be a JSON object.');
+            const entry = value as Record<string, unknown>;
+            const text = (key: string, alternate = key): string => String(entry[key] || entry[alternate] || '');
+            const account: GoogleAccountEntry = {
+              id: text('id') || randomId(),
+              label: text('label', 'accountEmail') || 'Imported account',
+              refreshToken: text('refreshToken', 'refresh_token'),
+              accessToken: text('accessToken', 'access_token'),
+              clientId: text('clientId', 'client_id'),
+              clientSecret: text('clientSecret', 'client_secret'),
+              project: text('project', 'quota_project_id'),
+              enabled: entry.enabled !== false,
+              ...(entry.expiresAt != null ? { expiresAt: Number(entry.expiresAt) } : {}),
+            };
+            if (!account.refreshToken && !account.accessToken)
+              throw new Error('An imported account must contain a refresh token or access token.');
+            if (account.refreshToken && !account.clientId)
+              throw new Error('An imported refresh token requires its OAuth client ID.');
+            return account;
+          });
+          for (const account of incoming) addAccount(account);
+          accountJson.value = '';
+          file.value = '';
+          setStatus(status, `Imported ${incoming.length} accounts. Save the model to encrypt and retain them.`);
+        },
+        status,
+      ),
+    );
+    panel.append(list, actions, editor, login, importer, status);
+    parent.append(panel);
+    renderAccounts();
+    return () => accounts.map((account) => ({ ...account }));
   }
-
-  function getProviderColor(provider: string): string {
-    return PROVIDER_COLORS[provider] || PROVIDER_COLORS.custom;
+  function findRefreshButton(): HTMLButtonElement | null {
+    return (
+      Array.from(document.querySelectorAll('button')).find(
+        (node) =>
+          !node.closest('#agy-custom-models-section') &&
+          (node.textContent?.trim() === 'Refresh' ||
+            /refresh quota/i.test(`${node.getAttribute('aria-label') || ''} ${node.title || ''}`)),
+      ) || null
+    );
   }
-
+  async function modelsChanged(): Promise<void> {
+    customModelsCache.ts = 0;
+    await renderCustomModelsList();
+    findRefreshButton()?.click();
+  }
+  function uniqueName(base: string): string {
+    let name = base,
+      index = 2;
+    while (modelList.some((model) => model.name === name)) name = `${base}-${index++}`;
+    return name;
+  }
   async function renderCustomModelsList(): Promise<void> {
-    const contentArea = document.getElementById('agy-custom-models-content');
-    if (!contentArea) return;
-
-    contentArea.innerHTML = '';
-
+    const target = document.getElementById('agy-custom-models-content');
+    if (!target) return;
+    const version = ++renderVersion;
     try {
       const models = await storageAPI.getCustomModels();
-      if (!models || models.length === 0) {
-        const placeholder = document.createElement('div');
-        placeholder.style.display = 'flex';
-        placeholder.style.flexDirection = 'column';
-        placeholder.style.alignItems = 'center';
-        placeholder.style.justifyContent = 'center';
-        placeholder.style.padding = '24px';
-        placeholder.style.backgroundColor = '#18181b';
-        placeholder.style.border = '1px solid #27272a';
-        placeholder.style.borderRadius = '8px';
-        placeholder.style.textAlign = 'center';
-
-        placeholder.innerHTML = `
-                    <div style="font-size: 15px; font-weight: 600; color: #f4f4f5; margin-bottom: 4px;">No Custom Models</div>
-                    <div style="font-size: 13px; color: #a1a1aa;">You currently don't have any custom models installed. Add a custom model above.</div>
-                `;
-        contentArea.appendChild(placeholder);
-      } else {
-        models.forEach((model) => {
-          const item = document.createElement('div');
-          item.style.display = 'flex';
-          item.style.justifyContent = 'space-between';
-          item.style.alignItems = 'center';
-          item.style.padding = '12px 16px';
-          item.style.backgroundColor = '#18181b';
-          item.style.border = '1px solid #27272a';
-          item.style.borderRadius = '8px';
-          item.style.transition = 'border-color 0.15s ease, background-color 0.15s ease';
-          item.style.marginBottom = '8px';
-
-          item.addEventListener('mouseenter', () => {
-            item.style.borderColor = '#3f3f46';
-            item.style.backgroundColor = '#1c1c1f';
-          });
-          item.addEventListener('mouseleave', () => {
-            item.style.borderColor = '#27272a';
-            item.style.backgroundColor = '#18181b';
-          });
-
-          // ─── Left: Provider icon + model info ────────────
-          const left = document.createElement('div');
-          left.style.display = 'flex';
-          left.style.alignItems = 'center';
-          left.style.gap = '12px';
-
-          // Provider icon bubble
-          const iconWrapper = document.createElement('div');
-          iconWrapper.style.width = '32px';
-          iconWrapper.style.height = '32px';
-          iconWrapper.style.borderRadius = '8px';
-          iconWrapper.style.display = 'flex';
-          iconWrapper.style.alignItems = 'center';
-          iconWrapper.style.justifyContent = 'center';
-          iconWrapper.style.backgroundColor = getProviderColor(model.provider as string) + '18';
-          iconWrapper.style.color = getProviderColor(model.provider as string);
-          iconWrapper.style.flexShrink = '0';
-          iconWrapper.innerHTML = getProviderIcon(model.provider as string);
-
-          // Text info
-          const info = document.createElement('div');
-          info.style.display = 'flex';
-          info.style.flexDirection = 'column';
-          info.style.gap = '2px';
-
-          // Title row with status dot
-          const titleRow = document.createElement('div');
-          titleRow.style.display = 'flex';
-          titleRow.style.alignItems = 'center';
-          titleRow.style.gap = '6px';
-
-          // Status indicator dot
-          const statusDot = document.createElement('span');
-          statusDot.style.width = '6px';
-          statusDot.style.height = '6px';
-          statusDot.style.borderRadius = '50%';
-          statusDot.style.flexShrink = '0';
-          statusDot.style.backgroundColor = '#71717a'; // neutral = unknown
-          statusDot.title = 'Connection status unknown (test to verify)';
-          statusDot.style.transition = 'background-color 0.3s ease';
-
-          const title = document.createElement('div');
-          title.style.fontSize = '14px';
-          title.style.fontWeight = '500';
-          title.style.color = '#f4f4f5';
-          title.textContent = (model.displayName as string) || (model.name as string);
-
-          titleRow.appendChild(statusDot);
-          titleRow.appendChild(title);
-
-          // Subtitle with provider badge
-          const sub = document.createElement('div');
-          sub.style.fontSize = '12px';
-          sub.style.color = '#a1a1aa';
-          sub.style.display = 'flex';
-          sub.style.alignItems = 'center';
-          sub.style.gap = '8px';
-
-          // Provider badge
-          const badge = document.createElement('span');
-          badge.style.fontSize = '10px';
-          badge.style.fontWeight = '600';
-          badge.style.textTransform = 'uppercase';
-          badge.style.letterSpacing = '0.5px';
-          badge.style.padding = '2px 6px';
-          badge.style.borderRadius = '4px';
-          badge.style.backgroundColor = getProviderColor(model.provider as string) + '22';
-          badge.style.color = getProviderColor(model.provider as string);
-          badge.textContent = model.provider as string;
-
-          sub.appendChild(badge);
-          sub.appendChild(document.createTextNode(model.apiUrl as string));
-
-          info.appendChild(titleRow);
-          info.appendChild(sub);
-
-          left.appendChild(iconWrapper);
-          left.appendChild(info);
-
-          // ─── Right: Action buttons ──────────────────
-          const actions = document.createElement('div');
-          actions.style.display = 'flex';
-          actions.style.gap = '4px';
-          actions.style.alignItems = 'center';
-
-          // Test Connection button
-          const testBtn = document.createElement('button');
-          testBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`;
-          testBtn.style.background = 'transparent';
-          testBtn.style.border = 'none';
-          testBtn.style.color = '#a1a1aa';
-          testBtn.style.cursor = 'pointer';
-          testBtn.style.padding = '6px';
-          testBtn.style.borderRadius = '4px';
-          testBtn.style.display = 'flex';
-          testBtn.style.alignItems = 'center';
-          testBtn.style.justifyContent = 'center';
-          testBtn.style.transition = 'color 0.15s ease, background-color 0.15s ease';
-          testBtn.title = 'Test connection';
-
-          testBtn.addEventListener('mouseenter', () => {
-            testBtn.style.color = '#22c55e';
-            testBtn.style.backgroundColor = 'rgba(34, 197, 94, 0.1)';
-          });
-          testBtn.addEventListener('mouseleave', () => {
-            testBtn.style.color = '#a1a1aa';
-            testBtn.style.backgroundColor = 'transparent';
-          });
-
-          testBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            // Show loading spinner
-            const originalHtml = testBtn.innerHTML;
-            testBtn.style.color = '#fbbf24';
-            testBtn.style.cursor = 'wait';
-            testBtn.disabled = true;
-            testBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>`;
-
-            try {
-              const result = await storageAPI.testModelConnection({
-                apiUrl: model.apiUrl as string,
-                provider: model.provider as string,
-                apiKey: model.apiKey as string,
-                allowUnauthorized: model.allowUnauthorized as boolean | undefined,
-              });
-
-              if (result.success) {
-                statusDot.style.backgroundColor = '#22c55e'; // green
-                statusDot.title = result.message || 'Connected';
-                testBtn.title = 'Connected ✓';
-                testBtn.style.color = '#22c55e';
-                testBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`;
-              } else {
-                statusDot.style.backgroundColor = '#ef4444'; // red
-                const errMsg = result.error || 'Connection failed';
-                statusDot.title = errMsg;
-                testBtn.title = errMsg;
-                testBtn.style.color = '#ef4444';
-                testBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
-              }
-            } catch (err) {
-              statusDot.style.backgroundColor = '#ef4444';
-              statusDot.title = 'Connection test failed';
-              testBtn.title = 'Connection test failed';
-              testBtn.style.color = '#ef4444';
-              testBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
-            }
-
-            testBtn.style.cursor = 'pointer';
-
-            // Reset to neutral after 3 seconds
-            setTimeout(() => {
-              testBtn.disabled = false;
-              testBtn.style.cursor = 'pointer';
-              testBtn.style.color = '#a1a1aa';
-              testBtn.style.borderColor = '#3f3f46';
-              testBtn.innerHTML = originalHtml;
-            }, 3000);
-          });
-
-          // Delete button
-          const deleteBtn = document.createElement('button');
-          deleteBtn.innerHTML = `
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                            <line x1="10" y1="11" x2="10" y2="17"></line>
-                            <line x1="14" y1="11" x2="14" y2="17"></line>
-                        </svg>
-                    `;
-          deleteBtn.style.background = 'transparent';
-          deleteBtn.style.border = 'none';
-          deleteBtn.style.color = '#a1a1aa';
-          deleteBtn.style.cursor = 'pointer';
-          deleteBtn.style.padding = '6px';
-          deleteBtn.style.borderRadius = '4px';
-          deleteBtn.style.display = 'flex';
-          deleteBtn.style.alignItems = 'center';
-          deleteBtn.style.justifyContent = 'center';
-          deleteBtn.style.transition = 'color 0.15s ease, background-color 0.15s ease';
-
-          deleteBtn.addEventListener('mouseenter', () => {
-            deleteBtn.style.color = '#ef4444';
-            deleteBtn.style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
-          });
-          deleteBtn.addEventListener('mouseleave', () => {
-            deleteBtn.style.color = '#a1a1aa';
-            deleteBtn.style.backgroundColor = 'transparent';
-          });
-
-          deleteBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            if (confirm(`Are you sure you want to delete the model "${model.displayName || model.name}"?`)) {
-              await storageAPI.deleteCustomModel(model.name as string);
-              await renderCustomModelsList();
-
-              const refreshBtn = findRefreshButton();
-              if (refreshBtn) refreshBtn.click();
-            }
-          });
-
-          actions.appendChild(testBtn);
-          actions.appendChild(deleteBtn);
-
-          item.appendChild(left);
-          item.appendChild(actions);
-          contentArea.appendChild(item);
-        });
+      if (version !== renderVersion || !target.isConnected) return;
+      modelList = models;
+      target.replaceChildren();
+      const groups = new Map<string, CustomModelEntry[]>();
+      for (const model of models) {
+        if (
+          searchTerm &&
+          !`${model.displayName} ${model.name} ${model.externalModelName} ${model.provider}`
+            .toLowerCase()
+            .includes(searchTerm)
+        )
+          continue;
+        const key = `${model.provider}\n${model.apiUrl}`;
+        groups.set(key, [...(groups.get(key) || []), model]);
       }
-    } catch (err) {
-      console.error('Failed to load custom models in list:', err);
+      if (!groups.size)
+        target.append(
+          element(
+            'p',
+            'agy-muted',
+            models.length
+              ? 'No models match this search.'
+              : 'Add a provider model, discover a local server, or import a configuration to get started.',
+          ),
+        );
+      for (const models of groups.values()) {
+        const first = models[0];
+        const group = element('section', 'agy-group');
+        const header = element('div', 'agy-group-heading');
+        const heading = element('div');
+        heading.append(
+          element(
+            'h3',
+            '',
+            `${first.provider} · ${models.filter((model) => model.enabled !== false).length}/${models.length} enabled`,
+          ),
+          element('div', 'agy-muted', first.apiUrl),
+        );
+        const groupStatus = statusNode();
+        const actions = element('div', 'agy-actions');
+        actions.append(button('Discover models', () => openModelModal(first, 'discover'), groupStatus));
+        const allEnabled = models.every((model) => model.enabled !== false);
+        actions.append(
+          button(
+            allEnabled ? 'Disable group' : 'Enable group',
+            async () => {
+              for (const model of models)
+                requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: !allEnabled }));
+              await modelsChanged();
+            },
+            groupStatus,
+          ),
+        );
+        header.append(heading, actions);
+        group.append(header, groupStatus);
+        for (const model of models) {
+          const row = element('div', 'agy-row');
+          row.dataset.enabled = String(model.enabled !== false);
+          const info = element('div', 'agy-row-info');
+          info.append(
+            element('strong', '', model.displayName || model.name),
+            element('div', 'agy-muted', model.externalModelName),
+          );
+          const rowStatus = statusNode();
+          info.append(rowStatus);
+          const actions = element('div', 'agy-actions');
+          actions.append(
+            button(
+              model.enabled === false ? 'Enable' : 'Disable',
+              async () => {
+                requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
+                await modelsChanged();
+              },
+              rowStatus,
+            ),
+            button(
+              'Test',
+              async () => {
+                setStatus(rowStatus, 'Testing…');
+                const result = requireSuccess(await storageAPI.testModelConnection(model));
+                setStatus(rowStatus, result.message || 'Connection successful.');
+              },
+              rowStatus,
+            ),
+            button('Edit', () => openModelModal(model, 'edit'), rowStatus),
+            button('Duplicate', () => openModelModal(model, 'duplicate'), rowStatus),
+            button(
+              'Delete',
+              async () => {
+                if (!window.confirm(`Delete “${model.displayName || model.name}”?`)) return;
+                requireSuccess(await storageAPI.deleteCustomModel(model.name));
+                await modelsChanged();
+              },
+              rowStatus,
+            ),
+          );
+          row.append(info, actions);
+          group.append(row);
+        }
+        target.append(group);
+      }
+    } catch (error) {
+      setStatus(target, error instanceof Error ? error.message : 'Could not load custom models.', true);
     }
   }
 
-  async function injectCustomModelsSection(): Promise<void> {
-    const layout = findMcpSectionContainer();
-    if (!layout) return;
-
-    const { mainContainer, headerRow, contentBlock } = layout;
-
-    if (document.getElementById('agy-custom-models-section')) return;
-
-    const section = document.createElement('div');
-    section.id = 'agy-custom-models-section';
-    section.style.marginTop = '24px';
-    section.style.display = 'flex';
-    section.style.flexDirection = 'column';
-    section.style.gap = '12px';
-
-    const newHeaderRow = document.createElement('div');
-    newHeaderRow.className = (headerRow as HTMLElement).className;
-    newHeaderRow.style.cssText = (headerRow as HTMLElement).style.cssText;
-    newHeaderRow.style.display = 'flex';
-    newHeaderRow.style.justifyContent = 'space-between';
-    newHeaderRow.style.alignItems = 'center';
-    newHeaderRow.style.marginBottom = '8px';
-
-    const originalHeading = headerRow.firstElementChild as HTMLElement;
-    const newHeading = document.createElement(originalHeading ? originalHeading.tagName : 'div');
-    if (originalHeading) {
-      newHeading.className = originalHeading.className;
-      newHeading.style.cssText = originalHeading.style.cssText;
-    }
-    newHeading.textContent = 'Custom Models';
-
-    const newBtnGroup = document.createElement('div');
-    const originalBtnGroup = headerRow.lastElementChild as HTMLElement;
-    if (originalBtnGroup) {
-      newBtnGroup.className = originalBtnGroup.className;
-      newBtnGroup.style.cssText = originalBtnGroup.style.cssText;
-    }
-    newBtnGroup.style.display = 'flex';
-    newBtnGroup.style.gap = '8px';
-    newBtnGroup.style.alignItems = 'center';
-
-    const addModelBtn = document.createElement('button');
-    addModelBtn.id = 'agy-add-model-btn';
-    addModelBtn.textContent = 'Add Model';
-    const refreshBtn = findRefreshButton();
-    if (refreshBtn) {
-      addModelBtn.className = refreshBtn.className;
-      addModelBtn.style.cssText = refreshBtn.style.cssText;
-    }
-    addModelBtn.style.cursor = 'pointer';
-    addModelBtn.addEventListener('click', () => {
-      openAddModelModal();
-    });
-
-    newBtnGroup.appendChild(addModelBtn);
-    newHeaderRow.appendChild(newHeading);
-    newHeaderRow.appendChild(newBtnGroup);
-
-    const contentArea = document.createElement('div');
-    contentArea.id = 'agy-custom-models-content';
-    contentArea.style.display = 'flex';
-    contentArea.style.flexDirection = 'column';
-    contentArea.style.gap = '8px';
-
-    section.appendChild(newHeaderRow);
-    section.appendChild(contentArea);
-
-    if (contentBlock && contentBlock.nextSibling) {
-      mainContainer.insertBefore(section, contentBlock.nextSibling);
-    } else {
-      mainContainer.appendChild(section);
-    }
-
-    await renderCustomModelsList();
-  }
-
-  function openAddModelModal(): void {
-    // Remove existing modal if any
-    const existing = document.getElementById('agy-modal-overlay');
-    if (existing) existing.remove();
-
-    // Modal overlay backdrop
-    const overlay = document.createElement('div');
-    overlay.id = 'agy-modal-overlay';
-    overlay.style.position = 'fixed';
-    overlay.style.top = '0';
-    overlay.style.left = '0';
-    overlay.style.width = '100vw';
-    overlay.style.height = '100vh';
-    overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.6)';
-    overlay.style.backdropFilter = 'blur(6px)';
-    overlay.style.display = 'flex';
-    overlay.style.justifyContent = 'center';
-    overlay.style.alignItems = 'center';
-    overlay.style.zIndex = '999999';
-    overlay.style.opacity = '0';
-    overlay.style.transition = 'opacity 0.2s ease-in-out';
-
-    // Modal card container
-    const modal = document.createElement('div');
-    modal.id = 'agy-modal-card';
-    modal.style.width = '520px';
-    modal.style.maxHeight = '90vh';
-    modal.style.overflowY = 'auto';
-    modal.style.backgroundColor = '#18181b';
-    modal.style.border = '1px solid #27272a';
-    modal.style.borderRadius = '16px';
-    modal.style.padding = '32px';
-    modal.style.boxShadow = '0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.5)';
-    modal.style.color = '#f4f4f5';
-    modal.style.fontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
-    modal.style.transform = 'scale(0.9) translateY(20px)';
-    modal.style.transition = 'transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1)';
-
-    modal.innerHTML = `
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-                <div style="display: flex; align-items: center; gap: 10px;">
-                    <div id="agy-modal-provider-icon" style="width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; background-color: #10a37f18; color: #10a37f;">${PROVIDER_ICONS.openai}</div>
-                    <h3 style="margin: 0; font-size: 20px; font-weight: 600; color: #f4f4f5;">Add Custom AI Model</h3>
-                </div>
-                <button id="agy-modal-close" style="background: transparent; border: none; color: #a1a1aa; cursor: pointer; font-size: 20px; line-height: 1; padding: 4px; display: flex; align-items: center; justify-content: center; transition: color 0.15s ease;">&times;</button>
-            </div>
-
-            <div style="display: flex; flex-direction: column; gap: 16px; margin-bottom: 24px;">
-                <!-- Provider -->
-                <div style="display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">API Provider</label>
-                    <select id="agy-provider" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; cursor: pointer; transition: border-color 0.15s ease;">
-                        <option value="openai">OpenAI (ChatGPT)</option>
-                        <option value="anthropic">Anthropic (Claude)</option>
-                        <option value="google">Google AI Studio (Gemini)</option>
-                        <option value="ollama">Ollama (Local)</option>
-                        <option value="openrouter">OpenRouter</option>
-                        <option value="deepseek">DeepSeek</option>
-                        <option value="groq">Groq</option>
-                        <option value="mistral">Mistral</option>
-                        <option value="cerebras">Cerebras</option>
-                        <option value="kimi">Kimi (Moonshot)</option>
-                        <option value="fireworks">Fireworks AI</option>
-                        <option value="lmstudio">LM Studio (Local)</option>
-                        <option value="llamacpp">llama.cpp (Local)</option>
-                        <option value="nvidia">NVIDIA NIM</option>
-                        <option value="custom">Custom / Other</option>
-                    </select>
-                </div>
-
-                <!-- Model ID -->
-                <div style="display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">Model Name / ID <span style="color: #ef4444;">*</span></label>
-                    <input type="text" id="agy-model-id" placeholder="e.g. gpt-4o" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" required />
-                    <div id="agy-model-id-error" style="font-size: 11px; color: #ef4444; display: none; margin-top: 2px;"></div>
-                </div>
-
-                <!-- Friendly Display Name -->
-                <div style="display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">Friendly Display Name</label>
-                    <input type="text" id="agy-display-name" placeholder="e.g. GPT-4o (OpenAI)" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" />
-                </div>
-
-                <!-- API Key -->
-                <div id="agy-key-container" style="display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">API Key <span id="agy-key-required" style="color: #ef4444;">*</span></label>
-                    <input type="password" id="agy-api-key" placeholder="Enter API key" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" />
-                </div>
-
-                <!-- API URL -->
-                <div style="display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">API URL <span style="color: #ef4444;">*</span></label>
-                    <div style="display: flex; gap: 6px; align-items: center;">
-                        <input type="text" id="agy-api-url" placeholder="https://api.openai.com/v1/chat/completions" style="flex: 1; background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" required />
-                        <div id="agy-url-status" style="width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background-color: #71717a; transition: background-color 0.3s ease;" title="URL not yet validated"></div>
-                    </div>
-                    <div id="agy-url-error" style="font-size: 11px; color: #ef4444; display: none; margin-top: 2px;"></div>
-                </div>
-            </div>
-
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <button id="agy-btn-test" style="background-color: transparent; border: 1px solid #3f3f46; border-radius: 8px; color: #a1a1aa; padding: 10px 14px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s ease; display: flex; align-items: center; gap: 6px;">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                    Test Connection
-                </button>
-                <div style="display: flex; gap: 12px;">
-                    <button id="agy-btn-cancel" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #e4e4e7; padding: 10px 18px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background-color 0.15s ease, color 0.15s ease;">Cancel</button>
-                    <button id="agy-btn-save" style="background-color: #e4e4e7; border: none; border-radius: 8px; color: #18181b; padding: 10px 22px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background-color 0.15s ease, opacity 0.15s ease;">Save Model</button>
-                </div>
-            </div>
-        `;
-
-    overlay.appendChild(modal);
-    document.body.appendChild(overlay);
-
-    // Animate in
-    setTimeout(() => {
-      overlay.style.opacity = '1';
-      modal.style.transform = 'scale(1) translateY(0)';
-    }, 10);
-
-    // Close handler
-    const closeModal = () => {
-      overlay.style.opacity = '0';
-      modal.style.transform = 'scale(0.9) translateY(20px)';
-      setTimeout(() => overlay.remove(), 200);
-    };
-
-    document.getElementById('agy-modal-close')!.addEventListener('click', closeModal);
-    document.getElementById('agy-btn-cancel')!.addEventListener('click', closeModal);
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) closeModal();
-    });
-
-    const providerSelect = document.getElementById('agy-provider') as HTMLSelectElement;
-    const urlInput = document.getElementById('agy-api-url') as HTMLInputElement;
-    const keyContainer = document.getElementById('agy-key-container')!;
-    const keyInput = document.getElementById('agy-api-key') as HTMLInputElement;
-    const modelInput = document.getElementById('agy-model-id') as HTMLInputElement;
-    const nameInput = document.getElementById('agy-display-name') as HTMLInputElement;
-    const urlStatus = document.getElementById('agy-url-status')!;
-    const urlError = document.getElementById('agy-url-error')!;
-    const modelIdError = document.getElementById('agy-model-id-error')!;
-    const providerIcon = document.getElementById('agy-modal-provider-icon')!;
-    const keyRequired = document.getElementById('agy-key-required')!;
-    const testBtn = document.getElementById('agy-btn-test') as HTMLButtonElement;
-    const saveBtn = document.getElementById('agy-btn-save') as HTMLButtonElement;
-
-    const prefilledUrls: Record<string, string> = {
-      openai: 'https://api.openai.com/v1/chat/completions',
-      anthropic: 'https://api.anthropic.com/v1/messages',
-      ollama: 'http://localhost:11434/v1/chat/completions',
-      openrouter: 'https://openrouter.ai/api/v1/chat/completions',
-      deepseek: 'https://api.deepseek.com/anthropic',
-      groq: 'https://api.groq.com/openai/v1',
-      mistral: 'https://api.mistral.ai/v1',
-      cerebras: 'https://api.cerebras.ai/v1',
-      kimi: 'https://api.moonshot.ai/anthropic/v1',
-      fireworks: 'https://api.fireworks.ai/inference/v1',
-      lmstudio: 'http://localhost:1234/v1',
-      llamacpp: 'http://localhost:8080/v1',
-      nvidia: 'https://integrate.api.nvidia.com/v1',
-      custom: '',
-    };
-
-    // Real-time URL validation
-    const validateUrl = () => {
-      const val = urlInput.value.trim();
-      if (!val) {
-        urlStatus.style.backgroundColor = '#71717a';
-        urlStatus.title = 'URL required';
-        return;
-      }
-      try {
-        const u = new URL(val);
-        if (['http:', 'https:'].includes(u.protocol)) {
-          urlStatus.style.backgroundColor = '#22c55e';
-          urlStatus.title = 'Valid URL format';
-          urlError.style.display = 'none';
-        } else {
-          urlStatus.style.backgroundColor = '#fbbf24';
-          urlStatus.title = 'URL must use http or https';
-        }
-      } catch {
-        urlStatus.style.backgroundColor = '#ef4444';
-        urlStatus.title = 'Invalid URL format';
-        urlError.textContent = 'Please enter a valid URL (e.g. https://api.openai.com/v1)';
-        urlError.style.display = 'block';
-      }
-    };
-
-    // Model ID validation
-    const validateModelId = () => {
-      const val = modelInput.value.trim();
-      if (val && !/^[a-zA-Z0-9._/-]+$/.test(val)) {
-        modelIdError.textContent = 'Use only letters, numbers, dots, hyphens, underscores, forward slashes';
-        modelIdError.style.display = 'block';
-        modelInput.style.borderColor = '#ef4444';
-      } else {
-        modelIdError.style.display = 'none';
-        modelInput.style.borderColor = '#3f3f46';
-      }
-    };
-
-    urlInput.addEventListener('input', validateUrl);
-    modelInput.addEventListener('input', () => {
-      validateModelId();
-      if (providerSelect.value === 'google') {
-        const modelId = modelInput.value.trim() || 'model-name';
-        urlInput.value = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent`;
-        validateUrl();
-      }
-    });
-
-    const updatePrefills = () => {
-      const val = providerSelect.value;
-      const modelId = modelInput.value.trim() || 'model-name';
-
-      if (val === 'google') {
-        urlInput.value = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent`;
-      } else {
-        urlInput.value = prefilledUrls[val] || '';
-      }
-
-      // Update provider icon
-      providerIcon.style.backgroundColor = getProviderColor(val) + '18';
-      providerIcon.style.color = getProviderColor(val);
-      providerIcon.innerHTML = getProviderIcon(val);
-
-      // Update key requirement indicator
-      if (val === 'ollama') {
-        keyContainer.style.display = 'none';
-        keyInput.value = '';
-        keyRequired.style.display = 'none';
-        modelInput.placeholder = 'e.g. llama3';
-        nameInput.placeholder = 'e.g. Llama 3 (Ollama)';
-      } else {
-        keyContainer.style.display = 'flex';
-        keyRequired.style.display = 'inline';
-        if (val === 'openai') {
-          modelInput.placeholder = 'e.g. gpt-4o';
-          nameInput.placeholder = 'e.g. GPT-4o (OpenAI)';
-        } else if (val === 'anthropic') {
-          modelInput.placeholder = 'e.g. claude-3-5-sonnet-latest';
-          nameInput.placeholder = 'e.g. Claude 3.5 Sonnet';
-        } else if (val === 'google') {
-          modelInput.placeholder = 'e.g. gemini-2.0-flash';
-          nameInput.placeholder = 'e.g. Gemini 2.0 Flash';
-        } else {
-          modelInput.placeholder = 'e.g. model-name';
-          nameInput.placeholder = 'e.g. My Custom Model';
-        }
-      }
-
-      validateUrl();
-    };
-
-    providerSelect.addEventListener('change', updatePrefills);
-
-    // ─── Test Connection in Modal ────────────────────
-    testBtn.addEventListener('click', async () => {
-      const provider = providerSelect.value;
-      const modelId = modelInput.value.trim();
-      const apiKey = keyInput.value.trim();
-      const apiUrl = urlInput.value.trim();
-
-      if (!apiUrl) {
-        alert('Please enter an API URL first');
-        return;
-      }
-
-      testBtn.disabled = true;
-      testBtn.style.cursor = 'wait';
-      testBtn.style.color = '#fbbf24';
-      testBtn.style.borderColor = '#fbbf24';
-      const originalHtml = testBtn.innerHTML;
-      testBtn.innerHTML = '<span>Testing...</span>';
-
-      try {
-        const result = await storageAPI.testModelConnection({
-          apiUrl,
-          provider,
-          apiKey,
+  async function openModelModal(
+    existing?: CustomModelEntry,
+    mode: 'edit' | 'duplicate' | 'discover' = 'edit',
+  ): Promise<void> {
+    const { body, status, close } = openModal(
+      mode === 'duplicate'
+        ? 'Duplicate model'
+        : mode === 'discover'
+          ? 'Discover provider models'
+          : existing
+            ? 'Edit model'
+            : 'Add custom model',
+    );
+    try {
+      const presets = await storageAPI.getPresets();
+      if (!body.isConnected) return;
+      const providers = [...presets];
+      if (existing && !providers.some((preset) => preset.id === existing.provider))
+        providers.push({
+          id: existing.provider,
+          label: existing.provider,
+          defaultUrl: existing.apiUrl,
+          apiFormat: existing.apiFormat || 'openai',
+          keyRequired: false,
         });
-
-        if (result.success) {
-          urlStatus.style.backgroundColor = '#22c55e';
-          urlStatus.title = result.message || 'Connection successful!';
-          testBtn.style.color = '#22c55e';
-          testBtn.style.borderColor = '#22c55e';
-        } else {
-          urlStatus.style.backgroundColor = '#ef4444';
-          urlStatus.title = result.error || 'Connection failed';
-          testBtn.style.color = '#ef4444';
-          testBtn.style.borderColor = '#ef4444';
-        }
-      } catch (err) {
-        urlStatus.style.backgroundColor = '#ef4444';
-        urlStatus.title = 'Test connection failed';
-        testBtn.style.color = '#ef4444';
-        testBtn.style.borderColor = '#ef4444';
-      }
-
-      setTimeout(() => {
-        testBtn.disabled = false;
-        testBtn.style.cursor = 'pointer';
-        testBtn.style.color = '#a1a1aa';
-        testBtn.style.borderColor = '#3f3f46';
-        testBtn.innerHTML = originalHtml;
-      }, 3000);
-    });
-
-    saveBtn.addEventListener('click', async () => {
-      const provider = providerSelect.value;
-      const modelId = modelInput.value.trim();
-      let displayName = nameInput.value.trim();
-      const apiKey = keyInput.value.trim();
-      const apiUrl = urlInput.value.trim();
-
-      // Clear previous errors
-      modelIdError.style.display = 'none';
-      urlError.style.display = 'none';
-      modelInput.style.borderColor = '#3f3f46';
-      urlInput.style.borderColor = '#3f3f46';
-
-      let hasError = false;
-
-      if (!modelId) {
-        modelIdError.textContent = 'Model ID is required';
-        modelIdError.style.display = 'block';
-        modelInput.style.borderColor = '#ef4444';
-        hasError = true;
-      } else if (!/^[a-zA-Z0-9._/-]+$/.test(modelId)) {
-        modelIdError.textContent = 'Use only letters, numbers, dots, hyphens, underscores, forward slashes';
-        modelIdError.style.display = 'block';
-        modelInput.style.borderColor = '#ef4444';
-        hasError = true;
-      }
-
-      if (provider !== 'ollama' && !apiKey) {
-        alert('API Key is required.');
-        hasError = true;
-      }
-
-      if (!apiUrl) {
-        urlError.textContent = 'API URL is required';
-        urlError.style.display = 'block';
-        urlInput.style.borderColor = '#ef4444';
-        hasError = true;
-      } else {
-        try {
-          const u = new URL(apiUrl);
-          if (!['http:', 'https:'].includes(u.protocol)) {
-            urlError.textContent = 'URL must start with http:// or https://';
-            urlError.style.display = 'block';
-            urlInput.style.borderColor = '#ef4444';
-            hasError = true;
-          }
-        } catch {
-          urlError.textContent = 'Invalid URL format';
-          urlError.style.display = 'block';
-          urlInput.style.borderColor = '#ef4444';
-          hasError = true;
-        }
-      }
-
-      if (hasError) return;
-
-      if (!displayName) {
-        const providerNames: Record<string, string> = {
-          openai: 'OpenAI',
-          anthropic: 'Anthropic',
-          google: 'Google Studio',
-          ollama: 'Ollama',
-          openrouter: 'OpenRouter',
-          custom: 'Custom',
-          deepseek: 'DeepSeek',
-          groq: 'Groq',
-          mistral: 'Mistral',
-          cerebras: 'Cerebras',
-          kimi: 'Kimi',
-          fireworks: 'Fireworks',
-          lmstudio: 'LM Studio',
-          llamacpp: 'llama.cpp',
-          nvidia: 'NVIDIA',
-        };
-        displayName = `${modelId} (${providerNames[provider]})`;
-      }
-
-      const newModel: CustomModelEntry = {
-        name: 'models/' + modelId,
-        displayName: displayName,
-        description: `${displayName} custom model redirected through local proxy`,
-        provider: provider,
-        apiKey: apiKey || 'none',
-        apiUrl: apiUrl,
-        externalModelName: modelId,
+      if (!providers.length) throw new Error('Provider presets are unavailable. Close this dialog and try again.');
+      const provider = selectField(
+        body,
+        'Provider',
+        'agy-provider',
+        providers.map((preset) => [preset.id, preset.label]),
+        existing?.provider || providers[0].id,
+      );
+      const preset = () => providers.find((value) => value.id === provider.value) || providers[0];
+      const apiUrl = field(body, 'API URL', 'agy-api-url', existing?.apiUrl || preset().defaultUrl, 'url');
+      const apiKey = field(
+        body,
+        'API key',
+        'agy-api-key',
+        existing?.apiKey === 'none' ? '' : existing?.apiKey || '',
+        'password',
+      );
+      apiKey.placeholder = preset().keyRequired ? 'Enter provider API key' : 'Optional for local servers';
+      const apiFormat = selectField(
+        body,
+        'API format',
+        'agy-api-format',
+        [
+          ['openai', 'OpenAI compatible'],
+          ['anthropic', 'Anthropic Messages'],
+          ['google', 'Google Gemini'],
+        ],
+        existing?.apiFormat || preset().apiFormat,
+      );
+      const grid = element('div', 'agy-grid');
+      const modelId = field(
+        grid,
+        'Provider model ID',
+        'agy-model-id',
+        mode === 'discover' ? '' : existing?.externalModelName || '',
+      );
+      const displayName = field(
+        grid,
+        'Display name',
+        'agy-display-name',
+        mode === 'duplicate'
+          ? `${existing?.displayName || existing?.externalModelName || ''} copy`
+          : mode === 'discover'
+            ? ''
+            : existing?.displayName || '',
+      );
+      body.append(grid);
+      const name = field(
+        body,
+        'Configuration name (unique)',
+        'agy-model-name',
+        mode === 'duplicate' ? uniqueName(`${existing?.name}-copy`) : mode === 'discover' ? '' : existing?.name || '',
+      );
+      name.placeholder = 'Generated from provider and model ID when left blank';
+      const description = field(body, 'Description', 'agy-description', String(existing?.description || ''));
+      const googleConfig = element('div');
+      googleConfig.id = 'agy-google-account-config';
+      const googleProject = field(
+        googleConfig,
+        'Default Cloud Code project (optional)',
+        'agy-google-project',
+        String(existing?.googleProject || ''),
+      );
+      const initialPool = existing?.googlePool as
+        | { strategy?: string; maxConcurrency?: number; cooldownMs?: number }
+        | undefined;
+      const poolGrid = element('div', 'agy-grid');
+      const poolStrategy = selectField(
+        poolGrid,
+        'Account selection',
+        'agy-google-pool-strategy',
+        [
+          ['round-robin', 'Round robin'],
+          ['least-loaded', 'Least loaded'],
+          ['quota', 'Remaining quota'],
+        ],
+        initialPool?.strategy || 'least-loaded',
+      );
+      const poolConcurrency = field(
+        poolGrid,
+        'Maximum requests per account',
+        'agy-google-pool-concurrency',
+        String(initialPool?.maxConcurrency || 2),
+        'number',
+      );
+      const poolCooldown = field(
+        poolGrid,
+        'Account cooldown (milliseconds)',
+        'agy-google-pool-cooldown',
+        String(initialPool?.cooldownMs || 60000),
+        'number',
+      );
+      googleConfig.append(poolGrid);
+      const readAccounts = createGoogleAccountPanel(
+        googleConfig,
+        Array.isArray(existing?.googleAccounts) ? (existing.googleAccounts as GoogleAccountEntry[]) : [],
+        existing?.name,
+      );
+      const updateGoogleVisibility = () => {
+        const isGoogle = provider.value === 'google-cloudcode';
+        googleConfig.hidden = !isGoogle;
+        apiKey.closest('label')!.hidden = isGoogle;
+        apiFormat.closest('label')!.hidden = isGoogle;
       };
-
-      saveBtn.disabled = true;
-      saveBtn.textContent = 'Saving...';
-
-      try {
-        const res = await storageAPI.saveCustomModel(newModel);
-        if (res && res.success) {
-          closeModal();
-
-          // Re-render the custom models list immediately!
-          await renderCustomModelsList();
-
-          // Trigger native refresh button if available
-          const refreshBtn = findRefreshButton();
-          if (refreshBtn) {
-            refreshBtn.click();
-          }
-        } else {
-          alert('Failed to save model: ' + (res?.error || 'Unknown error'));
-          saveBtn.disabled = false;
-          saveBtn.textContent = 'Save Model';
-        }
-      } catch (err) {
-        alert('Error saving model: ' + (err as Error).message);
-        saveBtn.disabled = false;
-        saveBtn.textContent = 'Save Model';
+      updateGoogleVisibility();
+      body.append(googleConfig);
+      const advanced = element('details');
+      advanced.append(element('summary', '', 'Advanced settings'));
+      const advancedGrid = element('div', 'agy-grid');
+      const effort = selectField(
+        advancedGrid,
+        'Reasoning effort',
+        'agy-reasoning-effort',
+        ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((value) => [
+          value,
+          value || 'Provider default',
+        ]),
+        String(existing?.reasoningEffort || ''),
+      );
+      const thinking = field(
+        advancedGrid,
+        'Thinking budget (tokens)',
+        'agy-thinking-budget',
+        existing?.thinkingBudget != null ? String(existing.thinkingBudget) : '',
+        'number',
+      );
+      const maxOutput = field(
+        advancedGrid,
+        'Maximum output tokens',
+        'agy-max-output',
+        existing?.maxOutputTokens != null ? String(existing.maxOutputTokens) : '',
+        'number',
+      );
+      const context = field(
+        advancedGrid,
+        'Context window (tokens)',
+        'agy-context-window',
+        existing?.contextWindow != null ? String(existing.contextWindow) : '',
+        'number',
+      );
+      const timeout = field(
+        advancedGrid,
+        'Request timeout (milliseconds)',
+        'agy-timeout',
+        existing?.timeout != null ? String(existing.timeout) : '',
+        'number',
+      );
+      const retries = field(
+        advancedGrid,
+        'Maximum retries (0–5)',
+        'agy-max-retries',
+        existing?.maxRetries != null ? String(existing.maxRetries) : '',
+        'number',
+      );
+      retries.max = '5';
+      const vision = selectField(
+        advancedGrid,
+        'Image input',
+        'agy-vision',
+        [
+          ['', 'Auto detect'],
+          ['true', 'Supported'],
+          ['false', 'Unsupported'],
+        ],
+        existing?.supportsVision == null ? '' : String(existing.supportsVision),
+      );
+      const rawUrl = selectField(
+        advancedGrid,
+        'Endpoint path',
+        'agy-raw-url',
+        [
+          ['false', 'Normalize for provider'],
+          ['true', 'Use exactly as entered'],
+        ],
+        String(existing?.rawUrl === true),
+      );
+      const tls = selectField(
+        advancedGrid,
+        'TLS certificates',
+        'agy-tls',
+        [
+          ['false', 'Verify certificates'],
+          ['true', 'Allow self-signed certificates'],
+        ],
+        String(existing?.allowUnauthorized === true),
+      );
+      const enabled = selectField(
+        advancedGrid,
+        'Model state',
+        'agy-enabled',
+        [
+          ['true', 'Enabled'],
+          ['false', 'Disabled'],
+        ],
+        String(existing?.enabled !== false),
+      );
+      advanced.append(advancedGrid);
+      const fallbacks = field(
+        advanced,
+        'Fallback model configuration names (comma separated)',
+        'agy-fallback-models',
+        Array.isArray(existing?.fallbackModels) ? existing.fallbackModels.join(', ') : '',
+      );
+      const headers = jsonField(advanced, 'Custom headers (JSON)', 'agy-custom-headers', existing?.customHeaders);
+      const extraBody = jsonField(advanced, 'Additional request fields (JSON)', 'agy-extra-body', existing?.extraBody);
+      const breaker = existing?.circuitBreaker as
+        | { enabled?: boolean; failureThreshold?: number; cooldownMs?: number }
+        | undefined;
+      const breakerGrid = element('div', 'agy-grid');
+      const breakerEnabled = selectField(
+        breakerGrid,
+        'Circuit breaker',
+        'agy-breaker-enabled',
+        [
+          ['', 'Default'],
+          ['true', 'Enabled'],
+          ['false', 'Disabled'],
+        ],
+        breaker?.enabled == null ? '' : String(breaker.enabled),
+      );
+      const breakerThreshold = field(
+        breakerGrid,
+        'Failures before cooldown',
+        'agy-breaker-threshold',
+        breaker?.failureThreshold != null ? String(breaker.failureThreshold) : '',
+        'number',
+      );
+      const breakerCooldown = field(
+        breakerGrid,
+        'Cooldown (milliseconds)',
+        'agy-breaker-cooldown',
+        breaker?.cooldownMs != null ? String(breaker.cooldownMs) : '',
+        'number',
+      );
+      advanced.append(breakerGrid);
+      body.append(advanced);
+      const discovery = element('div', 'agy-discovery');
+      let choices: ModelChoice[] = [];
+      const selected = new Set<string>();
+      function connection(): Partial<CustomModelEntry> {
+        return {
+          provider: provider.value,
+          apiUrl: validUrl(apiUrl.value),
+          apiKey: apiKey.value.trim() || 'none',
+          apiFormat: apiFormat.value,
+          name: existing?.name,
+          allowUnauthorized: tls.value === 'true',
+          externalModelName: modelId.value.trim(),
+          customHeaders: readJson(headers, 'Custom headers'),
+          rawUrl: rawUrl.value === 'true',
+          ...(provider.value === 'google-cloudcode'
+            ? {
+                googleAccounts: readAccounts(),
+                googleProject: googleProject.value.trim(),
+                googlePool: {
+                  strategy: poolStrategy.value,
+                  maxConcurrency: readNumber(poolConcurrency, 'Account concurrency', 1),
+                  cooldownMs: readNumber(poolCooldown, 'Account cooldown', 1),
+                },
+              }
+            : {}),
+        };
       }
-    });
-  }
-
-  // Efficient DOM tracking via MutationObserver — instead of setInterval
-  let injectionObserver: MutationObserver | null = null;
-  let injectionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function setupInjectionObserver(): void {
-    // Try immediately first
-    void injectCustomModelsSection();
-
-    // If already added, no need for observer
-    if (document.getElementById('agy-custom-models-section')) return;
-
-    // Set up observer: watch all changes under document.body
-    injectionObserver = new MutationObserver(() => {
-      // Debounce: coalesce consecutive mutations into a single attempt
-      if (injectionDebounceTimer) clearTimeout(injectionDebounceTimer);
-      injectionDebounceTimer = setTimeout(async () => {
-        await injectCustomModelsSection();
-        // If successfully injected, stop observing
-        if (document.getElementById('agy-custom-models-section')) {
-          if (injectionObserver) {
-            injectionObserver.disconnect();
-            injectionObserver = null;
-          }
-        }
-      }, 200);
-    });
-
-    injectionObserver.observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
-  }
-
-  // URL tracking for re-injection on SPA page transitions
-  let lastUrl = location.href;
-  setInterval(() => {
-    const currentUrl = location.href;
-    if (currentUrl !== lastUrl) {
-      lastUrl = currentUrl;
-      // Page changed — clean up previous observer and re-initialize
-      if (injectionObserver) {
-        injectionObserver.disconnect();
-        injectionObserver = null;
+      function modelConfig(id: string, title: string, localName?: string): CustomModelEntry {
+        if (!id.trim() || /\s/.test(id.trim())) throw new Error('Enter a model ID without spaces.');
+        if (preset().keyRequired && !apiKey.value.trim()) throw new Error('Enter an API key for this provider.');
+        if (provider.value === 'google-cloudcode' && !readAccounts().some((account) => account.enabled !== false))
+          throw new Error('Add and enable at least one Google account.');
+        const maxRetries = readNumber(retries, 'Maximum retries');
+        if (maxRetries != null && maxRetries > 5) throw new Error('Maximum retries cannot exceed 5.');
+        const customHeaders = readJson(headers, 'Custom headers');
+        if (customHeaders && Object.values(customHeaders).some((value) => typeof value !== 'string'))
+          throw new Error('Custom header values must be strings.');
+        return {
+          ...(mode === 'edit' && existing ? existing : {}),
+          ...connection(),
+          name: localName || name.value.trim() || uniqueName(`models/${provider.value}/${id}`),
+          provider: provider.value,
+          apiUrl: apiUrl.value.trim(),
+          apiKey: apiKey.value.trim() || 'none',
+          externalModelName: id.trim(),
+          displayName: title || id.trim(),
+          description: description.value.trim(),
+          enabled: enabled.value === 'true',
+          apiFormat: apiFormat.value,
+          googleAccounts: provider.value === 'google-cloudcode' ? readAccounts() : undefined,
+          googleProject: provider.value === 'google-cloudcode' ? googleProject.value.trim() || undefined : undefined,
+          googlePool:
+            provider.value === 'google-cloudcode'
+              ? {
+                  strategy: poolStrategy.value,
+                  maxConcurrency: readNumber(poolConcurrency, 'Account concurrency', 1),
+                  cooldownMs: readNumber(poolCooldown, 'Account cooldown', 1),
+                }
+              : undefined,
+          reasoningEffort: effort.value || undefined,
+          thinkingBudget: readNumber(thinking, 'Thinking budget'),
+          maxOutputTokens: readNumber(maxOutput, 'Maximum output tokens', 1),
+          contextWindow: readNumber(context, 'Context window', 1),
+          timeout: readNumber(timeout, 'Timeout', 1),
+          maxRetries,
+          fallbackModels: fallbacks.value
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean),
+          customHeaders,
+          extraBody: readJson(extraBody, 'Additional request fields'),
+          supportsVision: vision.value === '' ? undefined : vision.value === 'true',
+          rawUrl: rawUrl.value === 'true',
+          allowUnauthorized: tls.value === 'true',
+          circuitBreaker:
+            breakerEnabled.value || breakerThreshold.value || breakerCooldown.value
+              ? {
+                  enabled: breakerEnabled.value !== 'false',
+                  failureThreshold: readNumber(breakerThreshold, 'Failure threshold', 1),
+                  cooldownMs: readNumber(breakerCooldown, 'Cooldown', 1),
+                }
+              : undefined,
+          ...(existing?.name && mode === 'edit'
+            ? { originalName: existing.name }
+            : existing?.name
+              ? { copyFrom: existing.name }
+              : {}),
+        };
       }
-      // Re-initialize after a short delay (for new DOM to render)
-      setTimeout(setupInjectionObserver, 500);
+      function showChoices(): void {
+        discovery.replaceChildren();
+        if (!choices.length) return;
+        const toolbar = element('div', 'agy-actions');
+        toolbar.append(
+          element('span', 'agy-muted', `${choices.length} models found`),
+          button(
+            'Select all',
+            () => {
+              for (const model of choices) selected.add(model.id);
+              showChoices();
+            },
+            status,
+          ),
+          button(
+            'Clear selection',
+            () => {
+              selected.clear();
+              showChoices();
+            },
+            status,
+          ),
+        );
+        discovery.append(toolbar);
+        for (const model of choices) {
+          const label = element('label', 'agy-choice');
+          const checkbox = element('input');
+          checkbox.type = 'checkbox';
+          checkbox.checked = selected.has(model.id);
+          checkbox.addEventListener('change', () => {
+            if (checkbox.checked) selected.add(model.id);
+            else selected.delete(model.id);
+          });
+          label.append(
+            checkbox,
+            element(
+              'span',
+              '',
+              model.displayName && model.displayName !== model.id ? `${model.displayName} · ${model.id}` : model.id,
+            ),
+          );
+          discovery.append(label);
+        }
+      }
+      const actions = element('div', 'agy-actions');
+      actions.append(
+        button(
+          'Test connection',
+          async () => {
+            setStatus(status, 'Testing…');
+            const result = requireSuccess(await storageAPI.testModelConnection(connection()));
+            setStatus(status, result.message || 'Connection successful.');
+          },
+          status,
+        ),
+        button(
+          'Fetch provider models',
+          async () => {
+            setStatus(status, 'Fetching models…');
+            const result = await storageAPI.discoverModels(connection());
+            requireSuccess(result);
+            choices = result.models || [];
+            selected.clear();
+            showChoices();
+            setStatus(
+              status,
+              choices.length
+                ? 'Select models below, then choose Add selected.'
+                : 'This provider returned no models. You can enter a model ID manually.',
+            );
+          },
+          status,
+        ),
+        button(
+          'Save model',
+          async () => {
+            requireSuccess(await storageAPI.saveCustomModel(modelConfig(modelId.value, displayName.value.trim())));
+            await modelsChanged();
+            close();
+          },
+          status,
+          true,
+        ),
+      );
+      body.append(actions, discovery);
+      body.append(
+        button(
+          'Add selected',
+          async () => {
+            if (!selected.size) throw new Error('Select at least one model from the fetched list.');
+            let saved = 0;
+            for (const choice of choices.filter((model) => selected.has(model.id))) {
+              const prior = modelList.find(
+                (model) =>
+                  model.provider === provider.value &&
+                  model.apiUrl === apiUrl.value.trim() &&
+                  model.externalModelName === choice.id,
+              );
+              const config = modelConfig(
+                choice.id,
+                choice.displayName || choice.id,
+                prior?.name || uniqueName(`models/${provider.value}/${choice.id}`),
+              );
+              delete config.originalName;
+              if (prior) config.originalName = prior.name;
+              else if (existing?.name) config.copyFrom = existing.name;
+              requireSuccess(await storageAPI.saveCustomModel(config));
+              saved++;
+            }
+            await modelsChanged();
+            setStatus(status, `Saved ${saved} models.`);
+          },
+          status,
+        ),
+      );
+      provider.addEventListener('change', () => {
+        apiUrl.value = preset().defaultUrl;
+        apiFormat.value = preset().apiFormat;
+        apiKey.value = '';
+        choices = [];
+        selected.clear();
+        showChoices();
+        updateGoogleVisibility();
+      });
+    } catch (error) {
+      setStatus(status, error instanceof Error ? error.message : 'Could not open model settings.', true);
     }
-  }, 1500);
+  }
+
+  async function openImportExport(kind: 'import' | 'export'): Promise<void> {
+    const { body, status } = openModal(kind === 'export' ? 'Export models' : 'Import models');
+    body.append(
+      element(
+        'p',
+        'agy-muted',
+        kind === 'export'
+          ? 'Credentials are removed from this export. Add API keys on the destination device.'
+          : 'Paste a model configuration as JSON or an exported base64 string. Existing configurations are merged by name.',
+      ),
+    );
+    const input = jsonField(body, 'Configuration', 'agy-config-json', undefined);
+    input.rows = 14;
+    if (kind === 'export') {
+      input.readOnly = true;
+      try {
+        input.value = JSON.stringify(await ipcRenderer.invoke('storage:export-custom-models'), null, 2);
+      } catch (error) {
+        setStatus(status, String(error), true);
+      }
+      const actions = element('div', 'agy-actions');
+      actions.append(
+        button(
+          'Select all',
+          () => {
+            input.focus();
+            input.select();
+          },
+          status,
+        ),
+        button(
+          'Copy JSON',
+          async () => {
+            await navigator.clipboard.writeText(input.value);
+            setStatus(status, 'Configuration copied.');
+          },
+          status,
+        ),
+      );
+      body.append(actions);
+    } else {
+      const file = field(body, 'Or choose a JSON file', 'agy-import-file', '', 'file');
+      file.accept = '.json,application/json';
+      file.addEventListener('change', async () => {
+        try {
+          const selected = file.files?.[0];
+          if (!selected) return;
+          if (selected.size > 2 * 1024 * 1024) throw new Error('Configuration files must be smaller than 2 MB.');
+          input.value = await selected.text();
+        } catch (error) {
+          setStatus(status, String(error), true);
+        }
+      });
+      body.append(
+        button(
+          'Import configuration',
+          async () => {
+            if (!input.value.trim()) throw new Error('Paste a configuration or choose a file first.');
+            const result = requireSuccess(await ipcRenderer.invoke('storage:import-custom-models', input.value.trim()));
+            await modelsChanged();
+            setStatus(status, `Imported ${result.count ?? 0} models. Add any missing API keys before use.`);
+          },
+          status,
+          true,
+        ),
+      );
+    }
+  }
+  async function discoverLocal(): Promise<void> {
+    const { body, status } = openModal('Local model servers');
+    setStatus(status, 'Checking Ollama, LM Studio and llama.cpp on this computer…');
+    try {
+      const result = (await ipcRenderer.invoke('storage:discover-local')) as ActionResult & {
+        servers?: { provider: string; apiUrl: string; models: ModelChoice[] }[];
+      };
+      requireSuccess(result);
+      if (!body.isConnected) return;
+      setStatus(
+        status,
+        result.servers?.length
+          ? 'Choose a server to configure its models.'
+          : 'No local model servers were found. Start a server or add its URL manually.',
+      );
+      for (const server of result.servers || []) {
+        const row = element('div', 'agy-row');
+        row.append(
+          element('span', '', `${server.provider} · ${server.models.length} models`),
+          element('div', 'agy-muted', server.apiUrl),
+          button(
+            'Configure',
+            () =>
+              openModelModal(
+                { name: '', provider: server.provider, apiUrl: server.apiUrl, apiKey: 'none', externalModelName: '' },
+                'discover',
+              ),
+            status,
+          ),
+        );
+        body.append(row);
+      }
+    } catch (error) {
+      setStatus(status, String(error), true);
+    }
+  }
+  async function openGateway(): Promise<void> {
+    const { body, status } = openModal('Remote gateway');
+    try {
+      const saved = (await ipcRenderer.invoke('storage:get-gateway')) as GatewayConfig;
+      if (!body.isConnected) return;
+      body.append(
+        element(
+          'p',
+          'agy-muted',
+          'Connect to your proxy gateway to import its model aliases and open its management dashboard.',
+        ),
+      );
+      const url = field(body, 'Gateway URL', 'agy-gateway-url', saved?.url || '', 'url');
+      const token = field(body, 'Gateway token', 'agy-gateway-token', saved?.token || '', 'password');
+      const dashboard = field(body, 'Dashboard URL (optional)', 'agy-dashboard-url', saved?.dashboardUrl || '', 'url');
+      const config = (): GatewayConfig => ({
+        url: validUrl(url.value),
+        token: token.value.trim(),
+        dashboardUrl: dashboard.value.trim() ? validUrl(dashboard.value) : '',
+      });
+      const save = async () => {
+        requireSuccess(await ipcRenderer.invoke('storage:save-gateway', config()));
+      };
+      const actions = element('div', 'agy-actions');
+      actions.append(
+        button(
+          'Save connection',
+          async () => {
+            await save();
+            setStatus(status, 'Gateway connection saved.');
+          },
+          status,
+          true,
+        ),
+        button(
+          'Test gateway',
+          async () => {
+            setStatus(status, 'Connecting…');
+            const result = requireSuccess(await ipcRenderer.invoke('storage:test-gateway', config()));
+            setStatus(status, result.message || 'Gateway reachable and authentication accepted.');
+          },
+          status,
+        ),
+        button(
+          'Import model aliases',
+          async () => {
+            await save();
+            const result = requireSuccess(await ipcRenderer.invoke('storage:import-gateway-models'));
+            await modelsChanged();
+            setStatus(status, `Imported ${result.count ?? 0} gateway models.`);
+          },
+          status,
+        ),
+        button(
+          'Open dashboard',
+          async () => {
+            await save();
+            requireSuccess(await ipcRenderer.invoke('storage:open-gateway-dashboard'));
+          },
+          status,
+        ),
+      );
+      body.append(actions);
+    } catch (error) {
+      setStatus(status, String(error), true);
+    }
+  }
+  function findSettingsMount(): HTMLElement | null {
+    const headings = Array.from(document.querySelectorAll<HTMLElement>('h1,h2,h3,h4,[role="heading"],div,span'));
+    const heading = headings.find(
+      (node) =>
+        node.children.length === 0 &&
+        /^(Models\s*(?:&|and)\s*Usage|Model Settings|MCP Servers|MCP)$/i.test(node.textContent?.trim() || '') &&
+        !node.closest('#agy-custom-models-section,button,nav,[role="tablist"],[hidden],[aria-hidden="true"]'),
+    );
+    if (heading) {
+      const section = heading.closest('section');
+      if (section) return section;
+      const panel = heading.closest('[role="tabpanel"]');
+      if (panel) return panel as HTMLElement;
+      let content: HTMLElement = heading;
+      while (content.parentElement && content.parentElement !== document.body) {
+        if (content.parentElement.classList.contains('overflow-y-auto')) return content;
+        content = content.parentElement;
+      }
+      return heading.parentElement?.parentElement || heading.parentElement;
+    }
+    const refresh = findRefreshButton();
+    const legacy = refresh?.parentElement?.parentElement?.parentElement;
+    if (legacy && /MCP|Model Context Protocol/i.test(legacy.textContent || '')) return legacy;
+    return null;
+  }
+  function injectCustomModelsSection(): void {
+    if (document.getElementById('agy-custom-models-section')) return;
+    const mount = findSettingsMount();
+    if (!mount) return;
+    installStyles();
+    const section = element('section');
+    section.id = 'agy-custom-models-section';
+    section.setAttribute('aria-label', 'Custom Models');
+    const header = element('div', 'agy-toolbar');
+    header.append(
+      element('h2', '', 'Custom Models'),
+      button('Add model', () => openModelModal(), undefined, true),
+    );
+    const actions = element('div', 'agy-actions');
+    actions.append(
+      button('Discover local', discoverLocal),
+      button('Import', () => openImportExport('import')),
+      button('Export', () => openImportExport('export')),
+      button('Remote gateway', openGateway),
+    );
+    const search = field(section, 'Search models', 'agy-model-search', searchTerm, 'search');
+    search.placeholder = 'Search by name, model ID or provider';
+    search.addEventListener('input', () => {
+      searchTerm = search.value.trim().toLowerCase();
+      void renderCustomModelsList();
+    });
+    const content = element('div');
+    content.id = 'agy-custom-models-content';
+    const status = statusNode();
+    status.id = 'agy-main-status';
+    section.prepend(
+      header,
+      element('p', 'agy-muted', 'Provider connections, local models and remote gateways.'),
+      actions,
+    );
+    section.append(status, content);
+    mount.append(section);
+    void renderCustomModelsList();
+  }
+  function setupInjectionObserver(): void {
+    injectCustomModelsSection();
+    if (!document.body) return;
+    let pending: ReturnType<typeof setTimeout> | undefined;
+    const observer = new MutationObserver(() => {
+      if (document.getElementById('agy-custom-models-section')) return;
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(() => {
+        pending = undefined;
+        injectCustomModelsSection();
+      }, 150);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    window.addEventListener(
+      'pagehide',
+      () => {
+        observer.disconnect();
+        if (pending) clearTimeout(pending);
+      },
+      { once: true },
+    );
+  }
 
   // --- Network Interceptor for Model Injection --------------------------
 
@@ -944,7 +1480,7 @@ window.addEventListener('DOMContentLoaded', () => {
   async function getCustomModelsForInjection(): Promise<any[]> {
     if (Date.now() - customModelsCache.ts < 30000) return customModelsCache.models;
     try {
-      customModelsCache.models = await storageAPI.getCustomModels();
+      customModelsCache.models = (await storageAPI.getCustomModels()).filter((model) => model.enabled !== false);
       customModelsCache.ts = Date.now();
     } catch {
       /* ignore */
@@ -1004,8 +1540,8 @@ window.addEventListener('DOMContentLoaded', () => {
                   (modelsObj as Record<string, unknown>)[slug] = {
                     displayName: m.displayName || m.name,
                     recommended: true,
-                    maxTokens: 1048576,
-                    maxOutputTokens: 4096,
+                    maxTokens: m.contextWindow || 1048576,
+                    maxOutputTokens: m.maxOutputTokens || 4096,
                     tokenizerType: 'LLAMA_WITH_SPECIAL',
                     model:
                       'MODEL_PLACEHOLDER_M' +
@@ -1065,8 +1601,8 @@ window.addEventListener('DOMContentLoaded', () => {
               (modelsObj as Record<string, unknown>)[slug] = {
                 displayName: m.displayName || m.name,
                 recommended: true,
-                maxTokens: 1048576,
-                maxOutputTokens: 4096,
+                maxTokens: m.contextWindow || 1048576,
+                maxOutputTokens: m.maxOutputTokens || 4096,
                 tokenizerType: 'LLAMA_WITH_SPECIAL',
                 model:
                   'MODEL_PLACEHOLDER_M' +

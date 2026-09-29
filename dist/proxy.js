@@ -59,8 +59,9 @@ let stoppingProxy = null;
 const shared_1 = require("./proxy/shared");
 // Model configuration & capability detection
 const modelUtils_1 = require("./proxy/modelUtils");
-// Provider translator registry (auto-discovers translators from proxy/translators/)
-const registry = __importStar(require("./proxy/registry"));
+// Custom request transport and model storage
+const customRequest_1 = require("./proxy/customRequest");
+const modelStore_1 = require("./modelStore");
 const listen_1 = require("./proxy/listen");
 // Dynamic imports (stays require for Electron-specific modules)
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -138,35 +139,85 @@ function loadCustomModels() {
         return cryptoStore.decryptModels(defaultModels.models);
     }
     try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const parsed = JSON.parse(content);
-        const models = parsed.models || [];
+        const models = (0, modelStore_1.readModelConfig)(filePath);
         // Auto-migration check
-        const needsMigration = models.some((m) => !m.encrypted &&
-            m.apiKey &&
-            m.apiKey !== 'none' &&
-            !m.apiKey.startsWith('enc:') &&
-            !m.apiKey.startsWith('fallback:'));
+        const unprotected = (value) => typeof value === 'string' && value && value !== 'none' && !/^(enc:|fallback:|local-gcm:)/.test(value);
+        const needsMigration = models.some((m) => (!m.encrypted && unprotected(m.apiKey)) ||
+            (!m.encryptedHeaders && Object.values(m.customHeaders || {}).some(unprotected)) ||
+            (!m.encryptedGoogleAccounts && (m.googleAccounts || []).some((account) => [account.accessToken, account.refreshToken, account.clientSecret].some(unprotected))));
         if (needsMigration) {
             electron_log_1.default.info('[Proxy] Plaintext custom_models.json detected. Migrating to encrypted format...');
             cryptoStore.backupFile(filePath);
             const encryptedModels = cryptoStore.encryptModels(models);
+            for (const model of encryptedModels) {
+                if (model.customHeaders && !model.encryptedHeaders) {
+                    model.customHeaders = Object.fromEntries(Object.entries(model.customHeaders).map(([name, value]) => [name, unprotected(value) ? cryptoStore.encryptString(value) : value]));
+                    model.encryptedHeaders = true;
+                }
+                if (model.googleAccounts && !model.encryptedGoogleAccounts) {
+                    model.googleAccounts = model.googleAccounts.map((account) => {
+                        const encrypted = { ...account };
+                        for (const field of ['accessToken', 'refreshToken', 'clientSecret'])
+                            if (unprotected(encrypted[field]))
+                                encrypted[field] = cryptoStore.encryptString(encrypted[field]);
+                        return encrypted;
+                    });
+                    model.encryptedGoogleAccounts = true;
+                }
+            }
             try {
-                fs.writeFileSync(filePath, JSON.stringify({ models: encryptedModels }, null, 2), 'utf-8');
+                (0, modelStore_1.writeJsonAtomic)(filePath, { models: encryptedModels });
                 electron_log_1.default.info('[Proxy] Successfully migrated custom_models.json to encrypted format.');
-                return cryptoStore.decryptModels(encryptedModels);
+                // Continue through validation and enabled filtering below.
             }
             catch (err) {
                 electron_log_1.default.error('[Proxy] Failed to write encrypted custom_models.json during migration:', err);
             }
         }
         const decrypted = cryptoStore.decryptModels(models);
+        for (const model of decrypted) {
+            if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(model.apiKey || '')) {
+                model.enabled = false;
+                electron_log_1.default.warn('[Proxy] Skipping a model whose API key could not be decrypted');
+                continue;
+            }
+            if (model.googleAccounts) {
+                model.googleAccounts = model.googleAccounts.flatMap((account) => {
+                    const decryptedAccount = { ...account };
+                    for (const field of ['accessToken', 'refreshToken', 'clientSecret']) {
+                        const value = decryptedAccount[field];
+                        if (!value)
+                            continue;
+                        if (model.encryptedGoogleAccounts)
+                            decryptedAccount[field] = cryptoStore.decryptString(value);
+                        if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(decryptedAccount[field] || '')) {
+                            electron_log_1.default.warn('[Proxy] Skipping a Google account whose credentials could not be decrypted');
+                            return [];
+                        }
+                    }
+                    return [decryptedAccount];
+                });
+                model.encryptedGoogleAccounts = false;
+            }
+            if (model.encryptedHeaders && model.customHeaders) {
+                model.customHeaders = Object.fromEntries(Object.entries(model.customHeaders).map(([key, value]) => {
+                    const decryptedHeader = cryptoStore.decryptString(value);
+                    if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(decryptedHeader || '')) {
+                        model.enabled = false;
+                        electron_log_1.default.warn('[Proxy] Skipping a model whose custom header could not be decrypted');
+                    }
+                    return [key, decryptedHeader];
+                }));
+                model.encryptedHeaders = false;
+            }
+        }
         // Validate all models
         const validModels = [];
         for (let i = 0; i < decrypted.length; i++) {
             const validation = validateCustomModel(decrypted[i]);
             if (validation.valid) {
-                validModels.push(decrypted[i]);
+                if (decrypted[i].enabled !== false)
+                    validModels.push(decrypted[i]);
             }
             else {
                 electron_log_1.default.warn(`[Proxy] Skipping invalid model at index ${i}: ${validation.error}`);
@@ -316,286 +367,8 @@ function downloadFileContent(url, authHeader) {
     });
 }
 // ─── Custom Model Request Handler ─────────────────────────────────────────
-/**
- * Parses the Retry-After header from upstream responses (RFC 7231 §7.1.3).
- * Returns delay in milliseconds, or 0 if no valid header is present.
- */
-function parseRetryAfter(headers) {
-    const val = headers['retry-after'];
-    if (!val)
-        return 0;
-    const raw = Array.isArray(val) ? val[0] : val;
-    if (!raw)
-        return 0;
-    // Try delta-seconds (e.g. "120")
-    const seconds = parseInt(raw.trim(), 10);
-    if (!isNaN(seconds) && seconds >= 0) {
-        return seconds * 1000;
-    }
-    // Try HTTP-date (e.g. "Wed, 21 Oct 2015 07:28:00 GMT")
-    const date = new Date(raw);
-    if (!isNaN(date.getTime())) {
-        const delay = date.getTime() - Date.now();
-        return delay > 0 ? delay : 0;
-    }
-    return 0;
-}
-function handleCustomModelRequest(res, model, geminiBody, isStream, retryCount = 0) {
-    // P3-18: Configurable max retries per model (default 3, min 0, max 5)
-    const MAX_RETRIES = Math.min(Math.max(model.maxRetries ?? 3, 0), 5);
-    const REQUEST_TIMEOUT_MS = model.timeout || 120000;
-    const provider = model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
-    const payload = registry.translateRequest(provider, geminiBody, model.externalModelName);
-    const headers = registry.getProviderHeaders(provider, model.apiKey);
-    if (isStream && registry.supportsStreaming(provider)) {
-        payload.stream = true;
-    }
-    let finalUrlStr = model.apiUrl;
-    // P3-15: Google AI Studio uses dynamic URL construction for streaming vs non-streaming
-    // P3-16: Ollama uses URL normalization for default port and endpoint
-    if (provider === 'google' || provider === 'ollama') {
-        const providerTranslator = registry.getTranslator(provider);
-        finalUrlStr = registry.getProviderUrl(finalUrlStr, model.externalModelName, isStream, providerTranslator);
-    }
-    else if (provider === 'openai' || model.provider === 'custom' || model.provider === 'openrouter') {
-        const urlLower = finalUrlStr.toLowerCase();
-        if (!urlLower.includes('/chat/completions') && !urlLower.includes('/completions')) {
-            if (finalUrlStr.endsWith('/v1')) {
-                finalUrlStr += '/chat/completions';
-            }
-            else if (!finalUrlStr.endsWith('/')) {
-                finalUrlStr += '/v1/chat/completions';
-            }
-            else {
-                finalUrlStr += 'v1/chat/completions';
-            }
-        }
-    }
-    const url = new URL(finalUrlStr);
-    const client = url.protocol === 'https:' ? https : http;
-    const options = {
-        method: 'POST',
-        headers: headers,
-    };
-    // P0-2: SSL bypass ONLY when user explicitly opts in via allowUnauthorized.
-    // Custom providers no longer bypass SSL automatically.
-    if (model.allowUnauthorized) {
-        electron_log_1.default.warn(`[Proxy] SSL verification DISABLED for ${model.name} (allowUnauthorized=true). Connection is vulnerable to MITM.`);
-        options.rejectUnauthorized = false;
-    }
-    electron_log_1.default.info(`[Proxy] Routing ${model.name} to ${model.provider} (${model.apiUrl}) (isStream: ${!!isStream})${retryCount > 0 ? ` (retry ${retryCount})` : ''}`);
-    const request = client.request(url, options, (apiRes) => {
-        apiRes.on('error', (err) => {
-            electron_log_1.default.error(`[Proxy] Upstream stream error for ${model.name}:`, err.message);
-            if (!res.headersSent) {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: 'Upstream connection error: ' + err.message } }));
-            }
-            else {
-                res.end();
-            }
-        });
-        if (isStream) {
-            // Check for API errors BEFORE writing streaming headers
-            if (apiRes.statusCode >= 400) {
-                let errorBody = '';
-                apiRes.on('data', (chunk) => errorBody += chunk.toString());
-                apiRes.on('end', () => {
-                    electron_log_1.default.error(`[Proxy] Stream API error (${apiRes.statusCode}) for ${model.name}: ${errorBody.substring(0, 300)}`);
-                    if (retryCount < MAX_RETRIES) {
-                        electron_log_1.default.warn(`[Proxy] Stream error, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-                        setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), 1000 * (retryCount + 1));
-                        return;
-                    }
-                    res.writeHead(apiRes.statusCode, { 'Content-Type': 'application/json' });
-                    res.end(errorBody);
-                });
-                return;
-            }
-            res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                Connection: 'keep-alive',
-                'X-Accel-Buffering': 'no',
-            });
-            let buffer = '';
-            apiRes.on('data', (chunk) => {
-                buffer += chunk.toString('utf-8');
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed)
-                        continue;
-                    if (trimmed.startsWith('data: ')) {
-                        const dataStr = trimmed.substring(6).trim();
-                        if (dataStr === '[DONE]')
-                            continue;
-                        try {
-                            const parsed = JSON.parse(dataStr);
-                            const mapped = registry.translateStreamChunk(provider, parsed, model.name);
-                            if (mapped) {
-                                const cloudCodeResponse = {
-                                    response: { candidates: [mapped] },
-                                    traceId: '',
-                                    metadata: {},
-                                };
-                                res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
-                            }
-                        }
-                        catch (err) {
-                            // Partial/invalid JSON chunks are normal during streaming; debug-level only
-                            electron_log_1.default.debug(`[Proxy] Stream chunk parse warning for ${model.name}:`, err.message);
-                        }
-                    }
-                }
-            });
-            apiRes.on('end', () => {
-                if (buffer.trim().startsWith('data: ')) {
-                    const dataStr = buffer.trim().substring(6).trim();
-                    if (dataStr !== '[DONE]') {
-                        try {
-                            const parsed = JSON.parse(dataStr);
-                            const mapped = registry.translateStreamChunk(provider, parsed, model.name);
-                            if (mapped) {
-                                const cloudCodeResponse = {
-                                    response: { candidates: [mapped] },
-                                    traceId: '',
-                                    metadata: {},
-                                };
-                                res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
-                            }
-                        }
-                        catch (e) {
-                            electron_log_1.default.debug(`[Proxy] Stream buffer drain parse warning for ${model.name}:`, e.message);
-                        }
-                    }
-                }
-                const finalChunk = {
-                    response: {
-                        candidates: [
-                            {
-                                content: { parts: [], role: 'model' },
-                                finishReason: 'STOP',
-                                index: 0,
-                            },
-                        ],
-                    },
-                    traceId: '',
-                    metadata: {},
-                };
-                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-                res.end();
-            });
-        }
-        else {
-            let body = '';
-            apiRes.on('data', (chunk) => (body += chunk));
-            apiRes.on('end', () => {
-                // Retry on 5xx with exponential backoff
-                if (apiRes.statusCode >= 500 && apiRes.statusCode < 600 && retryCount < MAX_RETRIES) {
-                    const retryAfter = parseRetryAfter(apiRes.headers);
-                    const delay = retryAfter > 0 ? retryAfter : 1000 * Math.pow(2, retryCount);
-                    electron_log_1.default.warn(`[Proxy] Server error ${apiRes.statusCode} for ${model.name}, retrying in ${delay}ms (${retryCount + 1}/${MAX_RETRIES})...`);
-                    setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), delay);
-                    return;
-                }
-                // Retry on 429 with Retry-After header support + exponential backoff
-                if (apiRes.statusCode === 429 && retryCount < MAX_RETRIES) {
-                    const retryAfter = parseRetryAfter(apiRes.headers);
-                    const delay = retryAfter > 0 ? retryAfter : 2000 * Math.pow(2, retryCount);
-                    electron_log_1.default.warn(`[Proxy] Rate limited (429) for ${model.name}, retrying in ${delay}ms (${retryCount + 1}/${MAX_RETRIES})...`);
-                    setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), delay);
-                    return;
-                }
-                if (apiRes.statusCode >= 400) {
-                    // P0-3: Only log status code and model name, NOT response body content
-                    electron_log_1.default.error(`[Proxy] API error (${apiRes.statusCode}) for ${model.name}`);
-                    res.writeHead(apiRes.statusCode, { 'Content-Type': 'application/json' });
-                    res.end(body);
-                    return;
-                }
-                try {
-                    const parsed = JSON.parse(body);
-                    const reasoning = parsed.choices?.[0]
-                        ?.message?.reasoning_content ||
-                        parsed.choices?.[0]
-                            ?.message?.reasoning;
-                    if (reasoning) {
-                        shared_1.modelReasoningContent.set(model.name, reasoning);
-                        (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.reasoning, model.name);
-                    }
-                    const providerForResponse = model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
-                    const mapped = registry.translateResponse(providerForResponse, parsed, model.name);
-                    const cloudCodeResponse = {
-                        response: mapped,
-                        traceId: '',
-                        metadata: {},
-                    };
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify(cloudCodeResponse));
-                }
-                catch (e) {
-                    electron_log_1.default.error('[Proxy] Failed to map response:', e);
-                    if (retryCount < MAX_RETRIES) {
-                        electron_log_1.default.warn(`[Proxy] Parse error for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-                        setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), 1000 * (retryCount + 1));
-                        return;
-                    }
-                    res.writeHead(500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: { message: 'Failed to translate model response' } }));
-                }
-            });
-        }
-    });
-    request.setTimeout(REQUEST_TIMEOUT_MS, () => {
-        electron_log_1.default.error(`[Proxy] Request timeout (${REQUEST_TIMEOUT_MS}ms) for ${model.name}`);
-        request.destroy();
-        if (retryCount < MAX_RETRIES) {
-            electron_log_1.default.warn(`[Proxy] Timeout for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), 1000 * (retryCount + 1));
-            return;
-        }
-        if (!res.headersSent) {
-            res.writeHead(504, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: `Request timeout after ${REQUEST_TIMEOUT_MS / 1000}s` } }));
-        }
-    });
-    request.on('error', (err) => {
-        electron_log_1.default.error('[Proxy] Custom Model Request Error:', err);
-        if (retryCount < MAX_RETRIES) {
-            electron_log_1.default.warn(`[Proxy] Network error for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), 1000 * (retryCount + 1));
-            return;
-        }
-        if (isStream) {
-            if (!res.headersSent) {
-                const errResponse = {
-                    response: {
-                        candidates: [
-                            {
-                                content: { parts: [{ text: 'Network error: ' + err.message }], role: 'model' },
-                                finishReason: 'STOP',
-                                index: 0,
-                            },
-                        ],
-                    },
-                    traceId: '',
-                    metadata: {},
-                };
-                res.write('data: ' + JSON.stringify(errResponse) + '\n\n');
-            }
-            res.end();
-        }
-        else {
-            if (!res.headersSent) {
-                res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: 'Custom model request failed: ' + err.message } }));
-            }
-        }
-    });
-    request.write(JSON.stringify(payload));
-    request.end();
+function handleCustomModelRequest(res, model, body, isStream, cloudEnvelope = true) {
+    void (0, customRequest_1.runCustomModelRequest)(res, model, body, isStream, loadCustomModels(), cloudEnvelope);
 }
 function readVarint(buf, offset) {
     let result = 0;
@@ -737,7 +510,17 @@ function encodeModelEntryForGetModels(name, displayName, mapping) {
 }
 // ─── GetAvailableModels Proxy Handler ───────────────────────────────────────
 function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
-    const lsParsed = new URL(lsUrl);
+    let lsParsed;
+    try {
+        lsParsed = new URL(lsUrl);
+        if (!['http:', 'https:'].includes(lsParsed.protocol))
+            throw new Error('Invalid protocol');
+    }
+    catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid language server URL' } }));
+        return;
+    }
     const client = lsParsed.protocol === 'https:' ? https : http;
     const options = {
         method: 'POST',
@@ -826,9 +609,21 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
 }
 // ─── Main Request Handler ─────────────────────────────────────────────────
 function handleRequest(req, res) {
-    req.url = req.url.replace(/^.*\/dummy_path_padding/, '');
-    // Strip binary patch padding (from LS hostname replacement)
-    req.url = req.url.replace(/\/v1internal\/x{7}/, '');
+    let requestUrl;
+    try {
+        req.url = (req.url || '/').replace(/^.*\/dummy_path_padding/, '');
+        // Strip binary patch padding (from LS hostname replacement)
+        req.url = req.url.replace(/\/v1internal\/x{7}/, '');
+        // This listener routes fixed upstreams; authority-form targets must never replace them.
+        if (!req.url.startsWith('/') || /^[\\/]{2}/.test(req.url))
+            throw new Error('Invalid target');
+        requestUrl = new URL(req.url, 'http://localhost');
+    }
+    catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid request target' } }));
+        return;
+    }
     // Health check
     if (req.method === 'GET' && (req.url === '/health' || req.url === '/healthz')) {
         const memUsage = process.memoryUsage();
@@ -850,6 +645,11 @@ function handleRequest(req, res) {
             },
             timestamp: new Date().toISOString(),
         }));
+        return;
+    }
+    if (req.method === 'GET' && requestUrl.pathname === '/metrics') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify((0, customRequest_1.getProxyMetrics)()));
         return;
     }
     // P0-4: Enforce maximum request body size to prevent memory exhaustion DoS
@@ -919,8 +719,8 @@ function handleRequest(req, res) {
                             const slug = toSlug(m);
                             mappedCustom[slug] = {
                                 displayName: m.displayName,
-                                maxTokens: 1048576,
-                                maxOutputTokens: 4096,
+                                maxTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                                maxOutputTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
                                 model: generateModelPlaceholderId(m),
                                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
@@ -1042,8 +842,8 @@ function handleRequest(req, res) {
                                 modelsMap[slug] = {
                                     displayName: m.displayName,
                                     recommended: true,
-                                    maxTokens: 1048576,
-                                    maxOutputTokens: 4096,
+                                    maxTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                                    maxOutputTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
                                     tokenizerType: 'LLAMA_WITH_SPECIAL',
                                     model: generateModelPlaceholderId(m),
                                     apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
@@ -1083,8 +883,8 @@ function handleRequest(req, res) {
                             const slug = toSlug(m);
                             mappedCustom[slug] = {
                                 displayName: m.displayName,
-                                maxTokens: 1048576,
-                                maxOutputTokens: 4096,
+                                maxTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                                maxOutputTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
                                 model: generateModelPlaceholderId(m),
                                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
@@ -1103,8 +903,8 @@ function handleRequest(req, res) {
                     const slug = toSlug(m);
                     mappedCustom[slug] = {
                         displayName: m.displayName,
-                        maxTokens: 1048576,
-                        maxOutputTokens: 4096,
+                        maxTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                        maxOutputTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
                         model: generateModelPlaceholderId(m),
                         apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                         modelProvider: 'MODEL_PROVIDER_GOOGLE',
@@ -1160,8 +960,8 @@ function handleRequest(req, res) {
                             version: '1.0',
                             displayName: m.displayName,
                             description: m.description,
-                            inputTokenLimit: 1048576,
-                            outputTokenLimit: 4096,
+                            inputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                            outputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
                             supportedGenerationMethods: ['generateContent', 'countTokens'],
                             temperature: 0.7,
                             topP: 0.9,
@@ -1184,8 +984,8 @@ function handleRequest(req, res) {
                             version: '1.0',
                             displayName: m.displayName,
                             description: m.description,
-                            inputTokenLimit: 1048576,
-                            outputTokenLimit: 4096,
+                            inputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                            outputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
                             supportedGenerationMethods: ['generateContent', 'countTokens'],
                         }));
                         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1226,7 +1026,11 @@ function handleRequest(req, res) {
                     if (matchedCustomModel) {
                         electron_log_1.default.info(`[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`);
                         const isStream = req.url.includes('streamGenerateContent') || req.url.includes('alt=sse');
-                        const actualGeminiBody = (reqJson.request || reqJson);
+                        const actualGeminiBody = { ...(reqJson.request || reqJson) };
+                        if (typeof reqJson.sessionId === 'string')
+                            actualGeminiBody.sessionId = reqJson.sessionId;
+                        if (typeof reqJson.conversationId === 'string')
+                            actualGeminiBody.conversationId = reqJson.conversationId;
                         // Resolve fileData URIs then route to translator
                         resolveFileData(actualGeminiBody, req.headers).then(() => {
                             handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream);
@@ -1245,7 +1049,15 @@ function handleRequest(req, res) {
         const isGenerate = !!generateMatch;
         const isStandardStream = !!streamMatch;
         if (req.method === 'POST' && (isGenerate || isStandardStream)) {
-            const matchedModelName = isGenerate ? generateMatch[1] : streamMatch[1];
+            let matchedModelName;
+            try {
+                matchedModelName = decodeURIComponent(isGenerate ? generateMatch[1] : streamMatch[1]);
+            }
+            catch {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'Invalid model URL encoding' } }));
+                return;
+            }
             const customModels = loadCustomModels();
             const matchedCustomModel = customModels.find((m) => {
                 const enumName = generateModelPlaceholderId(m);
@@ -1258,7 +1070,7 @@ function handleRequest(req, res) {
                 try {
                     const geminiBody = JSON.parse(bodyStr);
                     resolveFileData(geminiBody, req.headers).then(() => {
-                        handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream);
+                        handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false);
                     });
                     return;
                 }
@@ -1318,6 +1130,7 @@ function stopProxy() {
             }
         }
         (0, shared_1.stopCleanupInterval)();
+        (0, customRequest_1.stopCustomRequests)();
         if (server) {
             const closingServer = server;
             await new Promise((resolve) => closingServer.close(() => resolve()));

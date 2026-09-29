@@ -57,7 +57,7 @@ interface GeminiRequestBody {
  * Google AI Studio uses the same Gemini format — just pass through.
  * The caller handles URL routing (streamGenerateContent vs generateContent).
  */
-export declare function mapGeminiToGoogle(geminiBody: GeminiRequestBody, modelName: string): GeminiRequestBody;
+export declare function mapGeminiToGoogle(geminiBody: GeminiRequestBody, _modelName: string): GeminiRequestBody;
 /**
  * Google AI Studio returns Gemini-format responses directly.
  * Just pass through — the proxy wraps it in the Cloud Code envelope.

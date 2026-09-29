@@ -16,6 +16,27 @@ export interface CustomModel {
     _slug?: string;
     timeout?: number;
     maxRetries?: number;
+    enabled?: boolean;
+    apiFormat?: import('./providers').ApiFormat;
+    fallbackModels?: string[];
+    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+    thinkingBudget?: number;
+    maxOutputTokens?: number;
+    contextWindow?: number;
+    idleTimeout?: number;
+    retryBudgetMs?: number;
+    circuitBreaker?: import('./proxy/circuitBreaker').CircuitBreakerOptions;
+    customHeaders?: Record<string, string>;
+    encryptedHeaders?: boolean;
+    extraBody?: Record<string, unknown>;
+    rawUrl?: boolean;
+    gateway?: boolean;
+    supportsVision?: boolean;
+    supportsThinking?: boolean;
+    googleProject?: string;
+    googleAccounts?: import('./googleAccounts').GoogleAccount[];
+    googlePool?: import('./googleAccounts').GooglePoolOptions;
+    encryptedGoogleAccounts?: boolean;
 }
 export declare function startProxy(): Promise<number>;
 export declare function stopProxy(): Promise<void>;

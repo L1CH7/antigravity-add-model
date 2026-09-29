@@ -10,6 +10,10 @@ export interface CustomModelConfig {
   provider: string;
   externalModelName?: string;
   displayName?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsVision?: boolean;
+  supportsThinking?: boolean;
 }
 
 export interface ModelCapabilities {
@@ -44,13 +48,13 @@ export function detectModelCapabilities(m: CustomModelConfig, includeDisplayName
   const extLower = (m.externalModelName || '').toLowerCase();
   const displayLower = includeDisplayName ? (m.displayName || '').toLowerCase() : '';
 
-  const isThinking =
+  const isThinking = m.supportsThinking ?? (
     m.provider === 'anthropic' ||
     m.provider === 'openai' ||
     m.provider === 'openrouter' ||
     THINKING_PATTERN.test(nameLower) ||
     THINKING_PATTERN.test(extLower) ||
-    (includeDisplayName && THINKING_PATTERN.test(displayLower));
+    (includeDisplayName && THINKING_PATTERN.test(displayLower)));
 
   const isDeepSeek =
     DEEPSEEK_PATTERN.test(nameLower) ||
@@ -59,17 +63,17 @@ export function detectModelCapabilities(m: CustomModelConfig, includeDisplayName
 
   const isClaude = m.provider === 'anthropic' || CLAUDE_PATTERN.test(nameLower) || CLAUDE_PATTERN.test(extLower);
 
-  const maxTokens = isClaude ? 200_000 : 1_048_576;
-  const maxOutputTokens = isDeepSeek ? 32_768 : isThinking ? 32_768 : 16_384;
+  const maxTokens = m.contextWindow ?? (isClaude ? 200_000 : 1_048_576);
+  const maxOutputTokens = m.maxOutputTokens ?? (isDeepSeek ? 32_768 : isThinking ? 32_768 : 16_384);
 
   // Image support: Claude, GPT-4o, Gemini always support images. DeepSeek, Ollama text models don't.
   const allNames = nameLower + ' ' + extLower + ' ' + displayLower;
-  const supportsImages =
+  const supportsImages = m.supportsVision ?? (
     m.provider === 'anthropic' ||
     m.provider === 'google' ||
     (m.provider === 'openai' && IMAGE_SUPPORT_PATTERN.test(allNames)) ||
     (m.provider === 'openrouter' && IMAGE_SUPPORT_PATTERN.test(allNames)) ||
-    (IMAGE_SUPPORT_PATTERN.test(allNames) && !NO_IMAGE_PATTERN.test(allNames));
+    (IMAGE_SUPPORT_PATTERN.test(allNames) && !NO_IMAGE_PATTERN.test(allNames)));
 
   return { isThinking, isDeepSeek, isClaude, maxTokens, maxOutputTokens, supportsImages };
 }

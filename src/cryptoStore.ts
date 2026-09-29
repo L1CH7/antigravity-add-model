@@ -1,6 +1,31 @@
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { safeStorage } = require('electron');
+const { safeStorage, app } = require('electron');
 import * as fs from 'fs';
+import * as path from 'path';
+import { randomBytes, createCipheriv, createDecipheriv } from 'crypto';
+
+function localKey(create: boolean): Buffer {
+  const directory = path.join(app.getPath('home'), '.gemini', 'antigravity');
+  const filename = path.join(directory, '.model-credentials-key');
+  if (create && !fs.existsSync(filename)) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    try {
+      fs.writeFileSync(filename, randomBytes(32), { mode: 0o600, flag: 'wx' });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  const key = fs.readFileSync(filename);
+  if (key.length !== 32) throw new Error('Invalid local credential encryption key');
+  return key;
+}
+
+function encryptLocal(value: string): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', localKey(true), iv);
+  const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  return 'local-gcm:' + Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString('base64');
+}
 
 /**
  * Creates a backup of the specified file with a .bak extension.
@@ -29,7 +54,7 @@ export function isEncryptionAvailable(): boolean {
 }
 
 /**
- * Encrypts a plaintext string. Falls back to base64 with a prefix if safeStorage is unavailable.
+ * Use OS-backed storage when available; otherwise AES-GCM with a local user key.
  */
 export function encryptString(plainText: string): string {
   if (!plainText || plainText === 'none') return plainText;
@@ -39,12 +64,11 @@ export function encryptString(plainText: string): string {
       const buffer = safeStorage.encryptString(plainText);
       return 'enc:' + buffer.toString('base64');
     } catch (err) {
-      console.error('[CryptoStore] safeStorage encryption failed, falling back to base64:', err);
-      return 'fallback:' + Buffer.from(plainText, 'utf-8').toString('base64');
+      console.error('[CryptoStore] safeStorage encryption failed; using local authenticated encryption.');
+      return encryptLocal(plainText);
     }
   } else {
-    console.warn('[CryptoStore] safeStorage not available. Using base64 fallback format.');
-    return 'fallback:' + Buffer.from(plainText, 'utf-8').toString('base64');
+    return encryptLocal(plainText);
   }
 }
 
@@ -53,6 +77,18 @@ export function encryptString(plainText: string): string {
  */
 export function decryptString(encryptedText: string): string {
   if (!encryptedText || encryptedText === 'none') return encryptedText;
+
+  if (encryptedText.startsWith('local-gcm:')) {
+    try {
+      const bytes = Buffer.from(encryptedText.slice(10), 'base64');
+      if (bytes.length < 28) throw new Error('Truncated ciphertext');
+      const cipher = createDecipheriv('aes-256-gcm', localKey(false), bytes.subarray(0, 12));
+      cipher.setAuthTag(bytes.subarray(12, 28));
+      return Buffer.concat([cipher.update(bytes.subarray(28)), cipher.final()]).toString('utf8');
+    } catch {
+      return 'DECRYPTION_FAILED';
+    }
+  }
 
   if (encryptedText.startsWith('enc:')) {
     const base64Data = encryptedText.substring(4);

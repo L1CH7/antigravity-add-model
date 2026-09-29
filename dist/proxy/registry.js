@@ -1,13 +1,4 @@
 "use strict";
-/**
- * Provider Translator Registry.
- * Auto-discovers translator modules and provides a unified interface for request/response mapping.
- *
- * To add a new provider:
- *   1. Create a file in ./translators/ named <provider>.ts
- *   2. Export: mapGeminiTo<Provider>, map<Provider>ToGemini, map<Provider>ChunkToGemini
- *   3. The registry detects it automatically — no config changes needed.
- */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -41,9 +32,6 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getTranslator = getTranslator;
 exports.translateRequest = translateRequest;
@@ -52,128 +40,76 @@ exports.translateStreamChunk = translateStreamChunk;
 exports.getProviderHeaders = getProviderHeaders;
 exports.supportsStreaming = supportsStreaming;
 exports.getProviderUrl = getProviderUrl;
-const path = __importStar(require("path"));
-const fs = __importStar(require("fs"));
-const electron_log_1 = __importDefault(require("electron-log"));
-// ─── Registry State ───────────────────────────────────────────────────────
-const translators = new Map();
-// ─── Auto-Discovery ───────────────────────────────────────────────────────
-function loadTranslators() {
-    const translatorDir = path.join(__dirname, 'translators');
-    try {
-        const files = fs.readdirSync(translatorDir).filter((f) => f.endsWith('.js') && f !== 'utils.js');
-        for (const file of files) {
-            const provider = path.basename(file, '.js');
-            try {
-                // eslint-disable-next-line @typescript-eslint/no-var-requires
-                const mod = require(path.join(translatorDir, file));
-                translators.set(provider, mod);
-                electron_log_1.default.info(`[TranslatorRegistry] Loaded provider translator: "${provider}"`);
-            }
-            catch (err) {
-                electron_log_1.default.error(`[TranslatorRegistry] Failed to load translator "${provider}":`, err.message);
-            }
-        }
-    }
-    catch (err) {
-        electron_log_1.default.error('[TranslatorRegistry] Failed to scan translators directory:', err.message);
-    }
-    electron_log_1.default.info(`[TranslatorRegistry] ${translators.size} provider translator(s) loaded: ${[...translators.keys()].join(', ')}`);
+/** Wire-format dispatch, independent from provider branding and authentication. */
+const openai = __importStar(require("./translators/openai"));
+const anthropic = __importStar(require("./translators/anthropic"));
+const google = __importStar(require("./translators/google"));
+const providers_1 = require("../providers");
+function getTranslator(provider, apiFormat) {
+    const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
+    return format === 'google' ? google : format === 'anthropic' ? anthropic : openai;
 }
-// Providers grouped by transport compatibility
-const OPENAI_COMPAT = new Set(['openai', 'ollama', 'openrouter', 'custom', 'groq', 'mistral', 'cerebras', 'nvidia', 'opencode', 'codestral']);
-const ANTHROPIC_COMPAT = new Set(['anthropic', 'deepseek', 'kimi', 'fireworks', 'lmstudio', 'llamacpp', 'wafer', 'zai']);
-// ─── Public API ───────────────────────────────────────────────────────────
-function getTranslator(provider) {
-    if (OPENAI_COMPAT.has(provider))
-        return translators.get('openai') || null;
-    if (ANTHROPIC_COMPAT.has(provider))
-        return translators.get('anthropic') || null;
-    if (provider === 'google')
-        return translators.get('google') || null;
-    return translators.get('openai') || null;
+function translateRequest(provider, body, modelName, apiFormat, stateKey) {
+    const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
+    if (format === 'google')
+        return google.mapGeminiToGoogle(body, modelName);
+    if (format === 'anthropic')
+        return anthropic.mapGeminiToAnthropic(body, modelName, stateKey);
+    return openai.mapGeminiToOpenAI(body, modelName, stateKey);
 }
-function translateRequest(provider, geminiBody, modelName) {
-    const t = getTranslator(provider);
-    if (provider === 'google')
-        return geminiBody;
-    if (OPENAI_COMPAT.has(provider))
-        return t?.mapGeminiToOpenAI ? t.mapGeminiToOpenAI(geminiBody, modelName) : geminiBody;
-    if (ANTHROPIC_COMPAT.has(provider))
-        return t?.mapGeminiToAnthropic ? t.mapGeminiToAnthropic(geminiBody, modelName) : geminiBody;
-    // Generic: try mapGeminiTo<Provider> convention
-    const fnName = `mapGeminiTo${provider.charAt(0).toUpperCase() + provider.slice(1)}`;
-    if (t && typeof t[fnName] === 'function') {
-        return t[fnName](geminiBody, modelName);
-    }
-    electron_log_1.default.warn(`[TranslatorRegistry] No request translator for provider "${provider}", passing through`);
-    return geminiBody;
+function translateResponse(provider, response, stateKey, apiFormat) {
+    const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
+    if (format === 'google')
+        return google.mapGoogleToGemini(response, stateKey);
+    if (format === 'anthropic')
+        return anthropic.mapAnthropicToGemini(response, stateKey);
+    return openai.mapOpenAIToGemini(response, stateKey);
 }
-function translateResponse(provider, providerRes, modelName) {
-    const t = getTranslator(provider);
-    if (provider === 'google')
-        return providerRes;
-    if (OPENAI_COMPAT.has(provider))
-        return t?.mapOpenAIToGemini ? t.mapOpenAIToGemini(providerRes, modelName) : providerRes;
-    if (ANTHROPIC_COMPAT.has(provider))
-        return t?.mapAnthropicToGemini ? t.mapAnthropicToGemini(providerRes, modelName) : providerRes;
-    const fnName = `map${provider.charAt(0).toUpperCase() + provider.slice(1)}ToGemini`;
-    if (t && typeof t[fnName] === 'function') {
-        return t[fnName](providerRes, modelName);
-    }
-    electron_log_1.default.warn(`[TranslatorRegistry] No response translator for provider "${provider}", passing through`);
-    return providerRes;
+function translateStreamChunk(provider, chunk, stateKey, apiFormat, streamKey) {
+    const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
+    if (format === 'google')
+        return google.mapGoogleChunkToGemini(chunk, stateKey);
+    if (format === 'anthropic')
+        return anthropic.mapAnthropicChunkToGemini(chunk, stateKey, streamKey);
+    return openai.mapOpenAIChunkToGemini(chunk, stateKey, streamKey);
 }
-function translateStreamChunk(provider, chunk, modelName) {
-    const t = getTranslator(provider);
-    if (provider === 'google')
-        return t?.mapGoogleChunkToGemini ? t.mapGoogleChunkToGemini(chunk, modelName) : null;
-    if (OPENAI_COMPAT.has(provider))
-        return t?.mapOpenAIChunkToGemini ? t.mapOpenAIChunkToGemini(chunk, modelName) : null;
-    if (ANTHROPIC_COMPAT.has(provider))
-        return t?.mapAnthropicChunkToGemini ? t.mapAnthropicChunkToGemini(chunk, modelName) : null;
-    const fnName = `map${provider.charAt(0).toUpperCase() + provider.slice(1)}ChunkToGemini`;
-    if (t && typeof t[fnName] === 'function') {
-        return t[fnName](chunk, modelName);
-    }
-    return null;
-}
-function getProviderHeaders(provider, apiKey) {
+function getProviderHeaders(provider, apiKey = '', apiFormat) {
     const headers = { 'Content-Type': 'application/json' };
-    if (!apiKey || apiKey === 'none')
-        return headers;
-    if (provider === 'anthropic' || ANTHROPIC_COMPAT.has(provider)) {
-        headers['x-api-key'] = apiKey;
-        headers['anthropic-version'] = '2025-04-01';
+    const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
+    if (format === 'anthropic')
+        headers['anthropic-version'] = '2023-06-01';
+    if (apiKey && apiKey !== 'none') {
+        if (/^(enc:|fallback:|local-gcm:|DECRYPTION_FAILED)/.test(apiKey))
+            throw new Error('API key could not be decrypted; save the key again.');
+        if (format === 'google')
+            headers['x-goog-api-key'] = apiKey;
+        else if (format === 'anthropic')
+            headers['x-api-key'] = apiKey;
+        else
+            headers.Authorization = `Bearer ${apiKey}`;
     }
-    else if (provider === 'google') {
-        headers['x-goog-api-key'] = apiKey;
-    }
-    else if (provider === 'openrouter') {
-        headers['Authorization'] = `Bearer ${apiKey}`;
+    if (provider === 'openrouter') {
         headers['HTTP-Referer'] = 'https://antigravity.google';
         headers['X-Title'] = 'Antigravity';
     }
-    else if (provider !== 'ollama') {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-    }
+    if (['opencode', 'zen', 'opencode-go'].includes(provider))
+        headers['User-Agent'] = 'opencode';
     return headers;
 }
-function supportsStreaming(provider) {
-    return OPENAI_COMPAT.has(provider) || ANTHROPIC_COMPAT.has(provider) || provider === 'google';
+function supportsStreaming(_provider) {
+    return true;
 }
-// ─── URL Helpers ──────────────────────────────────────────────────────────
 function getProviderUrl(baseUrl, modelName, isStream, translator) {
-    // Google AI Studio: dynamic streaming vs non-streaming URL
-    if (translator && typeof translator['getGoogleApiUrl'] === 'function') {
-        return translator['getGoogleApiUrl'](baseUrl, modelName, isStream);
-    }
-    // Ollama: normalize to standard /v1/chat/completions endpoint
-    if (translator && typeof translator['getOllamaApiUrl'] === 'function') {
-        return translator['getOllamaApiUrl'](baseUrl);
-    }
-    return baseUrl;
+    if (typeof translator?.getGoogleApiUrl === 'function')
+        return translator.getGoogleApiUrl(baseUrl, modelName, isStream);
+    const url = new URL(baseUrl);
+    let pathname = url.pathname.replace(/\/+$/, '');
+    const anthropicFormat = translator === anthropic;
+    pathname = pathname.replace(/\/(?:chat\/completions|completions|messages)$/, '');
+    if (!pathname)
+        pathname = '/v1';
+    pathname += anthropicFormat ? '/messages' : '/chat/completions';
+    url.pathname = pathname;
+    return url.toString();
 }
-// ─── Boot ─────────────────────────────────────────────────────────────────
-loadTranslators();
 //# sourceMappingURL=registry.js.map

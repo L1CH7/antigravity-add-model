@@ -76,8 +76,9 @@ function mapGeminiToolsToAnthropic(geminiTools) {
     }
     return anthropicTools;
 }
-function mapGeminiToAnthropic(geminiBody, modelName) {
+function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
     const messages = [];
+    const historyCallIds = new Map();
     let system = undefined;
     if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
         system = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
@@ -94,6 +95,9 @@ function mapGeminiToAnthropic(geminiBody, modelName) {
                             contentBlocks.push({ type: 'text', text: p.text });
                         if (p.functionCall) {
                             const callId = p.functionCall.id || 'call_' + Math.random().toString(36).slice(2, 10);
+                            const ids = historyCallIds.get(p.functionCall.name) || [];
+                            ids.push(callId);
+                            historyCallIds.set(p.functionCall.name, ids);
                             let originalName = p.functionCall.name;
                             let originalArgs = p.functionCall.args;
                             const translatedInfo = shared_1.translatedToolCalls.get(callId);
@@ -118,8 +122,14 @@ function mapGeminiToAnthropic(geminiBody, modelName) {
                     for (const p of item.parts) {
                         if (p.functionResponse) {
                             const funcName = p.functionResponse.name || '';
-                            const modelTCIds = shared_1.modelToolCallIds.get(modelName) || {};
-                            const toolCallId = p.functionResponse.id || modelTCIds[funcName] || 'call_' + funcName;
+                            const modelTCIds = shared_1.modelToolCallIds.get(stateKey) || {};
+                            const ids = historyCallIds.get(funcName) || [];
+                            const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+                            if (p.functionResponse.id) {
+                                const matched = ids.indexOf(p.functionResponse.id);
+                                if (matched >= 0)
+                                    ids.splice(matched, 1);
+                            }
                             const responseData = p.functionResponse.response;
                             let contentStr = '';
                             const translatedInfo = shared_1.translatedToolCalls.get(toolCallId);
@@ -257,9 +267,9 @@ function mapAnthropicToGemini(anthRes, modelName) {
     };
 }
 // ─── STREAM CHUNK: Anthropic SSE → Gemini ─────────────────────────────────
-function mapAnthropicChunkToGemini(chunk, modelName) {
+function mapAnthropicChunkToGemini(chunk, modelName, streamKey) {
     const type = chunk.type;
-    const streamId = chunk.message?.id || 'anthropic_stream';
+    const streamId = streamKey || chunk.message?.id || 'anthropic_stream';
     if (!shared_1.activeStreamContexts.has(streamId)) {
         shared_1.activeStreamContexts.set(streamId, { accumulatedText: '', accumulatedReasoning: '', toolCalls: {} });
         (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.streamCtx, streamId);
@@ -269,7 +279,7 @@ function mapAnthropicChunkToGemini(chunk, modelName) {
         const block = chunk.content_block;
         const idx = chunk.index ?? 0;
         if (block?.type === 'tool_use') {
-            context.toolCalls[idx] = { id: block.id || '', name: block.name || '', arguments: '' };
+            context.toolCalls[idx] = { id: block.id || '', name: block.name || '', arguments: block.input && Object.keys(block.input).length ? JSON.stringify(block.input) : '' };
         }
     }
     if (type === 'content_block_delta') {
@@ -289,7 +299,7 @@ function mapAnthropicChunkToGemini(chunk, modelName) {
                 index: 0,
             };
         }
-        else if (delta?.type === 'input_delta') {
+        else if (delta?.type === 'input_json_delta' || delta?.type === 'input_delta') {
             if (context.toolCalls[idx]) {
                 context.toolCalls[idx].arguments += delta.partial_json || '';
             }
@@ -301,7 +311,7 @@ function mapAnthropicChunkToGemini(chunk, modelName) {
             const parts = Object.values(context.toolCalls).map((tc) => {
                 let args = {};
                 try {
-                    args = JSON.parse(tc.arguments);
+                    args = JSON.parse(tc.arguments || '{}');
                 }
                 catch (e) {
                     electron_log_1.default.debug('[Anthropic] Stream tool args parse fallback:', e.message);

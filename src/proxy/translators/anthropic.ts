@@ -174,8 +174,9 @@ function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[] {
   return anthropicTools;
 }
 
-export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string): AnthropicRequestBody {
+export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string, stateKey = modelName): AnthropicRequestBody {
   const messages: AnthropicMessage[] = [];
+  const historyCallIds = new Map<string, string[]>();
   let system: string | undefined = undefined;
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
@@ -194,6 +195,9 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
             if (p.text) contentBlocks.push({ type: 'text', text: p.text });
             if (p.functionCall) {
               const callId = p.functionCall.id || 'call_' + Math.random().toString(36).slice(2, 10);
+              const ids = historyCallIds.get(p.functionCall.name) || [];
+              ids.push(callId);
+              historyCallIds.set(p.functionCall.name, ids);
               let originalName = p.functionCall.name;
               let originalArgs = p.functionCall.args;
               const translatedInfo = translatedToolCalls.get(callId);
@@ -218,8 +222,13 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
           for (const p of item.parts) {
             if (p.functionResponse) {
               const funcName = p.functionResponse.name || '';
-              const modelTCIds = modelToolCallIds.get(modelName) || {};
-              const toolCallId = p.functionResponse.id || modelTCIds[funcName] || 'call_' + funcName;
+              const modelTCIds = modelToolCallIds.get(stateKey) || {};
+              const ids = historyCallIds.get(funcName) || [];
+              const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+              if (p.functionResponse.id) {
+                const matched = ids.indexOf(p.functionResponse.id);
+                if (matched >= 0) ids.splice(matched, 1);
+              }
               const responseData = p.functionResponse.response;
               let contentStr = '';
               const translatedInfo = translatedToolCalls.get(toolCallId);
@@ -345,9 +354,9 @@ export function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: stri
 
 // ─── STREAM CHUNK: Anthropic SSE → Gemini ─────────────────────────────────
 
-export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: string): GeminiCandidate | null {
+export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: string, streamKey?: string): GeminiCandidate | null {
   const type = chunk.type;
-  const streamId = chunk.message?.id || 'anthropic_stream';
+  const streamId = streamKey || chunk.message?.id || 'anthropic_stream';
 
   if (!activeStreamContexts.has(streamId)) {
     activeStreamContexts.set(streamId, { accumulatedText: '', accumulatedReasoning: '', toolCalls: {} });
@@ -359,7 +368,7 @@ export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: s
     const block = chunk.content_block;
     const idx = chunk.index ?? 0;
     if (block?.type === 'tool_use') {
-      context.toolCalls[idx] = { id: block.id || '', name: block.name || '', arguments: '' };
+      context.toolCalls[idx] = { id: block.id || '', name: block.name || '', arguments: block.input && Object.keys(block.input).length ? JSON.stringify(block.input) : '' };
     }
   }
 
@@ -378,7 +387,7 @@ export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: s
         finishReason: 'OTHER',
         index: 0,
       };
-    } else if (delta?.type === 'input_delta') {
+    } else if (delta?.type === 'input_json_delta' || delta?.type === 'input_delta') {
       if (context.toolCalls[idx]) {
         context.toolCalls[idx].arguments += delta.partial_json || '';
       }
@@ -391,7 +400,7 @@ export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: s
       const parts: GeminiPart[] = Object.values(context.toolCalls).map((tc) => {
         let args: ToolCallArgs = {};
         try {
-          args = JSON.parse(tc.arguments);
+          args = JSON.parse(tc.arguments || '{}');
         } catch (e) {
           log.debug('[Anthropic] Stream tool args parse fallback:', (e as Error).message);
           args = {};

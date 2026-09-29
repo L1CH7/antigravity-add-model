@@ -21,25 +21,25 @@ function detectModelCapabilities(m, includeDisplayName = true) {
     const nameLower = (m.name || '').toLowerCase();
     const extLower = (m.externalModelName || '').toLowerCase();
     const displayLower = includeDisplayName ? (m.displayName || '').toLowerCase() : '';
-    const isThinking = m.provider === 'anthropic' ||
+    const isThinking = m.supportsThinking ?? (m.provider === 'anthropic' ||
         m.provider === 'openai' ||
         m.provider === 'openrouter' ||
         THINKING_PATTERN.test(nameLower) ||
         THINKING_PATTERN.test(extLower) ||
-        (includeDisplayName && THINKING_PATTERN.test(displayLower));
+        (includeDisplayName && THINKING_PATTERN.test(displayLower)));
     const isDeepSeek = DEEPSEEK_PATTERN.test(nameLower) ||
         DEEPSEEK_PATTERN.test(extLower) ||
         (includeDisplayName && DEEPSEEK_PATTERN.test(displayLower));
     const isClaude = m.provider === 'anthropic' || CLAUDE_PATTERN.test(nameLower) || CLAUDE_PATTERN.test(extLower);
-    const maxTokens = isClaude ? 200000 : 1048576;
-    const maxOutputTokens = isDeepSeek ? 32768 : isThinking ? 32768 : 16384;
+    const maxTokens = m.contextWindow ?? (isClaude ? 200000 : 1048576);
+    const maxOutputTokens = m.maxOutputTokens ?? (isDeepSeek ? 32768 : isThinking ? 32768 : 16384);
     // Image support: Claude, GPT-4o, Gemini always support images. DeepSeek, Ollama text models don't.
     const allNames = nameLower + ' ' + extLower + ' ' + displayLower;
-    const supportsImages = m.provider === 'anthropic' ||
+    const supportsImages = m.supportsVision ?? (m.provider === 'anthropic' ||
         m.provider === 'google' ||
         (m.provider === 'openai' && IMAGE_SUPPORT_PATTERN.test(allNames)) ||
         (m.provider === 'openrouter' && IMAGE_SUPPORT_PATTERN.test(allNames)) ||
-        (IMAGE_SUPPORT_PATTERN.test(allNames) && !NO_IMAGE_PATTERN.test(allNames));
+        (IMAGE_SUPPORT_PATTERN.test(allNames) && !NO_IMAGE_PATTERN.test(allNames)));
     return { isThinking, isDeepSeek, isClaude, maxTokens, maxOutputTokens, supportsImages };
 }
 /**

@@ -78,8 +78,9 @@ function mapGeminiToolsToOpenAI(geminiTools) {
     }
     return openaiTools;
 }
-function mapGeminiToOpenAI(geminiBody, modelName) {
+function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
     const messages = [];
+    const historyCallIds = new Map();
     if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
         const systemText = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
         if (systemText) {
@@ -96,6 +97,9 @@ function mapGeminiToOpenAI(geminiBody, modelName) {
                     for (const p of item.parts) {
                         if (p.functionCall) {
                             const callId = p.functionCall.id || 'call_' + Math.random().toString(36).slice(2, 10);
+                            const ids = historyCallIds.get(p.functionCall.name) || [];
+                            ids.push(callId);
+                            historyCallIds.set(p.functionCall.name, ids);
                             let originalName = p.functionCall.name;
                             let originalArgs = p.functionCall.args;
                             const translatedInfo = shared_1.translatedToolCalls.get(callId);
@@ -119,8 +123,14 @@ function mapGeminiToOpenAI(geminiBody, modelName) {
                     for (const p of item.parts) {
                         if (p.functionResponse) {
                             const funcName = p.functionResponse.name || '';
-                            const modelTCIds = shared_1.modelToolCallIds.get(modelName) || {};
-                            const toolCallId = p.functionResponse.id || modelTCIds[funcName] || 'call_' + funcName;
+                            const modelTCIds = shared_1.modelToolCallIds.get(stateKey) || {};
+                            const ids = historyCallIds.get(funcName) || [];
+                            const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+                            if (p.functionResponse.id) {
+                                const matched = ids.indexOf(p.functionResponse.id);
+                                if (matched >= 0)
+                                    ids.splice(matched, 1);
+                            }
                             const responseData = p.functionResponse.response;
                             let contentStr = '';
                             const translatedInfo = shared_1.translatedToolCalls.get(toolCallId);
@@ -197,7 +207,7 @@ function mapGeminiToOpenAI(geminiBody, modelName) {
     }
     for (let i = 0; i < messages.length; i++) {
         if (messages[i].role === 'assistant' && !messages[i].reasoning_content) {
-            const preservedReasoning = shared_1.modelReasoningContent.get(modelName) || '';
+            const preservedReasoning = shared_1.modelReasoningContent.get(stateKey) || '';
             messages[i].reasoning_content = i === lastAssistantIdx && preservedReasoning ? preservedReasoning : '';
         }
     }
@@ -348,12 +358,12 @@ function mapOpenAIToGemini(openAiRes, modelName) {
     };
 }
 // ─── STREAM CHUNK: OpenAI → Gemini ────────────────────────────────────────
-function mapOpenAIChunkToGemini(chunk, modelName) {
+function mapOpenAIChunkToGemini(chunk, modelName, streamKey) {
     const choice = chunk.choices?.[0];
     if (!choice)
         return null;
     const delta = choice.delta;
-    const streamId = chunk.id || 'default_stream';
+    const streamId = streamKey || chunk.id || 'default_stream';
     if (!shared_1.activeStreamContexts.has(streamId)) {
         shared_1.activeStreamContexts.set(streamId, { accumulatedText: '', accumulatedReasoning: '', toolCalls: {} });
         (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.streamCtx, streamId);

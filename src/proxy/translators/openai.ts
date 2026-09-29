@@ -202,8 +202,9 @@ function mapGeminiToolsToOpenAI(geminiTools: GeminiTool[]): OpenAITool[] {
   return openaiTools;
 }
 
-export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: string): OpenAIRequestBody {
+export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: string, stateKey = modelName): OpenAIRequestBody {
   const messages: OpenAIMessage[] = [];
+  const historyCallIds = new Map<string, string[]>();
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
     const systemText = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
@@ -223,6 +224,9 @@ export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: stri
           for (const p of item.parts) {
             if (p.functionCall) {
               const callId = p.functionCall.id || 'call_' + Math.random().toString(36).slice(2, 10);
+              const ids = historyCallIds.get(p.functionCall.name) || [];
+              ids.push(callId);
+              historyCallIds.set(p.functionCall.name, ids);
               let originalName = p.functionCall.name;
               let originalArgs = p.functionCall.args;
               const translatedInfo = translatedToolCalls.get(callId);
@@ -245,8 +249,13 @@ export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: stri
           for (const p of item.parts) {
             if (p.functionResponse) {
               const funcName = p.functionResponse.name || '';
-              const modelTCIds = modelToolCallIds.get(modelName) || {};
-              const toolCallId = p.functionResponse.id || modelTCIds[funcName] || 'call_' + funcName;
+              const modelTCIds = modelToolCallIds.get(stateKey) || {};
+              const ids = historyCallIds.get(funcName) || [];
+              const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+              if (p.functionResponse.id) {
+                const matched = ids.indexOf(p.functionResponse.id);
+                if (matched >= 0) ids.splice(matched, 1);
+              }
               const responseData = p.functionResponse.response;
               let contentStr = '';
               const translatedInfo = translatedToolCalls.get(toolCallId);
@@ -314,7 +323,7 @@ export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: stri
   }
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].role === 'assistant' && !(messages[i] as OpenAIMessage).reasoning_content) {
-      const preservedReasoning = modelReasoningContent.get(modelName) || '';
+      const preservedReasoning = modelReasoningContent.get(stateKey) || '';
       messages[i].reasoning_content = i === lastAssistantIdx && preservedReasoning ? preservedReasoning : '';
     }
   }
@@ -471,11 +480,11 @@ export function mapOpenAIToGemini(openAiRes: OpenAIResponse, modelName: string):
 
 // ─── STREAM CHUNK: OpenAI → Gemini ────────────────────────────────────────
 
-export function mapOpenAIChunkToGemini(chunk: OpenAIResponse, modelName: string): GeminiCandidate | null {
+export function mapOpenAIChunkToGemini(chunk: OpenAIResponse, modelName: string, streamKey?: string): GeminiCandidate | null {
   const choice = chunk.choices?.[0];
   if (!choice) return null;
   const delta = choice.delta;
-  const streamId = ((chunk as Record<string, unknown>).id as string) || 'default_stream';
+  const streamId = streamKey || ((chunk as Record<string, unknown>).id as string) || 'default_stream';
 
   if (!activeStreamContexts.has(streamId)) {
     activeStreamContexts.set(streamId, { accumulatedText: '', accumulatedReasoning: '', toolCalls: {} });
