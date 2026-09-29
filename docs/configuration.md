@@ -39,6 +39,20 @@ Choose limits supported by your actual model. The example does not install a
 server or download a model. A local server that requires authentication still
 needs its own API key.
 
+## Discover and select models
+
+Select a provider, enter its key and endpoint, then choose **Fetch provider models**.
+Search the returned catalog by model name or ID. **Select filtered** selects the
+current matches; selections remain checked when you change the search. **Add
+selected** saves all checked models, including selections outside the current filter.
+
+When available, discovery imports each model's context/output limits and image
+and reasoning metadata. Explicit values in **Advanced settings** take priority.
+An output limit at least as large as the context is reduced to leave input room.
+Missing metadata keeps the normal defaults; review limits and capabilities for
+your chosen model. Discovery does not generate a completion or verify tool use.
+See [providers and model catalogs](providers.md) for endpoints and service-specific details.
+
 ## Fields and advanced settings
 
 Most fields are exposed under **Advanced settings**. Fields marked JSON/import

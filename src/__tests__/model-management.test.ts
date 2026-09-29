@@ -330,6 +330,181 @@ describe('model storage and compatibility', () => {
 });
 
 describe('provider discovery and saved credentials', () => {
+  it('discovers a large OpenRouter-style catalog with metadata and skips non-chat outputs', async () => {
+    const catalog = Array.from({ length: 450 }, (_, index) => ({
+      id: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      context_length: 128000,
+      top_provider: { max_completion_tokens: 8192 },
+      architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      supported_parameters: ['tools', 'reasoning'],
+    }));
+    const url = await server((req, res) => {
+      expect(req.url).toBe('/api/v1/models');
+      expect(req.headers.authorization).toBe('Bearer catalog-key');
+      res.end(
+        JSON.stringify({
+          data: [...catalog, catalog[0], { id: 'image-only', architecture: { output_modalities: ['image'] } }],
+        }),
+      );
+    });
+    const { manager } = setup();
+    const found = await manager.discoverModels({
+      provider: 'openrouter',
+      apiUrl: `${url}/api/v1/chat/completions`,
+      apiKey: 'catalog-key',
+    });
+    expect(found.models).toHaveLength(450);
+    expect(found.models[449]).toEqual({
+      id: 'vendor/model-449',
+      displayName: 'Model 449',
+      contextWindow: 128000,
+      maxOutputTokens: 8192,
+      supportsVision: true,
+      supportsThinking: true,
+    });
+  });
+
+  it('accepts Together-style top-level arrays and keeps chat models with context limits', async () => {
+    const url = await server((_req, res) =>
+      res.end(
+        JSON.stringify([
+          { id: 'org/chat-model', display_name: 'Chat model', type: 'chat', context_length: 64000 },
+          { id: 'org/embedding-model', type: 'embedding' },
+          { id: 'org/image-model', type: 'image' },
+        ]),
+      ),
+    );
+    const { manager } = setup();
+    const found = await manager.discoverModels({
+      provider: 'together',
+      apiUrl: `${url}/v1/chat/completions`,
+      apiKey: 'test',
+    });
+    expect(found.models).toEqual([{ id: 'org/chat-model', displayName: 'Chat model', contextWindow: 64000 }]);
+  });
+
+  it('uses the DashScope listing API on the configured origin and reads every advertised page', async () => {
+    const paths: string[] = [];
+    const url = await server((req, res) => {
+      expect(req.headers.authorization).toBe('Bearer regional-key');
+      const requested = new URL(req.url!, 'http://localhost');
+      expect(requested.pathname).toBe('/api/v1/models');
+      expect(requested.searchParams.get('capabilities')).toBe('TG');
+      expect(requested.searchParams.get('page_size')).toBe('100');
+      paths.push(requested.searchParams.get('page_no')!);
+      const page = requested.searchParams.get('page_no');
+      res.end(
+        JSON.stringify({
+          output: {
+            total: 2,
+            models: [
+              {
+                model: `qwen-${page}`,
+                name: `Friendly Qwen ${page}`,
+                model_info: { context_window: 32768 },
+                inference_metadata: { request_modality: ['Text', 'Image'] },
+              },
+            ],
+          },
+        }),
+      );
+    });
+    const { manager } = setup();
+    const found = await manager.discoverModels({
+      provider: 'dashscope',
+      apiFormat: 'openai',
+      apiUrl: `${url}/compatible-mode/v1/chat/completions`,
+      apiKey: 'regional-key',
+    });
+    expect(paths).toEqual(['1', '2']);
+    expect(found.models).toEqual(
+      [1, 2].map((i) => ({
+        id: `qwen-${i}`,
+        displayName: `Friendly Qwen ${i}`,
+        contextWindow: 32768,
+        supportsVision: true,
+      })),
+    );
+  });
+
+  it('uses Fireworks resource names, Bearer listing auth, and continuation tokens', async () => {
+    const pages: string[] = [];
+    const url = await server((req, res) => {
+      expect(req.headers.authorization).toBe('Bearer fireworks-key');
+      const requested = new URL(req.url!, 'http://localhost');
+      expect(requested.pathname).toBe('/v1/accounts/fireworks/models');
+      expect(requested.searchParams.get('pageSize')).toBe('200');
+      const cursor = requested.searchParams.get('pageToken') || '';
+      pages.push(cursor);
+      res.end(
+        JSON.stringify({
+          models: [
+            {
+              name: `accounts/fireworks/models/chat-${pages.length}`,
+              displayName: 'Example chat',
+              kind: 'HF_BASE_MODEL',
+              state: 'READY',
+              supportsServerless: true,
+            },
+            { name: 'embedding', kind: 'EMBEDDING_MODEL' },
+            { name: 'private-only', supportsServerless: false },
+          ],
+          ...(cursor ? {} : { nextPageToken: 'cursor+/=' }),
+        }),
+      );
+    });
+    const { manager } = setup();
+    const found = await manager.discoverModels({
+      provider: 'fireworks',
+      apiUrl: `${url}/inference/v1/chat/completions`,
+      apiKey: 'fireworks-key',
+    });
+    expect(pages).toEqual(['', 'cursor+/=']);
+    expect(found.models.map((value) => value.id)).toEqual([
+      'accounts/fireworks/models/chat-1',
+      'accounts/fireworks/models/chat-2',
+    ]);
+  });
+
+  it('rejects repeated model page tokens instead of looping or returning a partial catalog', async () => {
+    let calls = 0;
+    const url = await server((_req, res) => {
+      calls++;
+      res.end(JSON.stringify({ models: [{ name: 'accounts/fireworks/models/one' }], nextPageToken: 'repeat' }));
+    });
+    const { manager } = setup();
+    await expect(
+      manager.discoverModels({ provider: 'fireworks', apiUrl: `${url}/inference/v1`, apiKey: 'test' }),
+    ).rejects.toThrow('invalid model page token');
+    expect(calls).toBe(2);
+  });
+
+  it('keeps HF context conservative and maps Novita/SambaNova catalog fields', async () => {
+    const url = await server((_req, res) =>
+      res.end(
+        JSON.stringify({
+          data: [
+            { id: 'hf/model', providers: [{ context_length: 32768 }, { context_length: 65536 }] },
+            { id: 'hf/unknown-route', providers: [{ context_length: 32768 }, {}] },
+            { id: 'novita/model', title: 'Novita model', context_size: 8192 },
+            { id: 'samba/model', context_length: 16384, max_completion_tokens: 4096 },
+            { id: 'deepseek/model', context_window: 131072, max_output_tokens: 8192 },
+            { id: 'hf/incomplete', providers: [null, { context_length: 32768 }] },
+          ],
+        }),
+      ),
+    );
+    const { manager } = setup();
+    const found = await manager.discoverModels({ provider: 'custom', apiUrl: `${url}/v1` });
+    expect(found.models[0]).toMatchObject({ contextWindow: 32768 });
+    expect(found.models[1]).not.toHaveProperty('contextWindow');
+    expect(found.models[2]).toMatchObject({ displayName: 'Novita model', contextWindow: 8192 });
+    expect(found.models[3]).toMatchObject({ contextWindow: 16384, maxOutputTokens: 4096 });
+    expect(found.models[4]).toMatchObject({ contextWindow: 131072, maxOutputTokens: 8192 });
+    expect(found.models[5]).not.toHaveProperty('contextWindow');
+  });
+
   it('probes saved masked credentials and verifies the chosen model without generating', async () => {
     const requests: string[] = [];
     const url = await server((req, res) => {
@@ -385,6 +560,9 @@ describe('provider discovery and saved credentials', () => {
     ['https://x.test/v1/chat/completions', 'openai', 'https://x.test/v1/models'],
     ['https://x.test/anthropic/v1/messages', 'anthropic', 'https://x.test/anthropic/v1/models'],
     ['https://x.test/v1beta/models/a:generateContent', 'google', 'https://x.test/v1beta/models'],
+    ['https://x.test/v3/openai/chat/completions', 'openai', 'https://x.test/v3/openai/models'],
+    ['https://x.test/openai/v1/chat/completions', 'openai', 'https://x.test/openai/v1/models'],
+    ['https://x.test/compatible-mode/v1/chat/completions', 'openai', 'https://x.test/compatible-mode/v1/models'],
   ])('normalizes model discovery path %s', (url, format, expected) => expect(modelListUrl(url, format)).toBe(expected));
 });
 

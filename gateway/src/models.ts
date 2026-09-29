@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { detectModelCapabilities } from './model-capabilities.js';
 import type { ModelCapabilities } from './model-capabilities.js';
 import type { ProviderId } from './adapter.js';
+import { BUILTIN_PROVIDERS } from './provider-catalog.js';
 
 export type RoutingMode = 'priority-chain' | 'per-model-per-provider';
 
@@ -58,7 +59,10 @@ export class ModelResolver {
   private providerMap: ProviderModelMap = {};
   private aliasCapabilities: Record<string, AliasCapabilities> = {};
   routingMode: RoutingMode = 'priority-chain';
-  globalProviderPriority: ProviderId[] = ['openrouter', 'nvidia', 'anthropic', 'google', 'zen', 'opencode-go', 'openai', 'groq', 'ollama', 'vllm', 'lmstudio'];
+  globalProviderPriority: ProviderId[] = [...new Set([
+    'openrouter', 'nvidia', 'anthropic', 'google', 'zen', 'opencode-go', 'openai', 'groq',
+    ...BUILTIN_PROVIDERS.map(provider => provider.id),
+  ])];
   titleModel: string = '';
   fallbackModel: string = '';
   defaultProvider: ProviderId | '' = '';

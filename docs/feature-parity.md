@@ -27,7 +27,7 @@ workspace/session/terminal APIs and mobile clients are a separate runtime.
 | Provider groups and enable/disable | Available | Models group by provider and endpoint; group and individual enable actions preserve saved credentials. Storage remains a flat model list. |
 | Provider-level shared defaults | Import and discovery supported | Provider-group imports inherit defaults; discovered models copy settings. Later model edits are independent; this is not a live shared provider-credential object. |
 | Edit, duplicate, rename, delete | Available | Main-process updates preserve masked credentials; duplicate uses the source model's saved secret. |
-| Provider model discovery | Available | Authenticated provider model-list requests with a selectable result list; provider listing support is required. |
+| Provider model discovery | Available | Live model catalogs with search, filtered bulk selection, available capability/limit metadata, and provider-specific pagination. See [provider setup](providers.md). |
 | Local server discovery | Available on request | Common ports for Ollama, LM Studio, llama.cpp, vLLM, LocalAI, TabbyAPI, Text Generation WebUI, LiteLLM, and Aphrodite. No background network scan. |
 | JSON/base64 import and export | Available | Flat arrays, `models`, and provider-group inputs; export removes API keys, custom headers, and Google tokens/client secrets. Import validates before writing. |
 | OpenAI, Anthropic, Gemini protocols | Available | Explicit `apiFormat` selects translation independently from preset branding; old entries retain their historical format when no override exists. |

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
+import { BUILTIN_PROVIDERS } from '../src/provider-catalog.js';
 
 process.env.AG_GATEWAY_DATA_DIR ||= fs.mkdtempSync(path.join(os.tmpdir(), 'ag-gateway-integration-'));
 const token = 'gateway-test-token-only-0123456789';
@@ -90,12 +91,59 @@ test('malformed dashboard request targets return 400 without stopping either lis
 });
 
 test('config reads mask credentials while preserving nonsecret settings', async () => {
-  await api('/api/config', { OAUTH_CLIENT_SECRET: 'fixture-private-client-secret' });
+  assert.equal((await api('/api/config', { OAUTH_CLIENT_SECRET: 'fixture-private-client-secret' })).status, 400);
+  // Legacy/CLI settings can still contain arbitrary secrets and must remain masked.
+  (await import('../src/settings.js')).writeSettings({ OAUTH_CLIENT_SECRET: 'fixture-private-client-secret' });
   const settings = await (await api('/api/config')).json() as any;
   for (const key of ['OPENAI_API_KEY', 'NVIDIA_API_KEY', 'AG_GATEWAY_TOKEN', 'DASHBOARD_PASSWORD', 'OAUTH_CLIENT_SECRET']) assert.equal(settings[key], '********');
   assert.match(settings.OPENAI_BASE_URL, /\/primary\/v1$/);
   assert.equal(settings.DASHBOARD_USER, 'admin');
   assert.ok(!JSON.stringify(settings).includes(password));
+});
+
+test('provider metadata and settings support every catalog entry without exposing credentials', async () => {
+  assert.equal((await fetch(dashboard + '/api/providers')).status, 401);
+  const metadata = await (await api('/api/providers')).json() as any;
+  assert.deepEqual(metadata.providers.map((item: any) => item.id), BUILTIN_PROVIDERS.map(item => item.id));
+  const secrets: Record<string, string> = {};
+  const origin = `http://127.0.0.1:${(upstream.address() as any).port}`;
+  for (const definition of BUILTIN_PROVIDERS.filter(item => ['together', 'huggingface', 'sambanova', 'siliconflow', 'novita', 'dashscope', 'deepseek', 'mistral', 'xai', 'cerebras', 'fireworks'].includes(item.id))) {
+    const entry = metadata.providers.find((item: any) => item.id === definition.id);
+    assert.equal(entry.envKey, definition.envKey);
+    assert.equal(entry.baseUrlEnv, definition.baseUrlEnv);
+    assert.equal(entry.baseUrl, definition.baseUrl);
+    secrets[definition.envKey] = `fixture-private-${definition.id}-key`;
+    secrets[definition.baseUrlEnv] = origin + '/providers/' + definition.id + new URL(definition.baseUrl).pathname;
+  }
+  secrets.HUGGINGFACE_API_KEY = '';
+  secrets.HF_TOKEN = 'fixture-private-hf-alias-token';
+  assert.equal((await api('/api/config', secrets)).status, 200);
+  const status = await (await api('/api/status')).json() as any;
+  assert.match(status.env.TOGETHER_API_KEY, /••••/);
+  assert.match(status.env.HUGGINGFACE_API_KEY, /••••/);
+  assert.equal(status.providers.find((item: any) => item.id === 'huggingface').hasKey, true);
+  assert.ok(!JSON.stringify(status).includes('fixture-private-'));
+  assert.ok(!JSON.stringify(metadata).includes('fixture-private-'));
+});
+
+test('new provider selections actually route authenticated Gemini JSON and SSE requests after reload', async () => {
+  try {
+    for (const id of ['together', 'huggingface', 'sambanova', 'siliconflow', 'novita', 'dashscope', 'deepseek', 'mistral', 'xai', 'cerebras', 'fireworks']) {
+      assert.equal((await api('/api/config', { PROVIDER_PRIORITY: id })).status, 200);
+      assert.equal((await api('/api/models', { ...setup, _provider_models: { demo: { [id]: `model-${id}` } } })).status, 200);
+      const response = await generate(); assert.equal(response.status, 200, id);
+      const value = await response.json() as any;
+      assert.equal(value.candidates[0].content.parts[0].text, 'Hello world', id);
+      assert.equal(value.modelVersion, `model-${id}`, id);
+      assert.match(requested.at(-1)!.url, new RegExp(`/providers/${id}/`));
+      assert.equal(requested.at(-1)!.authorization, id === 'huggingface' ? 'Bearer fixture-private-hf-alias-token' : `Bearer fixture-private-${id}-key`);
+      const stream = await generate(true); assert.equal(stream.status, 200, id);
+      assert.match(await stream.text(), /Hello /);
+    }
+  } finally {
+    await api('/api/config', { PROVIDER_PRIORITY: 'openai,nvidia' });
+    await api('/api/models', setup);
+  }
 });
 
 test('native Gemini JSON preserves text and usage; SSE contains unwrapped deltas exactly once', async () => {

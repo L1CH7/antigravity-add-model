@@ -127,40 +127,112 @@ function statusError(status: number): string {
   return `${messages[status] || 'Provider request failed'} (HTTP ${status})`;
 }
 
-export function modelListUrl(apiUrl: string, format: string): string {
+export function modelListUrl(apiUrl: string, format: string, provider?: string): string {
   const url = checkedUrl(apiUrl);
   url.search = '';
   let pathname = url.pathname.replace(/\/+$/, '');
   pathname = pathname
     .replace(/\/(chat\/completions|completions|responses|messages)$/, '')
     .replace(/\/models(?:\/.*)?$/, '');
+  if (provider === 'dashscope') {
+    url.pathname = `${pathname.replace(/\/(?:compatible-mode\/)?v1$/, '')}/api/v1/models`;
+    url.searchParams.set('capabilities', 'TG');
+    url.searchParams.set('page_no', '1');
+    url.searchParams.set('page_size', '100');
+    return url.toString();
+  }
+  if (provider === 'fireworks') {
+    url.pathname = `${pathname.replace(/\/(?:inference\/)?v1$/, '')}/v1/accounts/fireworks/models`;
+    url.searchParams.set('pageSize', '200');
+    return url.toString();
+  }
   if (format === 'google') {
     if (!/\/v1(?:beta)?$/.test(pathname)) pathname += '/v1beta';
-  } else if (!/\/v\d(?:beta)?$/.test(pathname)) pathname += '/v1';
+  } else if (!/(?:^|\/)v\d+(?:beta\d*)?(?:\/|$)/.test(pathname)) pathname += '/v1';
   url.pathname = `${pathname}/models`;
+  if (provider === 'siliconflow') url.searchParams.set('sub_type', 'chat');
   return url.toString();
 }
 
-function parseModels(data: unknown): DiscoveredModel[] {
+function parseModels(data: unknown, provider?: string): DiscoveredModel[] {
   if (!data || typeof data !== 'object') throw new Error('Provider did not return a JSON model list');
-  const root = data as { data?: unknown; models?: unknown };
-  const items = Array.isArray(root.data) ? root.data : root.models;
+  const root = data as { data?: unknown; models?: unknown; output?: { models?: unknown } };
+  const items = Array.isArray(data) ? data : Array.isArray(root.data) ? root.data : root.models || root.output?.models;
   if (!Array.isArray(items)) throw new Error('Provider response has no model list');
+  const positiveLimit = (...values: unknown[]): number | undefined =>
+    values.find(
+      (value): value is number =>
+        typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 1_000_000_000,
+    );
+  const seen = new Set<string>();
   return items
     .filter((item) => item && typeof item === 'object')
-    .map((item) => ({
-      id: String(item.id || item.name || item.model || '').replace(/^models\//, ''),
-      displayName: String(item.displayName || item.display_name || item.id || item.name || item.model || ''),
-      ...(Number.isSafeInteger(item.contextWindow) && item.contextWindow > 0
-        ? { contextWindow: item.contextWindow }
-        : {}),
-      ...(Number.isSafeInteger(item.maxOutputTokens) && item.maxOutputTokens > 0
-        ? { maxOutputTokens: item.maxOutputTokens }
-        : {}),
-      ...(typeof item.supportsVision === 'boolean' ? { supportsVision: item.supportsVision } : {}),
-      ...(typeof item.supportsThinking === 'boolean' ? { supportsThinking: item.supportsThinking } : {}),
-    }))
-    .filter((item) => item.id);
+    .filter((item) => provider !== 'together' || item.type === 'chat')
+    .filter(
+      (item) =>
+        provider !== 'fireworks' ||
+        (item.supportsServerless !== false &&
+          (!item.state || item.state === 'READY') &&
+          item.kind !== 'EMBEDDING_MODEL'),
+    )
+    .filter((item) => !['embedding', 'embeddings', 'image', 'audio', 'rerank', 'moderation'].includes(item.type))
+    .filter(
+      (item) =>
+        !Array.isArray(item.architecture?.output_modalities) || item.architecture.output_modalities.includes('text'),
+    )
+    .map((item) => {
+      const providerLimits = Array.isArray(item.providers)
+        ? item.providers.map((value: { context_length?: unknown } | null) => positiveLimit(value?.context_length))
+        : [];
+      const contextWindow = positiveLimit(
+        item.contextWindow,
+        item.context_window,
+        item.context_length,
+        item.context_size,
+        item.inputTokenLimit,
+        item.top_provider?.context_length,
+        item.model_info?.context_window,
+        providerLimits.length && providerLimits.every((value: unknown) => typeof value === 'number')
+          ? Math.min(...providerLimits)
+          : undefined,
+      );
+      const maxOutputTokens = positiveLimit(
+        item.maxOutputTokens,
+        item.max_output_tokens,
+        item.max_completion_tokens,
+        item.outputTokenLimit,
+        item.top_provider?.max_completion_tokens,
+      );
+      const supportsVision =
+        typeof item.supportsVision === 'boolean'
+          ? item.supportsVision
+          : Array.isArray(item.architecture?.input_modalities)
+            ? item.architecture.input_modalities.includes('image')
+            : Array.isArray(item.inference_metadata?.request_modality)
+              ? item.inference_metadata.request_modality.includes('Image')
+              : undefined;
+      const supportsThinking =
+        typeof item.supportsThinking === 'boolean'
+          ? item.supportsThinking
+          : Array.isArray(item.supported_parameters)
+            ? item.supported_parameters.some((value: unknown) => value === 'reasoning' || value === 'reasoning_effort')
+            : undefined;
+      return {
+        id: String(item.id || item.model || item.name || '').replace(/^models\//, ''),
+        displayName: String(
+          item.displayName || item.display_name || item.title || item.name || item.id || item.model || '',
+        ),
+        ...(contextWindow ? { contextWindow } : {}),
+        ...(maxOutputTokens ? { maxOutputTokens } : {}),
+        ...(supportsVision !== undefined ? { supportsVision } : {}),
+        ...(supportsThinking !== undefined ? { supportsThinking } : {}),
+      };
+    })
+    .filter((item) => {
+      if (!item.id || seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
 }
 
 export function createModelManager(
@@ -312,7 +384,9 @@ export function createModelManager(
     const model = resolveProbe(input);
     const format = resolveApiFormat(model.provider, model.apiFormat);
     const headers: Record<string, string> = {};
-    if (format === 'anthropic') {
+    if (model.provider === 'fireworks') {
+      if (model.apiKey) headers.Authorization = `Bearer ${model.apiKey}`;
+    } else if (format === 'anthropic') {
       headers['anthropic-version'] = '2023-06-01';
       if (model.apiKey) headers['x-api-key'] = model.apiKey;
     } else if (format === 'google') {
@@ -324,10 +398,42 @@ export function createModelManager(
       http.validateHeaderValue(key, value);
       headers[key] = value;
     }
-    const response = await requestJson(modelListUrl(model.apiUrl, format), headers, model.allowUnauthorized);
-    if (response.status < 200 || response.status >= 300)
-      throw Object.assign(new Error(statusError(response.status)), { status: response.status });
-    return { success: true, models: parseModels(response.data), status: response.status };
+    const listUrl = new URL(modelListUrl(model.apiUrl, format, model.provider));
+    const models = new Map<string, DiscoveredModel>();
+    const cursors = new Set<string>();
+    const deadline = Date.now() + 30000;
+    let received = 0;
+    for (let page = 1; page <= 50; page++) {
+      if (Date.now() >= deadline) throw new Error('Model discovery exceeded its 30-second time budget');
+      const response = await requestJson(listUrl.toString(), headers, model.allowUnauthorized);
+      if (response.status < 200 || response.status >= 300)
+        throw Object.assign(new Error(statusError(response.status)), { status: response.status });
+      for (const found of parseModels(response.data, model.provider)) models.set(found.id, found);
+      if (models.size > 10000) throw new Error('Model catalog exceeds 10000 entries');
+      const data = response.data as { output?: { models?: unknown[]; total?: number }; nextPageToken?: string };
+      if (model.provider === 'dashscope' && Array.isArray(data.output?.models)) {
+        received += data.output.models.length;
+        const total = data.output.total;
+        if (typeof total === 'number' && Number.isSafeInteger(total) && total >= 0 && received < total) {
+          if (!data.output.models.length) throw new Error('Provider returned an incomplete model catalog');
+          listUrl.searchParams.set('page_no', String(page + 1));
+          continue;
+        }
+        if (total === undefined && data.output.models.length === 100) {
+          listUrl.searchParams.set('page_no', String(page + 1));
+          continue;
+        }
+      } else if (model.provider === 'fireworks' && data.nextPageToken) {
+        const token = data.nextPageToken;
+        if (typeof token !== 'string' || token.length > 4096 || cursors.has(token))
+          throw new Error('Provider returned an invalid model page token');
+        cursors.add(token);
+        listUrl.searchParams.set('pageToken', token);
+        continue;
+      }
+      return { success: true, models: [...models.values()], status: response.status };
+    }
+    throw new Error('Model discovery exceeded the maximum number of pages');
   }
   async function gatewayModels(input?: GatewayConnection) {
     const connection = resolveGateway(input);

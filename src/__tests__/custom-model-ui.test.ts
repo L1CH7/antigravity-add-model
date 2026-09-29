@@ -274,6 +274,63 @@ describe('custom model settings in the preserved vendor preload', () => {
     expect(call?.[1]).not.toHaveProperty('copyFrom');
   });
 
+  it('filters hundreds of provider models, retains selection across searches, and imports catalog metadata', async () => {
+    const f = await fixture();
+    f.handlers['storage:discover-models'] = () => ({
+      success: true,
+      models: Array.from({ length: 450 }, (_, i) => ({
+        id: `vendor/model-${i}`,
+        displayName: `Catalog model ${i}`,
+        contextWindow: 65536,
+        maxOutputTokens: 4096,
+        supportsVision: true,
+        supportsThinking: false,
+      })),
+    });
+    await f.click('Discover models');
+    await f.click('Fetch provider models');
+    const search = f.input('agy-discovery-search', 'model-449');
+    search.dispatchEvent(new f.dom.window.Event('input', { bubbles: true }));
+    expect(f.document.querySelectorAll('.agy-choice')).toHaveLength(1);
+    await f.click('Select filtered');
+    search.value = 'model-448';
+    search.dispatchEvent(new f.dom.window.Event('input', { bubbles: true }));
+    expect(f.document.querySelector('.agy-discovery')!.textContent).toContain('1 selected');
+    await f.click('Select filtered');
+    search.value = 'missing';
+    search.dispatchEvent(new f.dom.window.Event('input', { bubbles: true }));
+    expect(f.document.querySelector('.agy-discovery')!.textContent).toContain('No provider models match');
+    await f.click('Add selected');
+    const saved = f.getModels().filter((value) => value.name !== model.name);
+    expect(saved.map((value) => value.externalModelName)).toEqual(['vendor/model-448', 'vendor/model-449']);
+    expect(saved[0]).toMatchObject({
+      contextWindow: 65536,
+      maxOutputTokens: 4096,
+      supportsVision: true,
+      supportsThinking: false,
+    });
+  });
+
+  it('keeps explicit limit overrides when importing catalog choices', async () => {
+    const f = await fixture();
+    f.handlers['storage:discover-models'] = () => ({
+      success: true,
+      models: [{ id: 'new-model', contextWindow: 32000, maxOutputTokens: 8000, supportsVision: true }],
+    });
+    await f.click('Discover models');
+    f.input('agy-context-window', '16000');
+    f.input('agy-max-output', '2048');
+    f.input('agy-vision', 'false');
+    await f.click('Fetch provider models');
+    await f.click('Select all');
+    await f.click('Add selected');
+    expect(f.getModels().find((value) => value.externalModelName === 'new-model')).toMatchObject({
+      contextWindow: 16000,
+      maxOutputTokens: 2048,
+      supportsVision: false,
+    });
+  });
+
   it('uses the redacted export endpoint and imports base64 without parsing it as JSON in the renderer', async () => {
     const f = await fixture();
     await f.click('Export');

@@ -4,6 +4,7 @@ import { poolFetch } from '../http-pool.js';
 import { getEffortForModel } from '../reasoning-effort.js';
 import { logger } from '../logger.js';
 import { parseToolArgs } from '../utils/parse-tool-args.js';
+import { openAIEndpoint } from '../provider-endpoints.js';
 
 /**
  * Known field names that providers use to emit reasoning/thinking content.
@@ -42,8 +43,9 @@ export class OpenAICompatAdapter implements ModelAdapter {
 
   constructor(provider: string, baseUrl: string, apiKey: string) {
     this.provider = provider;
-    this.baseUrl = baseUrl.replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
-    if (!this.baseUrl.endsWith('/v1')) this.baseUrl += '/v1';
+    // Validation and joining happen in one helper shared with model discovery.
+    openAIEndpoint(baseUrl, 'chat/completions');
+    this.baseUrl = baseUrl;
     this.apiKey = apiKey;
     this.supportsImages = true;
   }
@@ -236,6 +238,8 @@ export class OpenAICompatAdapter implements ModelAdapter {
     const perModelEffort = getEffortForModel(model);
     const effort = explicitEffort || (perModelEffort && perModelEffort !== 'default' ? perModelEffort : null);
     if (effort) body.reasoning_effort = effort;
+    // SiliconFlow's DeepSeek V3.1 endpoint requires thinking disabled with tools.
+    if (this.provider === 'siliconflow' && body.tools && /deepseek-v3\.1(?:$|[-/])/i.test(model)) body.enable_thinking = false;
     return body;
   }
 
@@ -275,11 +279,12 @@ export class OpenAICompatAdapter implements ModelAdapter {
   }
 
   protected async fetchWithRetry(body: Record<string, unknown>, signal?: AbortSignal, config?: Record<string, unknown>): Promise<Response> {
-    const response = await poolFetch(`${this.baseUrl}/chat/completions`, {
+    const response = await poolFetch(openAIEndpoint(this.baseUrl, 'chat/completions'), {
       method: 'POST',
       headers: this.buildHeaders(config),
       body: JSON.stringify(body),
       signal,
+      redirect: 'error',
     });
     if (!response.ok) {
       const err = await response.text().catch(() => 'unknown');

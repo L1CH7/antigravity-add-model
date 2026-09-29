@@ -13,6 +13,7 @@ import { reloadRouter, streamResponse } from './engine.js';
 import * as db from './db.js';
 import { USER_ENV_PATH, USER_LOGS_DIR, dataFile } from './data-paths.js';
 import { readSettings, writeSettings } from './settings.js';
+import { BUILTIN_PROVIDERS, getProviderApiKey } from './provider-catalog.js';
 import { getAllPricing, savePricing, reload as reloadPricing } from './pricing.js';
 import { setRateLimitConfig, getRateLimitConfig, getRateLimitStats, resetRateLimits } from './rate-limiter.js';
 import { getBlocklist, saveBlocklist, reload as reloadBlocklist } from './blocklist.js';
@@ -209,6 +210,40 @@ function maskKey(key: string): string {
 }
 
 function readEnv(): Record<string, string> { return readSettings(); }
+
+const DASHBOARD_CONFIG_KEYS = new Set([
+  'PROVIDER', 'PROVIDER_PRIORITY', 'LOG_LEVEL', 'PROXY_PORT', 'API_PORT',
+  'PROXY_RETRIES', 'PROXY_BACKOFF_MS', 'REQUEST_TIMEOUT_MS',
+  'RATE_LIMIT_GLOBAL', 'RATE_LIMIT_PROVIDER', 'RATE_LIMIT_WINDOW_MS',
+  'CONTEXT_STRIP_MODE', 'COMPACTION_ENABLED', 'COMPACTION_THRESHOLD',
+  'COMPACTION_MODEL', 'COMPACTION_TAIL_TURNS', 'FAILOVER_WEBHOOK_URL',
+  'DASHBOARD_USER', 'DASHBOARD_PASSWORD', 'AG_GATEWAY_TOKEN',
+  'AG_GATEWAY_HOST', 'AG_GATEWAY_REMOTE',
+  ...BUILTIN_PROVIDERS.flatMap(provider => [provider.envKey, provider.baseUrlEnv, ...(provider.apiKeyAliases || [])]).filter(Boolean),
+]);
+
+function providerStatus() {
+  return BUILTIN_PROVIDERS.map(provider => {
+    const configured = config.providers.find(item => item.id === provider.id);
+    const hasKey = !!configured?.apiKey || !!getProviderApiKey(provider);
+    return {
+      id: provider.id,
+      priority: configured?.priority,
+      hasKey,
+      enabled: configured?.enabled ?? (hasKey || !provider.envKey),
+      baseUrl: configured?.baseUrl || process.env[provider.baseUrlEnv] || provider.baseUrl,
+    };
+  });
+}
+
+function providerSettings(): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const provider of BUILTIN_PROVIDERS) {
+    if (provider.envKey) result[provider.envKey] = maskKey(getProviderApiKey(provider));
+    result[provider.baseUrlEnv] = process.env[provider.baseUrlEnv] || '';
+  }
+  return result;
+}
 
 function writeEnv(updates: Record<string, string>): boolean {
   try { writeSettings(updates); return true; } catch { return false; }
@@ -446,6 +481,11 @@ export function createDashboardHandler(options: { replay?: (input: Record<string
     }
 
     // API routes
+    if (url.pathname === '/api/providers' && method === 'GET') {
+      jsonResp(res, { providers: BUILTIN_PROVIDERS.map(({ id, name, envKey, baseUrlEnv, baseUrl }) => ({ id, name, envKey, baseUrlEnv, baseUrl })) });
+      return;
+    }
+
     if (url.pathname === '/api/status' && method === 'GET') {
       const env = readEnv();
       const stats = requestStore.getStats(true);
@@ -469,8 +509,8 @@ export function createDashboardHandler(options: { replay?: (input: Record<string
         compactionModel: process.env.COMPACTION_MODEL || config.compactionModel,
         compactionTailTurns: process.env.COMPACTION_TAIL_TURNS || String(config.compactionTailTurns),
         providerPriority: config.providerPriority,
-        providers: config.providers.map(p => ({ id: p.id, priority: p.priority, hasKey: !!p.apiKey, enabled: p.enabled })),
-        env: { PROVIDER: env.PROVIDER, LOG_LEVEL: env.LOG_LEVEL, PROXY_PORT: env.PROXY_PORT, API_PORT: env.API_PORT, PROVIDER_PRIORITY: env.PROVIDER_PRIORITY, PROXY_RETRIES: env.PROXY_RETRIES, PROXY_BACKOFF_MS: env.PROXY_BACKOFF_MS, NVIDIA_API_KEY: maskKey(env.NVIDIA_API_KEY), OPENROUTER_API_KEY: maskKey(env.OPENROUTER_API_KEY), ANTHROPIC_API_KEY: maskKey(env.ANTHROPIC_API_KEY), OPENAI_API_KEY: maskKey(env.OPENAI_API_KEY), GROQ_API_KEY: maskKey(env.GROQ_API_KEY), GOOGLE_API_KEY: maskKey(env.GOOGLE_API_KEY), OPENCODE_API_KEY: maskKey(env.OPENCODE_API_KEY), CONTEXT_STRIP_MODE: env.CONTEXT_STRIP_MODE || 'passthrough' },
+        providers: providerStatus(),
+        env: { PROVIDER: env.PROVIDER, LOG_LEVEL: env.LOG_LEVEL, PROXY_PORT: env.PROXY_PORT, API_PORT: env.API_PORT, PROVIDER_PRIORITY: env.PROVIDER_PRIORITY, PROXY_RETRIES: env.PROXY_RETRIES, PROXY_BACKOFF_MS: env.PROXY_BACKOFF_MS, ...providerSettings(), CONTEXT_STRIP_MODE: env.CONTEXT_STRIP_MODE || 'passthrough' },
         stats,
       });
       return;
@@ -485,6 +525,10 @@ export function createDashboardHandler(options: { replay?: (input: Record<string
       collectBody(req).then(body => {
         try {
           const updates = JSON.parse(body);
+          if (!updates || typeof updates !== 'object' || Array.isArray(updates) || Object.keys(updates).some(key => !DASHBOARD_CONFIG_KEYS.has(key))) {
+            jsonResp(res, { ok: false, error: 'Unsupported dashboard setting' }, 400);
+            return;
+          }
           if (writeEnv(updates)) {
             if (updates.COMPACTION_ENABLED !== undefined) {
               const models = readModels() as any;

@@ -33,7 +33,7 @@ export declare function requestJson(urlValue: string, headers?: Record<string, s
     status: number;
     data: unknown;
 }>;
-export declare function modelListUrl(apiUrl: string, format: string): string;
+export declare function modelListUrl(apiUrl: string, format: string, provider?: string): string;
 export declare function createModelManager(directory: string, codec: SecretCodec, openExternal: (url: string) => Promise<unknown>, dependencies?: {
     loginGoogleAccount: typeof loginGoogleAccount;
     refreshGoogleAccount: typeof refreshGoogleAccount;

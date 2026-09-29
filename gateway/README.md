@@ -49,10 +49,20 @@ Charts are bundled and work offline. Local discovery only runs when requested.
 
 Provider adapters cover OpenAI-compatible chat, Anthropic messages, Google
 Gemini, and OpenCode Zen/Go chat, messages, and Responses protocols. Presets
-include OpenAI, Anthropic, Google, OpenRouter, NVIDIA, Groq, Ollama, LM Studio,
-and vLLM. Configure keys as `<PROVIDER>_API_KEY` and optional custom endpoints
+include OpenAI, Anthropic, Google, OpenRouter, Together AI, Hugging Face Inference
+Providers, SambaNova, SiliconFlow, Novita AI, Alibaba Cloud Model Studio,
+DeepSeek, Mistral, xAI, Cerebras, Fireworks AI, NVIDIA, Groq, Ollama, LM Studio,
+vLLM, OpenCode Zen, and OpenCode Go. Configure keys as `<PROVIDER>_API_KEY` and optional custom endpoints
 as `<PROVIDER>_BASE_URL`; Zen uses `OPENCODE_API_KEY` / `OPENCODE_BASE_URL`,
 and Go uses `OPENCODE_GO_API_KEY` / `OPENCODE_GO_BASE_URL`.
+
+Dashboard provider forms, routing selectors, and **Browse Models** use the same
+[provider catalog](src/provider-catalog.ts). Save a provider key in **Config**,
+then browse its live models and map the desired IDs to aliases. Base URL
+overrides are optional; clearing an override restores its preset default.
+Saved keys remain masked and leaving a key field empty preserves it. See
+[provider setup and endpoints](../docs/providers.md) for exact IDs, endpoint
+formats, and regional/account requirements.
 
 For example, this `models.json` routes an alias to two OpenAI models in order:
 

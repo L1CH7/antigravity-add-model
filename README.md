@@ -36,7 +36,7 @@ Add external API providers and local models alongside Antigravity's built-in mod
 | --- | --- | --- |
 | [Installation](#installation) | [Gateway and web dashboard](#optional-gateway-and-web-dashboard) | [Troubleshooting and recovery](#updates-diagnostics-and-recovery) |
 | [Add your first model](#add-your-first-model) | [Connect from another computer](#connect-from-another-computer) | [Supported app versions and layouts](docs/compatibility.md) |
-| [Provider options](#providers-and-advanced-options) | [Model configuration](docs/configuration.md) | [Changelog](CHANGELOG.md) |
+| [Providers and model catalogs](docs/providers.md) | [Model configuration](docs/configuration.md) | [Changelog](CHANGELOG.md) |
 | [Development and contributing](#development-and-contributing) | [Google account setup](docs/configuration.md#google-cloud-code-account-pools) | [Browse existing issues](https://github.com/vahapogut/antigravity-add-model/issues) |
 
 ## What you can do
@@ -169,7 +169,7 @@ This option requires port **50999** and participates in backup/rollback. It is s
 | Method | Steps |
 | --- | --- |
 | **Enter a model manually** | Enter the exact **Provider model ID**, optionally set a display name, then choose **Test connection → Save model**. |
-| **Choose from the provider catalog** | Choose **Fetch provider models**, check the models you want, then **Add selected**. |
+| **Choose from the provider catalog** | Choose **Fetch provider models**, search by name or ID, check models or **Select filtered**, then **Add selected**. |
 
 **Running models locally?** Start your local server first, then choose **Discover local**. Discovery checks common ports only when requested.
 
@@ -182,11 +182,14 @@ This option requires port **50999** and participates in backup/rollback. It is s
 
 | Connection | Examples available in the preset catalog |
 | --- | --- |
-| Hosted APIs | OpenAI, Anthropic, Google Gemini, OpenRouter, DeepSeek, Groq, Mistral, Fireworks AI, NVIDIA NIM |
+| Multi-model services | OpenRouter, Together AI, Hugging Face Inference Providers, Fireworks AI, SiliconFlow, Novita AI |
+| Direct hosted APIs | OpenAI, Anthropic, Google Gemini, DeepSeek, Groq, Mistral, xAI, Cerebras, SambaNova, Alibaba Cloud Model Studio, NVIDIA NIM |
 | Local servers | Ollama, LM Studio, llama.cpp, vLLM, LocalAI, TabbyAPI, Text Generation WebUI |
 | Other endpoints | LiteLLM, compatible custom endpoints, or an authenticated model gateway |
 
 Presets fill in defaults; **API format** determines how requests are translated. Model IDs and access depend on the provider. The [provider catalog](src/providers.ts) is the full list.
+
+**Want hundreds of model choices?** OpenRouter and other multi-model services supply live catalogs through **Fetch provider models**. Search and select the models you need; the addon imports available context/output limits and image/reasoning metadata while preserving your explicit overrides. Catalogs change over time, and a listed model still needs account access and the capabilities your task requires. See [provider setup and model discovery](docs/providers.md).
 
 Open **Advanced settings** for request limits, reasoning, headers, fallback models, and other overrides. See the [configuration reference](docs/configuration.md) for field definitions and a sample import.
 
@@ -293,6 +296,7 @@ Use **Export** to share model settings. See [data handling](docs/configuration.m
 | Guide | What it covers |
 | --- | --- |
 | [Configuration reference](docs/configuration.md) | Model fields, import format, Google accounts, and credentials |
+| [Providers and model catalogs](docs/providers.md) | Popular services, API endpoints, large-catalog discovery, and account requirements |
 | [Gateway guide](gateway/README.md) | Setup, routing, dashboard, lifecycle, and remote access |
 | [Compatibility and recovery](docs/compatibility.md) | Supported layouts, updates, backups, and troubleshooting |
 | [Feature comparison](docs/feature-parity.md) | Reference repositories, implemented features, and remaining differences |
@@ -321,7 +325,7 @@ npm run test:integration
 
 CI runs on Windows, macOS, and Linux using local provider fixtures and isolated installation packages. It does not validate live provider credentials or every future Antigravity release.
 
-For a new provider, start with [the preset catalog](src/providers.ts) and [protocol registry](src/proxy/registry.ts). Changes should include relevant tests and rebuilt desktop output. Pull requests are welcome; [open an issue](https://github.com/vahapogut/antigravity-add-model/issues) for reproducible bugs, with your app type/version, OS, and diagnostics.
+For a new provider, start with [the desktop preset catalog](src/providers.ts), [protocol registry](src/proxy/registry.ts), and [gateway provider catalog](gateway/src/provider-catalog.ts). Changes should include relevant tests and rebuilt desktop output. Pull requests are welcome; [open an issue](https://github.com/vahapogut/antigravity-add-model/issues) for reproducible bugs, with your app type/version, OS, and diagnostics.
 
 ## License and credits
 

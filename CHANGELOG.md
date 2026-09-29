@@ -2,6 +2,14 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — More providers and searchable catalogs
+
+- Add desktop and gateway presets for Together AI, Hugging Face Inference Providers, SambaNova, SiliconFlow, Novita AI, and Alibaba Cloud Model Studio.
+- Add gateway routing for DeepSeek, Mistral, xAI, Cerebras, and Fireworks AI, with provider settings and selectors generated from one gateway catalog.
+- Add model-catalog search, filtered bulk selection, and import of available context/output limits and image/reasoning metadata without replacing explicit overrides.
+- Handle provider-specific model listing, including Together's array response and paginated DashScope and Fireworks catalogs; filter unsupported model types and preserve exact model IDs.
+- Document [provider endpoints and setup](docs/providers.md). Model availability, billing, and tool capabilities remain provider- and account-dependent.
+
 ### Unreleased — Model management and optional gateway
 
 - Add grouped model editing, duplication, enable/disable, provider/local discovery, JSON/base64 import, and credential-redacted export.

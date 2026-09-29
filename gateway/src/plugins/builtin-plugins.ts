@@ -21,108 +21,7 @@ import { ZenAdapter } from '../adapters/zen.js';
 import { OpencodeGoAdapter } from '../adapters/opencode-go.js';
 import { NvidiaAdapter } from '../adapters/nvidia.js';
 import { DEFAULT_CAPABILITIES } from '../provider-plugin.js';
-
-// ─── Provider definitions ──────────────────────────────────────────────
-
-interface ProviderDef {
-  id: string;
-  name: string;
-  envKey: string;
-  baseUrl: string;
-  adapterType: 'openai' | 'anthropic' | 'google';
-  capabilities?: Partial<ProviderCapabilities>;
-}
-
-const BUILTIN_PROVIDERS: ProviderDef[] = [
-  {
-    id: 'openai',
-    name: 'OpenAI',
-    envKey: 'OPENAI_API_KEY',
-    baseUrl: 'https://api.openai.com/v1',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: true, supportsImages: true, supportsSystemMessages: true },
-  },
-  {
-    id: 'anthropic',
-    name: 'Anthropic',
-    envKey: 'ANTHROPIC_API_KEY',
-    baseUrl: 'https://api.anthropic.com/v1',
-    adapterType: 'anthropic',
-    capabilities: { supportsReasoning: true, supportsImages: true, supportsSystemMessages: true },
-  },
-  {
-    id: 'google',
-    name: 'Google Gemini',
-    envKey: 'GOOGLE_API_KEY',
-    baseUrl: 'https://generativelanguage.googleapis.com',
-    adapterType: 'google',
-    capabilities: { supportsReasoning: false, supportsImages: true, supportsSystemMessages: true },
-  },
-  {
-    id: 'nvidia',
-    name: 'NVIDIA NIM',
-    envKey: 'NVIDIA_API_KEY',
-    baseUrl: 'https://integrate.api.nvidia.com/v1',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: true, supportsImages: true },
-  },
-  {
-    id: 'openrouter',
-    name: 'OpenRouter',
-    envKey: 'OPENROUTER_API_KEY',
-    baseUrl: 'https://openrouter.ai/api/v1',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: true, supportsImages: true },
-  },
-  {
-    id: 'groq',
-    name: 'Groq',
-    envKey: 'GROQ_API_KEY',
-    baseUrl: 'https://api.groq.com/openai/v1',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: false, supportsImages: false },
-  },
-  {
-    id: 'zen',
-    name: 'Zen (OpenCode)',
-    envKey: 'OPENCODE_API_KEY',
-    baseUrl: 'https://opencode.ai/zen/v1',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: true, supportsImages: false },
-  },
-  {
-    id: 'opencode-go',
-    name: 'OpenCode Go',
-    envKey: 'OPENCODE_GO_API_KEY',
-    baseUrl: 'https://opencode.ai/zen/go/v1',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: true, supportsImages: false },
-  },
-  {
-    id: 'ollama',
-    name: 'Ollama (Local)',
-    envKey: '',
-    baseUrl: 'http://localhost:11434',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: false, supportsImages: true },
-  },
-  {
-    id: 'vllm',
-    name: 'vLLM (Local)',
-    envKey: '',
-    baseUrl: 'http://localhost:8000',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: false, supportsImages: true },
-  },
-  {
-    id: 'lmstudio',
-    name: 'LM Studio (Local)',
-    envKey: '',
-    baseUrl: 'http://localhost:1234',
-    adapterType: 'openai',
-    capabilities: { supportsReasoning: false, supportsImages: true },
-  },
-];
+import { BUILTIN_PROVIDERS, getProviderApiKey, type ProviderDef } from '../provider-catalog.js';
 
 // ─── Plugin factory ────────────────────────────────────────────────────
 
@@ -167,7 +66,7 @@ function buildPlugin(def: ProviderDef): IProviderPlugin {
         ...config,
         id: def.id,
         baseUrl: config.baseUrl || def.baseUrl,
-        apiKey: config.apiKey || '',
+        apiKey: config.apiKey || getProviderApiKey(def),
       });
     },
 
@@ -178,7 +77,7 @@ function buildPlugin(def: ProviderDef): IProviderPlugin {
     validateConfig(config: Record<string, unknown>): string | null {
       // Local providers (ollama, vllm, lmstudio) don't need API keys
       if (!def.envKey) return null;
-      if (!config.apiKey && !process.env[def.envKey]) {
+      if (!config.apiKey && !getProviderApiKey(def)) {
         return `Missing API key — set ${def.envKey} in .env or provide it in config`;
       }
       return null;

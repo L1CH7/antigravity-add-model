@@ -538,6 +538,28 @@ tbody tr:hover { background: var(--surface); }
 .form-group { margin-bottom: 12px; }
 .form-group:last-child { margin-bottom: 0; }
 
+.provider-config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 12px;
+}
+.provider-config-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  margin: 0;
+}
+.provider-config-card h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  font-size: 13px;
+}
+.provider-config-card label { margin-top: 10px; }
+
 .form-group label {
   display: block;
   font-size: 11px;

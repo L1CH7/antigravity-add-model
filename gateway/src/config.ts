@@ -7,6 +7,7 @@ import { initializeConfig } from './settings.js';
 import { dataFile } from './data-paths.js';
 import type { ProviderConfig, ProviderId } from './adapter.js';
 import type { LocalProviderInfo } from './local-discovery.js';
+import { getProviderApiKey, getProviderDefinition } from './provider-catalog.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -51,22 +52,18 @@ function parsePriority(): ProviderId[] {
   return raw.length > 0 ? raw : ['openrouter', 'nvidia'];
 }
 
-const ENV_KEY_OVERRIDES: Partial<Record<ProviderId, { apiKey?: string; baseUrl?: string }>> = {
-  zen: { apiKey: 'OPENCODE_API_KEY', baseUrl: 'OPENCODE_BASE_URL' },
-};
-
-function buildProviders(priority: ProviderId[], localConfigs?: ProviderConfig[]): ProviderConfig[] {
+export function buildProviders(priority: ProviderId[], localConfigs?: ProviderConfig[]): ProviderConfig[] {
   const fromPriority: ProviderConfig[] = priority.map((id, idx) => {
-    const override = ENV_KEY_OVERRIDES[id];
+    const definition = getProviderDefinition(id);
     const envKey = id.toUpperCase().replace(/-/g, '_');
-    const apiKeyEnv = override?.apiKey || `${envKey}_API_KEY`;
-    const baseUrlEnv = override?.baseUrl || `${envKey}_BASE_URL`;
+    const apiKey = definition ? getProviderApiKey(definition) : process.env[`${envKey}_API_KEY`];
+    const baseUrlEnv = definition?.baseUrlEnv || `${envKey}_BASE_URL`;
     return {
       id,
       priority: idx,
-      apiKey: process.env[apiKeyEnv] || undefined,
+      apiKey: apiKey || undefined,
       baseUrl: process.env[baseUrlEnv] || undefined,
-      enabled: !!process.env[apiKeyEnv] || ['ollama', 'vllm', 'lmstudio'].includes(id) || !!process.env[baseUrlEnv],
+      enabled: !!apiKey || ['ollama', 'vllm', 'lmstudio'].includes(id) || !!process.env[baseUrlEnv],
     };
   });
   if (!localConfigs || localConfigs.length === 0) return fromPriority;
@@ -140,7 +137,7 @@ function createConfig() {
     },
     get baseUrl(): string {
       const current = this.providers.find(p => p.id === this.legacyProvider);
-      return current?.baseUrl || ({ nvidia: this.nvidiaBaseUrl, openrouter: this.openrouterBaseUrl, openai: 'https://api.openai.com/v1', anthropic: 'https://api.anthropic.com/v1', google: 'https://generativelanguage.googleapis.com', zen: 'https://opencode.ai/zen/v1', 'opencode-go': 'https://opencode.ai/zen/go/v1', groq: 'https://api.groq.com/openai/v1', ollama: 'http://localhost:11434', vllm: 'http://localhost:8000', lmstudio: 'http://localhost:1234' } as Record<string,string>)[this.legacyProvider] || '';
+      return current?.baseUrl || getProviderDefinition(this.legacyProvider)?.baseUrl || '';
     },
     get apiKey(): string {
       return this.providers.find(p => p.id === this.legacyProvider)?.apiKey || '';

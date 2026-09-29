@@ -25,6 +25,10 @@ interface ProviderPreset {
 interface ModelChoice {
   id: string;
   displayName?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsVision?: boolean;
+  supportsThinking?: boolean;
 }
 interface ActionResult {
   success: boolean;
@@ -985,6 +989,11 @@ window.addEventListener('DOMContentLoaded', () => {
       advanced.append(breakerGrid);
       body.append(advanced);
       const discovery = element('div', 'agy-discovery');
+      const discoveryFilter = element('div');
+      discoveryFilter.hidden = true;
+      const discoverySearch = field(discoveryFilter, 'Search provider models', 'agy-discovery-search', '', 'search');
+      discoverySearch.placeholder = 'Filter by model name or ID';
+      discoverySearch.addEventListener('input', () => showChoices());
       let choices: ModelChoice[] = [];
       const selected = new Set<string>();
       function connection(): Partial<CustomModelEntry> {
@@ -1075,14 +1084,24 @@ window.addEventListener('DOMContentLoaded', () => {
       }
       function showChoices(): void {
         discovery.replaceChildren();
+        discoveryFilter.hidden = !choices.length;
         if (!choices.length) return;
+        const query = discoverySearch.value.trim().toLowerCase();
+        const visible = choices.filter((model) =>
+          `${model.displayName || ''} ${model.id}`.toLowerCase().includes(query),
+        );
         const toolbar = element('div', 'agy-actions');
+        const count = element(
+          'span',
+          'agy-muted',
+          `${visible.length} of ${choices.length} models · ${selected.size} selected`,
+        );
         toolbar.append(
-          element('span', 'agy-muted', `${choices.length} models found`),
+          count,
           button(
-            'Select all',
+            query ? 'Select filtered' : 'Select all',
             () => {
-              for (const model of choices) selected.add(model.id);
+              for (const model of visible) selected.add(model.id);
               showChoices();
             },
             status,
@@ -1097,7 +1116,8 @@ window.addEventListener('DOMContentLoaded', () => {
           ),
         );
         discovery.append(toolbar);
-        for (const model of choices) {
+        if (!visible.length) discovery.append(element('p', 'agy-muted', 'No provider models match this search.'));
+        for (const model of visible) {
           const label = element('label', 'agy-choice');
           const checkbox = element('input');
           checkbox.type = 'checkbox';
@@ -1105,6 +1125,7 @@ window.addEventListener('DOMContentLoaded', () => {
           checkbox.addEventListener('change', () => {
             if (checkbox.checked) selected.add(model.id);
             else selected.delete(model.id);
+            count.textContent = `${visible.length} of ${choices.length} models · ${selected.size} selected`;
           });
           label.append(
             checkbox,
@@ -1135,6 +1156,7 @@ window.addEventListener('DOMContentLoaded', () => {
             const result = await storageAPI.discoverModels(connection());
             requireSuccess(result);
             choices = result.models || [];
+            discoverySearch.value = '';
             selected.clear();
             showChoices();
             setStatus(
@@ -1157,7 +1179,7 @@ window.addEventListener('DOMContentLoaded', () => {
           true,
         ),
       );
-      body.append(actions, discovery);
+      body.append(actions, discoveryFilter, discovery);
       body.append(
         button(
           'Add selected',
@@ -1176,6 +1198,18 @@ window.addEventListener('DOMContentLoaded', () => {
                 choice.displayName || choice.id,
                 prior?.name || uniqueName(`models/${provider.value}/${choice.id}`),
               );
+              // Prefer explicit form overrides; otherwise retain the catalog's advertised limits/capabilities.
+              for (const key of ['contextWindow', 'maxOutputTokens', 'supportsVision', 'supportsThinking'] as const) {
+                if (config[key] === undefined && choice[key] !== undefined) config[key] = choice[key];
+              }
+              if (
+                typeof config.contextWindow === 'number' &&
+                typeof config.maxOutputTokens === 'number' &&
+                config.maxOutputTokens >= config.contextWindow &&
+                !maxOutput.value.trim()
+              ) {
+                config.maxOutputTokens = config.contextWindow > 1 ? config.contextWindow - 1 : undefined;
+              }
               delete config.originalName;
               if (prior) config.originalName = prior.name;
               else if (existing?.name) config.copyFrom = existing.name;
@@ -1194,6 +1228,7 @@ window.addEventListener('DOMContentLoaded', () => {
         apiKey.value = '';
         choices = [];
         selected.clear();
+        discoverySearch.value = '';
         showChoices();
         updateGoogleVisibility();
       });

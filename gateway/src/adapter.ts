@@ -7,9 +7,12 @@ import { NvidiaAdapter } from './adapters/nvidia.js';
 import { AnthropicAdapter } from './adapters/anthropic.js';
 import { GoogleAdapter } from './adapters/google.js';
 import { providerRegistry } from './provider-registry.js';
+import { BUILTIN_PROVIDERS, getProviderApiKey, getProviderDefinition } from './provider-catalog.js';
 import type { OpenAIMessage } from './mapper.js';
 
-export type ProviderId = 'nvidia' | 'openrouter' | 'openai' | 'groq' | 'anthropic' | 'google' | 'zen' | 'opencode-go' | 'ollama' | 'vllm' | 'lmstudio' | (string & {});
+export type ProviderId = 'nvidia' | 'openrouter' | 'openai' | 'groq' | 'anthropic' | 'google' | 'zen' | 'opencode-go' |
+  'ollama' | 'vllm' | 'lmstudio' | 'together' | 'huggingface' | 'sambanova' | 'siliconflow' | 'novita' | 'dashscope' |
+  'deepseek' | 'mistral' | 'xai' | 'cerebras' | 'fireworks' | (string & {});
 
 export interface ProviderConfig {
   id: ProviderId;
@@ -24,19 +27,9 @@ export interface ProviderConfig {
  * Legacy default provider configs — kept for backward compatibility.
  * New code should use the plugin system (providerRegistry) instead.
  */
-export const DEFAULT_PROVIDER_CONFIGS: Record<string, { baseUrl: string; adapterType: 'openai' | 'anthropic' | 'google'; envKey: string }> = {
-  nvidia:    { baseUrl: 'https://integrate.api.nvidia.com/v1',         adapterType: 'openai',    envKey: 'NVIDIA_API_KEY' },
-  openrouter:{ baseUrl: 'https://openrouter.ai/api/v1',                adapterType: 'openai',    envKey: 'OPENROUTER_API_KEY' },
-  openai:    { baseUrl: 'https://api.openai.com/v1',                   adapterType: 'openai',    envKey: 'OPENAI_API_KEY' },
-  groq:      { baseUrl: 'https://api.groq.com/openai/v1',             adapterType: 'openai',    envKey: 'GROQ_API_KEY' },
-  anthropic: { baseUrl: 'https://api.anthropic.com/v1',                adapterType: 'anthropic', envKey: 'ANTHROPIC_API_KEY' },
-  google:    { baseUrl: 'https://generativelanguage.googleapis.com',    adapterType: 'google',    envKey: 'GOOGLE_API_KEY' },
-  zen:       { baseUrl: 'https://opencode.ai/zen/v1',                  adapterType: 'openai',    envKey: 'OPENCODE_API_KEY' },
-  'opencode-go': { baseUrl: 'https://opencode.ai/zen/go/v1',         adapterType: 'openai',    envKey: 'OPENCODE_GO_API_KEY' },
-  ollama:    { baseUrl: 'http://localhost:11434',                      adapterType: 'openai',    envKey: '' },
-  vllm:      { baseUrl: 'http://localhost:8000',                       adapterType: 'openai',    envKey: '' },
-  lmstudio:  { baseUrl: 'http://localhost:1234',                       adapterType: 'openai',    envKey: '' },
-};
+export const DEFAULT_PROVIDER_CONFIGS: Record<string, { baseUrl: string; adapterType: 'openai' | 'anthropic' | 'google'; envKey: string }> = Object.fromEntries(
+  BUILTIN_PROVIDERS.map(({ id, baseUrl, adapterType, envKey }) => [id, { baseUrl, adapterType, envKey }]),
+);
 
 /**
  * Legacy adapter factory — creates an adapter for a provider.
@@ -63,7 +56,8 @@ export function createAdapter(cfg: ProviderConfig): ModelAdapter {
     throw new Error(`Unknown provider: ${cfg.id}. Register a plugin first.`);
   }
   const baseUrl = cfg.baseUrl || defaults.baseUrl;
-  const apiKey = cfg.apiKey || '';
+  const definition = getProviderDefinition(cfg.id);
+  const apiKey = cfg.apiKey || (definition ? getProviderApiKey(definition) : '');
   // Use provider-specific adapters when available
   switch (cfg.id) {
     case 'groq':

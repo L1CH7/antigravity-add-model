@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { USER_DATA_DIR, USER_LOGS_DIR, USER_ENV_PATH } from './data-paths.js';
 import { readSettings, writeSettings } from './settings.js';
+import { BUILTIN_PROVIDERS, getProviderDefinition } from './provider-catalog.js';
 
 const args = process.argv.slice(2), command = args[0] || 'help';
 const settings = readSettings();
@@ -29,10 +30,11 @@ async function main(): Promise<void> {
     if (process.stdin.isTTY && !args.includes('--non-interactive')) {
       const rl = createInterface({ input: process.stdin, output: process.stdout });
       try {
-        const provider = (await rl.question('Provider (openai/openrouter/nvidia/anthropic/google/zen/opencode-go/groq/ollama): ')).trim() || settings.PROVIDER_PRIORITY;
+        const provider = (await rl.question(`Provider (${BUILTIN_PROVIDERS.map(item => item.id).join('/')}): `)).trim() || settings.PROVIDER_PRIORITY.split(',')[0];
         const key = await rl.question('Provider API key (empty keeps current; local services need none): ');
-        const prefix = provider === 'zen' ? 'OPENCODE' : provider.toUpperCase().replace(/-/g, '_');
-        writeSettings({ PROVIDER_PRIORITY: provider, ...(key ? { [`${prefix}_API_KEY`]: key } : {}) });
+        const definition = getProviderDefinition(provider);
+        if (!definition) throw new Error('Select a provider from the supported list');
+        writeSettings({ PROVIDER_PRIORITY: provider, ...(key && definition.envKey ? { [definition.envKey]: key } : {}) });
       } finally { rl.close(); }
     }
     const active = readSettings();
