@@ -59,7 +59,7 @@ See [customPreload.ts](../src/customPreload.ts),
 
 See [googleOAuth.ts](../src/googleOAuth.ts),
 [googleAccounts.ts](../src/googleAccounts.ts), and the
-[Google account workflow](../README.md#google-cloud-code-account-pools).
+[Google account workflow](configuration.md#google-cloud-code-account-pools).
 
 ## Optional gateway and web dashboard
 
