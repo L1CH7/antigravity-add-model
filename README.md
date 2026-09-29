@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="gateway/dashboard/gateway-mark.svg" width="72" height="72" alt="Antigravity Custom Model Enabler">
+  <img src="gateway/dashboard/antigravity-logo.png" width="96" height="96" alt="Google Antigravity logo">
 </p>
 
 <h1 align="center">Antigravity Custom Model Enabler</h1>
@@ -86,7 +86,7 @@ Save a gateway connection, import model aliases, and open its management dashboa
 Map model aliases to providers and configure fallback models and context limits in the optional web panel.
 
 <p align="center">
-  <a href="assets/model_gateway.png"><img src="assets/model_gateway.png" width="1000" alt="Gateway dashboard showing custom model aliases, provider selection, fallback settings, and context window controls"></a>
+  <a href="assets/model_gateway.jpg"><img src="assets/model_gateway.jpg" width="1000" alt="Gateway dashboard showing custom model aliases, provider selection, fallback settings, and context window controls"></a>
 </p>
 
 *Current gateway interface in a local test profile; the displayed model mapping is illustrative.*
@@ -326,6 +326,8 @@ For a new provider, start with [the preset catalog](src/providers.ts) and [proto
 ## License and credits
 
 [Apache License 2.0](LICENSE). Adapted gateway components retain their [MIT license](gateway/LICENSE.upstream) and [upstream attribution](gateway/UPSTREAM.md).
+
+Antigravity logo from [Google's official press assets](https://antigravity.google/press).
 
 Maintained by **[vahapogut](https://github.com/vahapogut)** · [LinkedIn](https://www.linkedin.com/in/abdulvahap-ogut-343992398/)
 

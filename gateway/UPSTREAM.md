@@ -14,3 +14,10 @@ the Antigravity application, or run the upstream desktop-launching scripts.
 The upstream provider/model tables and pricing are examples, not guarantees
 of current availability or billing rates. Users can edit routes and pricing
 in the dashboard. Token and cost totals are estimates.
+
+## Logo
+
+`dashboard/antigravity-logo.png` is the unmodified full-color icon downloaded
+from [Google Antigravity's official press assets](https://antigravity.google/press)
+([source PNG](https://antigravity.google/assets/image/brand/antigravity-icon__full-color.png)).
+It replaces the previous custom gateway mark in the README and dashboard.
