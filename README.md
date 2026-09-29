@@ -18,6 +18,7 @@
 <p align="center">
   <a href="#installation"><strong>Quick start</strong></a> ·
   <a href="#quick-links">Quick links</a> ·
+  <a href="#screenshots">Screenshots</a> ·
   <a href="#documentation">Documentation</a> ·
   <a href="https://github.com/vahapogut/antigravity-add-model/issues/new">Report an issue</a>
 </p>
@@ -52,8 +53,46 @@ Add external API providers and local models alongside Antigravity's built-in mod
 
 The installer preserves the installed application's runtime and adds validated hooks. It keeps version-specific backups and rolls back failed deployments. See the [feature comparison](docs/feature-parity.md) for implementation details and scope.
 
+## Screenshots
+
+### Model management
+
+Search your models, organize them by provider, and edit, duplicate, or enable connections from one place.
+
+<p align="center">
+  <a href="assets/model_manager.jpg"><img src="assets/model_manager.jpg" width="1000" alt="Current custom model manager showing provider groups, model search, discovery, import, export, and remote gateway controls"></a>
+</p>
+
+*Current addon controls rendered in an isolated browser demo with illustrative model settings. Click an image to view it at full size.*
+
+### Model editor
+
+Configure a provider and model, choose an API format, or discover available models.
+
+<p align="center">
+  <a href="assets/model_editor.jpg"><img src="assets/model_editor.jpg" width="1000" alt="Current model editor with provider, API format, model ID, discovery, and advanced settings"></a>
+</p>
+
+### Remote gateway
+
+Save a gateway connection, import model aliases, and open its management dashboard.
+
+<p align="center">
+  <a href="assets/remote_gateway.jpg"><img src="assets/remote_gateway.jpg" width="1000" alt="Remote gateway dialog with gateway URL, masked token, dashboard URL, connection testing, and model alias import"></a>
+</p>
+
+### Gateway dashboard
+
+Map model aliases to providers and configure fallback models and context limits in the optional web panel.
+
+<p align="center">
+  <a href="assets/model_gateway.png"><img src="assets/model_gateway.png" width="1000" alt="Gateway dashboard showing custom model aliases, provider selection, fallback settings, and context window controls"></a>
+</p>
+
+*Current gateway interface in a local test profile; the displayed model mapping is illustrative.*
+
 <details>
-<summary><strong>Preview: custom models in the chat picker</strong></summary>
+<summary><strong>Desktop chat picker — earlier build</strong></summary>
 
 <p align="center">
   <img src="assets/chat_model_dropdown.png" width="720" alt="Custom models listed alongside built-in models in Antigravity's chat picker">
@@ -175,17 +214,6 @@ In the desktop's **Remote gateway** dialog, enter:
 | Dashboard URL | `http://127.0.0.1:51001` |
 
 Choose **Test gateway**, then **Import model aliases**. The imported models appear in the desktop picker. **Open dashboard** opens the saved dashboard URL.
-
-<details>
-<summary><strong>Preview: gateway model routing</strong></summary>
-
-<p align="center">
-  <img src="assets/model_gateway.png" width="1000" alt="Gateway dashboard showing a saved custom model alias, provider selection, fallback settings, and context window controls">
-</p>
-
-*Current gateway interface in a local test profile; the displayed model mapping is illustrative.*
-
-</details>
 
 <details>
 <summary><strong>Gateway commands</strong></summary>
