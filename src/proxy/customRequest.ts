@@ -9,6 +9,7 @@ import * as registry from './registry';
 import { CircuitBreaker } from './circuitBreaker';
 import { applyRequestOptions, GeminiBody, parseRetryAfter, trimContext } from './requestOptions';
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
+import { collectToolSchemas } from './translators/utils';
 
 const circuits = new CircuitBreaker();
 const controllers = new Set<AbortController>();
@@ -120,6 +121,7 @@ export async function runCustomModelRequest(
   allModels: CustomModel[],
   cloudEnvelope = true,
 ): Promise<void> {
+  const toolSchemas = collectToolSchemas(originalBody);
   const controller = new AbortController();
   const { signal } = controller;
   const requestId = randomUUID();
@@ -335,7 +337,14 @@ export async function runCustomModelRequest(
                 for (const tool of Object.values(activeStreamContexts.get(stateKey)?.toolCalls || {}))
                   validateToolArguments(tool.arguments);
               }
-              const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey) as {
+              const mapped = registry.translateStreamChunk(
+                model.provider,
+                chunk,
+                stateKey,
+                format,
+                stateKey,
+                toolSchemas,
+              ) as {
                 content?: { parts?: unknown[] };
                 finishReason?: string;
               } | null;
@@ -396,7 +405,7 @@ export async function runCustomModelRequest(
               for (const tool of parsed.choices[0].message.tool_calls) validateToolArguments(tool.function?.arguments);
             }
             // Some compatible endpoints return a complete JSON response even when stream=true.
-            const mapped = registry.translateResponse(model.provider, parsed, stateKey, format) as {
+            const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas) as {
               candidates?: unknown[];
             };
             if (!mapped?.candidates?.length) throw new UpstreamError('Upstream returned no candidates.');

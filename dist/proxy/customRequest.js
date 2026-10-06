@@ -47,6 +47,7 @@ const registry = __importStar(require("./registry"));
 const circuitBreaker_1 = require("./circuitBreaker");
 const requestOptions_1 = require("./requestOptions");
 const shared_1 = require("./shared");
+const utils_1 = require("./translators/utils");
 const circuits = new circuitBreaker_1.CircuitBreaker();
 const controllers = new Set();
 const counts = {
@@ -151,6 +152,7 @@ function buildFallbackChain(primary, allModels) {
 }
 /** The sole retry/fallback owner; nothing is retried after any model output was received. */
 async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true) {
+    const toolSchemas = (0, utils_1.collectToolSchemas)(originalBody);
     const controller = new AbortController();
     const { signal } = controller;
     const requestId = (0, crypto_1.randomUUID)();
@@ -333,7 +335,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 for (const tool of Object.values(shared_1.activeStreamContexts.get(stateKey)?.toolCalls || {}))
                                     validateToolArguments(tool.arguments);
                             }
-                            const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey);
+                            const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas);
                             if (mapped) {
                                 if (mapped.content?.parts?.length)
                                     emitted = true;
@@ -405,7 +407,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 validateToolArguments(tool.function?.arguments);
                         }
                         // Some compatible endpoints return a complete JSON response even when stream=true.
-                        const mapped = registry.translateResponse(model.provider, parsed, stateKey, format);
+                        const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas);
                         if (!mapped?.candidates?.length)
                             throw new UpstreamError('Upstream returned no candidates.');
                         if (isStream) {

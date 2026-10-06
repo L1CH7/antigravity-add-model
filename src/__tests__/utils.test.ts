@@ -7,6 +7,7 @@ import {
   normalizeToolArgs,
   translateToolCallToNative,
   formatTranslatedResponse,
+  collectToolSchemas,
 } from '../proxy/translators/utils';
 
 // ─── fixParamTypes ─────────────────────────────────────────────────────────
@@ -126,9 +127,71 @@ describe('normalizeToolArgs', () => {
     expect(normalizeToolArgs('move_file', { src: '/b' })).toEqual({ SourcePath: '/b' });
   });
 
-  it('should use universal fallback for unknown tool names', () => {
+  it('preserves unknown tool parameters rather than guessing a path schema', () => {
     const result = normalizeToolArgs('unknown_tool', { file_path: '/test.txt' });
-    expect(result).toEqual({ AbsolutePath: '/test.txt' });
+    expect(result).toEqual({ file_path: '/test.txt' });
+  });
+
+  it.each(['constructor', 'toString', '__proto__'])(
+    'preserves custom tool %s without using inherited rules',
+    (name) => {
+      const args = { file_path: '/test.txt', content: 'hello' };
+      expect(normalizeToolArgs(name, args)).toEqual(args);
+    },
+  );
+
+  it('does not add AbsolutePath to a valid write_to_file call (issue #7)', () => {
+    const args = { TargetFile: '/workspace/app.ts', CodeContent: 'console.log("hello");', Overwrite: false };
+    expect(normalizeToolArgs('write_to_file', args)).toEqual(args);
+    expect(normalizeToolArgs('writefile', args)).toEqual(args);
+  });
+
+  it('does not mistake contents or descriptions for a missing file path', () => {
+    const args = { CodeContent: 'import fs from "node:fs";', Description: 'Save src/main.ts.' };
+    expect(normalizeToolArgs('write_to_file', args)).toEqual(args);
+    expect(normalizeToolArgs('write_file', args)).toEqual(args);
+  });
+
+  it('resolves an explicit write_to_file path alias without inventing other arguments', () => {
+    const schema = new Map([['write_to_file', { properties: { TargetFile: {}, CodeContent: {}, Overwrite: {} } }]]);
+    const args = { AbsolutePath: '/workspace/app.ts', CodeContent: 'hello', Overwrite: false };
+    expect(normalizeToolArgs('write_to_file', args, schema)).toEqual({
+      TargetFile: '/workspace/app.ts',
+      CodeContent: 'hello',
+      Overwrite: false,
+    });
+    expect(args).toHaveProperty('AbsolutePath');
+  });
+
+  it.each([true, false])('preserves canonical values regardless of alias order (%s)', (aliasFirst) => {
+    const canonical = { TargetFile: '/requested.ts' };
+    const alias = { AbsolutePath: '/other.ts' };
+    const args = aliasFirst ? { ...alias, ...canonical } : { ...canonical, ...alias };
+    expect(normalizeToolArgs('write_to_file', args)).toEqual(canonical);
+  });
+
+  it('retains both keys when the live schema declares them as independent parameters', () => {
+    const schema = new Map([['write_file', { properties: { path: {}, AbsolutePath: {} } }]]);
+    const args = { path: '/relative-context', AbsolutePath: '/explicit-target' };
+    expect(normalizeToolArgs('write_file', args, schema)).toEqual(args);
+  });
+
+  it('does not rename a legacy alias unless its canonical target is declared', () => {
+    const schema = new Map([['write_file', { properties: { destination: {}, content: {} } }]]);
+    const args = { destination: '/target.txt', content: 'Text with a period.' };
+    expect(normalizeToolArgs('write_file', args, schema)).toEqual(args);
+  });
+
+  it('preserves extra properties and nested values for the caller to validate', () => {
+    const schema = new Map([['write_to_file', { properties: { TargetFile: {} }, additionalProperties: true }]]);
+    const args = { TargetFile: '/file.txt', metadata: { path: '/nested', value: false }, custom: 'docs/file.md' };
+    expect(normalizeToolArgs('write_to_file', args, schema)).toEqual(args);
+  });
+
+  it('does not apply legacy normalization to undeclared tools or opaque schemas', () => {
+    const args = { path: '/file.txt' };
+    expect(normalizeToolArgs('write_file', args, new Map())).toEqual(args);
+    expect(normalizeToolArgs('write_file', args, new Map([['write_file', { $ref: '#/$defs/write' }]]))).toEqual(args);
   });
 
   it('should return original args for unknown tool without path-like keys', () => {
@@ -142,9 +205,50 @@ describe('normalizeToolArgs', () => {
   });
 });
 
+describe('collectToolSchemas', () => {
+  it('reads both declaration formats and prefers the full JSON schema', () => {
+    const legacy = { type: 'OBJECT', properties: { AbsolutePath: { type: 'STRING' } } };
+    const current = { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false };
+    const body = {
+      tools: [
+        {
+          functionDeclarations: [
+            { name: 'legacy', parameters: legacy },
+            { name: 'write_file', parameters: legacy, parametersJsonSchema: current },
+          ],
+        },
+      ],
+    };
+    const collected = collectToolSchemas(body);
+    expect(collected.get('legacy')).toEqual(legacy);
+    expect(collected.get('write_file')).toEqual(current);
+    expect(collectToolSchemas({ tools: [] }).size).toBe(0);
+    expect(collected.size).toBe(2);
+  });
+
+  it('avoids guessing between conflicting duplicate declarations', () => {
+    const tools = [
+      {
+        functionDeclarations: [
+          { name: 'write_file', parameters: { properties: { path: {} } } },
+          { name: 'write_file', parameters: { properties: { AbsolutePath: {} } } },
+        ],
+      },
+    ];
+    expect(normalizeToolArgs('write_file', { path: '/file.txt' }, collectToolSchemas({ tools }))).toEqual({
+      path: '/file.txt',
+    });
+  });
+});
+
 // ─── translateToolCallToNative ──────────────────────────────────────────────
 
 describe('translateToolCallToNative', () => {
+  it('preserves declared shell calls instead of substituting an undeclared file tool', () => {
+    const args = { CommandLine: 'echo hello > /tmp/out.txt', Cwd: '/tmp' };
+    const schema = new Map([['run_command', { properties: { CommandLine: {}, Cwd: {} } }]]);
+    expect(translateToolCallToNative('run_command', args, schema)).toEqual({ name: 'run_command', args });
+  });
   it('should pass through non-run_command calls', () => {
     const result = translateToolCallToNative('view_file', { AbsolutePath: '/x.ts' });
     expect(result).toEqual({ name: 'view_file', args: { AbsolutePath: '/x.ts' } });

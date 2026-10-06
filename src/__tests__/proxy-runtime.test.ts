@@ -72,7 +72,192 @@ async function body(req: http.IncomingMessage) {
 const sse = (res: http.ServerResponse, value: unknown) =>
   res.write(`data: ${typeof value === 'string' ? value : JSON.stringify(value)}\n\n`);
 
+function toolReply(
+  res: http.ServerResponse,
+  provider: 'openai' | 'anthropic',
+  stream: boolean,
+  name: string,
+  args: Record<string, unknown>,
+) {
+  if (!stream) {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(
+      JSON.stringify(
+        provider === 'openai'
+          ? {
+              choices: [
+                {
+                  message: {
+                    tool_calls: [
+                      { id: 'shared-call', type: 'function', function: { name, arguments: JSON.stringify(args) } },
+                    ],
+                  },
+                  finish_reason: 'tool_calls',
+                },
+              ],
+            }
+          : {
+              id: 'shared-message',
+              type: 'message',
+              content: [{ type: 'tool_use', id: 'shared-call', name, input: args }],
+              stop_reason: 'tool_use',
+            },
+      ),
+    );
+    return;
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  if (provider === 'openai') {
+    sse(res, {
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              { index: 0, id: 'shared-call', type: 'function', function: { name, arguments: JSON.stringify(args) } },
+            ],
+          },
+        },
+      ],
+    });
+    sse(res, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+    sse(res, '[DONE]');
+  } else {
+    sse(res, { type: 'message_start', message: { id: 'shared-message' } });
+    sse(res, {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'shared-call', name, input: {} },
+    });
+    sse(res, {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: JSON.stringify(args) },
+    });
+    sse(res, { type: 'content_block_stop', index: 0 });
+    sse(res, { type: 'message_delta', delta: { stop_reason: 'tool_use' } });
+    sse(res, { type: 'message_stop' });
+  }
+  res.end();
+}
+
+async function readToolCalls(response: Response, stream: boolean) {
+  type ToolCall = { name: string; args: Record<string, unknown> };
+  type Payload = { candidates?: { content?: { parts?: { functionCall?: ToolCall }[] } }[] };
+  const payloads: Payload[] = stream
+    ? (await response.text())
+        .split('\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice(6)))
+    : [await response.json()];
+  return payloads
+    .flatMap((payload) => payload.candidates || [])
+    .flatMap((candidate) => candidate.content?.parts || [])
+    .flatMap((part) => (part.functionCall ? [part.functionCall] : []));
+}
+
 describe('real upstream HTTP routing', () => {
+  describe.each(['openai', 'anthropic'] as const)('%s tool arguments', (provider) => {
+    it.each([
+      {
+        stream: false,
+        name: 'write_to_file',
+        args: { TargetFile: '/tmp/output.txt', CodeContent: 'hello', Overwrite: false },
+      },
+      {
+        stream: true,
+        name: 'write_to_file',
+        args: { TargetFile: '/tmp/output.txt', CodeContent: 'hello', Overwrite: false },
+      },
+      { stream: false, name: 'write_file', args: { path: '/tmp/output.txt', content: 'hello' } },
+      { stream: true, name: 'write_file', args: { path: '/tmp/output.txt', content: 'hello' } },
+    ])('preserves declared $name arguments with stream=$stream', async ({ stream, name, args }) => {
+      const upstream = await serve((_req, res) => toolReply(res, provider, stream, name, args));
+      const configured = model(upstream, { provider });
+      const request = {
+        contents: [{ role: 'user', parts: [{ text: 'write a file' }] }],
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name,
+                parametersJsonSchema: {
+                  type: 'object',
+                  properties: Object.fromEntries(
+                    Object.entries(args).map(([key, value]) => [key, { type: typeof value }]),
+                  ),
+                  required: Object.keys(args),
+                  additionalProperties: false,
+                },
+              },
+            ],
+          },
+        ],
+      };
+      const url = await serve(
+        (_req, res) => void runCustomModelRequest(res, configured, request, stream, [configured], false),
+      );
+      const response = await fetch(url);
+      expect(response.status).toBe(200);
+      expect(await readToolCalls(response, stream)).toEqual([expect.objectContaining({ name, args })]);
+    });
+
+    it('isolates live schemas for simultaneous streams on the same model', async () => {
+      const pending: { res: http.ServerResponse; token: string }[] = [];
+      const upstream = await serve(async (req, res) => {
+        const token = JSON.stringify(await body(req)).includes('first-request') ? 'first' : 'second';
+        pending.push({ res, token });
+        if (pending.length === 2) {
+          for (const request of pending.reverse()) {
+            toolReply(request.res, provider, true, 'write_file', {
+              path: `/tmp/${request.token}.txt`,
+              content: request.token,
+            });
+          }
+        }
+      });
+      const configured = model(upstream, { provider });
+      const url = await serve(async (req, res) => {
+        const request = await body(req);
+        void runCustomModelRequest(res, configured, request, true, [configured], false);
+      });
+      const results = await Promise.all(
+        ['first', 'second'].map(async (token) => {
+          const pathKey = token === 'first' ? 'path' : 'AbsolutePath';
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: `${token}-request` }] }],
+              tools: [
+                {
+                  functionDeclarations: [
+                    {
+                      name: 'write_file',
+                      parameters: {
+                        type: 'OBJECT',
+                        properties: { [pathKey]: { type: 'STRING' }, content: { type: 'STRING' } },
+                        required: [pathKey, 'content'],
+                        additionalProperties: false,
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
+          });
+          expect(response.status).toBe(200);
+          return readToolCalls(response, true);
+        }),
+      );
+      expect(results[0]).toEqual([
+        expect.objectContaining({ name: 'write_file', args: { path: '/tmp/first.txt', content: 'first' } }),
+      ]);
+      expect(results[1]).toEqual([
+        expect.objectContaining({ name: 'write_file', args: { AbsolutePath: '/tmp/second.txt', content: 'second' } }),
+      ]);
+    });
+  });
+
   it('retries a transient failure once, without forwarding credentials or upstream error text to clients', async () => {
     let attempts = 0;
     const upstream = await serve((req, res) => {

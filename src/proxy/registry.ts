@@ -3,6 +3,7 @@ import * as openai from './translators/openai';
 import * as anthropic from './translators/anthropic';
 import * as google from './translators/google';
 import { ApiFormat, resolveApiFormat } from '../providers';
+import type { ToolSchemas } from './translators/utils';
 
 export interface TranslatorModule {
   [key: string]: unknown;
@@ -35,11 +36,12 @@ export function translateResponse(
   response: unknown,
   stateKey: string,
   apiFormat?: ApiFormat,
+  toolSchemas?: ToolSchemas,
 ): unknown {
   const format = resolveApiFormat(provider, apiFormat);
   if (format === 'google') return google.mapGoogleToGemini(response, stateKey);
-  if (format === 'anthropic') return anthropic.mapAnthropicToGemini(response as never, stateKey);
-  return openai.mapOpenAIToGemini(response as never, stateKey);
+  if (format === 'anthropic') return anthropic.mapAnthropicToGemini(response as never, stateKey, toolSchemas);
+  return openai.mapOpenAIToGemini(response as never, stateKey, toolSchemas);
 }
 
 export function translateStreamChunk(
@@ -48,11 +50,13 @@ export function translateStreamChunk(
   stateKey: string,
   apiFormat?: ApiFormat,
   streamKey?: string,
+  toolSchemas?: ToolSchemas,
 ): unknown {
   const format = resolveApiFormat(provider, apiFormat);
   if (format === 'google') return google.mapGoogleChunkToGemini(chunk, stateKey);
-  if (format === 'anthropic') return anthropic.mapAnthropicChunkToGemini(chunk as never, stateKey, streamKey);
-  return openai.mapOpenAIChunkToGemini(chunk as never, stateKey, streamKey);
+  if (format === 'anthropic')
+    return anthropic.mapAnthropicChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas);
+  return openai.mapOpenAIChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas);
 }
 
 export function getProviderHeaders(provider: string, apiKey = '', apiFormat?: ApiFormat): ProviderHeaders {

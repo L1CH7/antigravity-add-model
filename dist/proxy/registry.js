@@ -57,21 +57,21 @@ function translateRequest(provider, body, modelName, apiFormat, stateKey) {
         return anthropic.mapGeminiToAnthropic(body, modelName, stateKey);
     return openai.mapGeminiToOpenAI(body, modelName, stateKey);
 }
-function translateResponse(provider, response, stateKey, apiFormat) {
+function translateResponse(provider, response, stateKey, apiFormat, toolSchemas) {
     const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
     if (format === 'google')
         return google.mapGoogleToGemini(response, stateKey);
     if (format === 'anthropic')
-        return anthropic.mapAnthropicToGemini(response, stateKey);
-    return openai.mapOpenAIToGemini(response, stateKey);
+        return anthropic.mapAnthropicToGemini(response, stateKey, toolSchemas);
+    return openai.mapOpenAIToGemini(response, stateKey, toolSchemas);
 }
-function translateStreamChunk(provider, chunk, stateKey, apiFormat, streamKey) {
+function translateStreamChunk(provider, chunk, stateKey, apiFormat, streamKey, toolSchemas) {
     const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
     if (format === 'google')
         return google.mapGoogleChunkToGemini(chunk, stateKey);
     if (format === 'anthropic')
-        return anthropic.mapAnthropicChunkToGemini(chunk, stateKey, streamKey);
-    return openai.mapOpenAIChunkToGemini(chunk, stateKey, streamKey);
+        return anthropic.mapAnthropicChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
+    return openai.mapOpenAIChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
 }
 function getProviderHeaders(provider, apiKey = '', apiFormat) {
     const headers = { 'Content-Type': 'application/json' };

@@ -40,10 +40,14 @@ export interface FileListResponse {
     CodeContent?: string;
 }
 export type ToolResponse = string | DirectoryItem[] | MatchResult[] | FileListResponse;
+/** Tool declarations belong to one request, never to a shared model/session cache. */
+export type ToolSchemas = ReadonlyMap<string, unknown>;
+export declare function collectToolSchemas(body: unknown): ToolSchemas;
 /**
- * Normalizes parameter names from external models to match Antigravity's expected PascalCase format.
+ * Resolve explicit legacy aliases only. Live declarations take precedence over
+ * historical tool signatures; arbitrary values must never become file paths.
  */
-export declare function normalizeToolArgs(name: string, args: Record<string, unknown> | null | undefined): Record<string, unknown>;
+export declare function normalizeToolArgs(name: string, args: Record<string, unknown> | null | undefined, schemas?: ToolSchemas): Record<string, unknown>;
 /**
  * Recursively converts Gemini parameter types (UPPERCASE) to lowercase format.
  * Gemini uses uppercase (STRING, NUMBER); OpenAI/Anthropic need lowercase.
@@ -52,7 +56,7 @@ export declare function fixParamTypes(properties: Record<string, unknown> | unde
 /**
  * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
  */
-export declare function translateToolCallToNative(name: string, args: ToolCallArgs): TranslatedToolCall;
+export declare function translateToolCallToNative(name: string, args: ToolCallArgs, schemas?: ToolSchemas): TranslatedToolCall;
 /**
  * Formats native file tool outputs (JSON/Array) back into standard textual command-line outputs.
  */

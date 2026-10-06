@@ -40,12 +40,31 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.collectToolSchemas = collectToolSchemas;
 exports.normalizeToolArgs = normalizeToolArgs;
 exports.fixParamTypes = fixParamTypes;
 exports.translateToolCallToNative = translateToolCallToNative;
 exports.formatTranslatedResponse = formatTranslatedResponse;
 const path = __importStar(require("path"));
 const electron_log_1 = __importDefault(require("electron-log"));
+function collectToolSchemas(body) {
+    const schemas = new Map();
+    if (!body || typeof body !== 'object')
+        return schemas;
+    const tools = body.tools;
+    if (!Array.isArray(tools))
+        return schemas;
+    for (const group of tools) {
+        if (!group || !Array.isArray(group.functionDeclarations))
+            continue;
+        for (const declaration of group.functionDeclarations) {
+            if (!declaration || typeof declaration.name !== 'string')
+                continue;
+            schemas.set(declaration.name, schemas.has(declaration.name) ? undefined : (declaration.parametersJsonSchema ?? declaration.parameters));
+        }
+    }
+    return schemas;
+}
 // ─── Tool Parameter Normalization ──────────────────────────────────────────
 const TOOL_PARAM_NORMALIZATION = {
     view_file: {
@@ -132,6 +151,21 @@ const TOOL_PARAM_NORMALIZATION = {
             'target',
             'filename',
             'source',
+        ],
+    },
+    write_to_file: {
+        primaryKey: 'TargetFile',
+        aliases: [
+            'AbsolutePath',
+            'absolute_path',
+            'absolutePath',
+            'target_file',
+            'targetFile',
+            'path',
+            'file_path',
+            'filePath',
+            'file',
+            'FilePath',
         ],
     },
     write_file: {
@@ -243,113 +277,55 @@ const TOOL_PARAM_NORMALIZATION = {
         aliases: ['destination_path', 'destinationPath', 'dest', 'destination', 'to', 'dst', 'target'],
     },
 };
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 /**
- * Normalizes parameter names from external models to match Antigravity's expected PascalCase format.
+ * Resolve explicit legacy aliases only. Live declarations take precedence over
+ * historical tool signatures; arbitrary values must never become file paths.
  */
-function normalizeToolArgs(name, args) {
+function normalizeToolArgs(name, args, schemas) {
     if (!args || typeof args !== 'object')
         return args || {};
     // Handle array args
     if (Array.isArray(args)) {
-        const config = TOOL_PARAM_NORMALIZATION[name];
-        if (config && args.length > 0 && typeof args[0] === 'string') {
+        const config = hasOwn(TOOL_PARAM_NORMALIZATION, name) ? TOOL_PARAM_NORMALIZATION[name] : undefined;
+        if (!schemas && config && args.length > 0 && typeof args[0] === 'string') {
             return { [config.primaryKey]: args[0] };
         }
         return {};
     }
-    const config = TOOL_PARAM_NORMALIZATION[name];
-    if (!config) {
-        return applyUniversalPathFallback(args);
+    const config = hasOwn(TOOL_PARAM_NORMALIZATION, name) ? TOOL_PARAM_NORMALIZATION[name] : undefined;
+    const normalized = { ...args };
+    if (!config)
+        return normalized;
+    let properties;
+    if (schemas) {
+        const schema = schemas.get(name);
+        if (!schema || typeof schema !== 'object' || Array.isArray(schema))
+            return normalized;
+        const declared = schema.properties;
+        if (!declared || typeof declared !== 'object' || Array.isArray(declared))
+            return normalized;
+        properties = declared;
     }
-    const normalized = {};
-    const usedKeys = new Set();
+    const rules = [
+        config,
+        ...Object.entries(TOOL_PARAM_NORMALIZATION)
+            .filter(([key]) => key.startsWith(name + '.'))
+            .map(([, value]) => value),
+    ];
     for (const [key, value] of Object.entries(args)) {
-        let matched = false;
-        if (key === config.primaryKey || (config.aliases && config.aliases.includes(key))) {
-            normalized[config.primaryKey] = value;
-            usedKeys.add(key);
-            matched = true;
-        }
-        if (!matched) {
-            const subConfigKey = name + '.' + key;
-            const subConfig = TOOL_PARAM_NORMALIZATION[subConfigKey];
-            if (subConfig) {
-                normalized[subConfig.primaryKey] = value;
-                usedKeys.add(key);
-                matched = true;
-            }
-        }
-        if (!matched) {
-            for (const [ck, cv] of Object.entries(TOOL_PARAM_NORMALIZATION)) {
-                if (ck.startsWith(name + '.') && cv.aliases && cv.aliases.includes(key)) {
-                    normalized[cv.primaryKey] = value;
-                    usedKeys.add(key);
-                    matched = true;
-                    break;
-                }
-            }
-        }
-        if (!matched) {
-            normalized[key] = value;
-        }
-    }
-    if (!normalized[config.primaryKey]) {
-        const unassigned = Object.entries(args).filter(([k]) => !usedKeys.has(k));
-        let found = unassigned.find(([, v]) => typeof v === 'string' && (v.includes('/') || v.includes('\\') || v.includes('.')));
-        if (!found)
-            found = unassigned.find(([, v]) => typeof v === 'string' && v.length > 0);
-        if (!found) {
-            found = Object.entries(args).find(([, v]) => typeof v === 'string' && (v.includes('/') || v.includes('\\') || v.includes('.')));
-            if (!found)
-                found = Object.entries(args).find(([, v]) => typeof v === 'string' && v.length > 0);
-        }
-        if (found) {
-            normalized[config.primaryKey] = found[1];
-            electron_log_1.default.info(`[Utils] normalizeToolArgs fallback: "${name}" extracted ${config.primaryKey}=${found[1]} from key "${found[0]}"`);
-        }
-        else {
-            electron_log_1.default.warn(`[Utils] normalizeToolArgs: "${name}" could not find value for "${config.primaryKey}". args=${JSON.stringify(args)}`);
-        }
+        // A valid caller-defined property is never renamed to a historical alias.
+        if (properties && hasOwn(properties, key))
+            continue;
+        const rule = rules.find((candidate) => candidate.aliases.includes(key));
+        if (!rule || (properties && !hasOwn(properties, rule.primaryKey)))
+            continue;
+        // Keep an explicit canonical argument even if a conflicting alias follows it.
+        if (!hasOwn(normalized, rule.primaryKey))
+            normalized[rule.primaryKey] = value;
+        delete normalized[key];
     }
     return normalized;
-}
-function applyUniversalPathFallback(args) {
-    const result = { ...args };
-    const aliasMap = {
-        path: 'AbsolutePath',
-        file_path: 'AbsolutePath',
-        filePath: 'AbsolutePath',
-        file: 'AbsolutePath',
-        filename: 'AbsolutePath',
-        target: 'AbsolutePath',
-        directory_path: 'DirectoryPath',
-        directoryPath: 'DirectoryPath',
-        dir: 'DirectoryPath',
-        directory: 'DirectoryPath',
-        folder: 'DirectoryPath',
-        target_file: 'TargetFile',
-        targetFile: 'TargetFile',
-        source: 'SourcePath',
-        sourcePath: 'SourcePath',
-        source_path: 'SourcePath',
-        dest: 'DestinationPath',
-        destination: 'DestinationPath',
-    };
-    for (const [key, value] of Object.entries(args)) {
-        const mappedKey = aliasMap[key];
-        if (mappedKey) {
-            result[mappedKey] = value;
-            delete result[key];
-            return result;
-        }
-    }
-    for (const [, value] of Object.entries(args)) {
-        if (typeof value === 'string' && (value.includes('/') || value.includes('\\') || value.includes('.'))) {
-            result['AbsolutePath'] = value;
-            return result;
-        }
-    }
-    return result;
 }
 // ─── Utility Functions ────────────────────────────────────────────────────
 /**
@@ -384,7 +360,11 @@ function fixParamTypes(properties) {
 /**
  * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
  */
-function translateToolCallToNative(name, args) {
+function translateToolCallToNative(name, args, schemas) {
+    // With live declarations, preserve the requested tool and its semantics.
+    // Guessing an equivalent file tool can introduce undeclared names/arguments.
+    if (schemas)
+        return { name, args: args };
     if (name !== 'run_command' || !args || !args.CommandLine) {
         return { name, args: args };
     }

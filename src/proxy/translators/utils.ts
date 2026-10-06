@@ -54,6 +54,27 @@ export interface FileListResponse {
 
 export type ToolResponse = string | DirectoryItem[] | MatchResult[] | FileListResponse;
 
+/** Tool declarations belong to one request, never to a shared model/session cache. */
+export type ToolSchemas = ReadonlyMap<string, unknown>;
+
+export function collectToolSchemas(body: unknown): ToolSchemas {
+  const schemas = new Map<string, unknown>();
+  if (!body || typeof body !== 'object') return schemas;
+  const tools = (body as { tools?: unknown }).tools;
+  if (!Array.isArray(tools)) return schemas;
+  for (const group of tools) {
+    if (!group || !Array.isArray(group.functionDeclarations)) continue;
+    for (const declaration of group.functionDeclarations) {
+      if (!declaration || typeof declaration.name !== 'string') continue;
+      schemas.set(
+        declaration.name,
+        schemas.has(declaration.name) ? undefined : (declaration.parametersJsonSchema ?? declaration.parameters),
+      );
+    }
+  }
+  return schemas;
+}
+
 // ─── Tool Parameter Normalization ──────────────────────────────────────────
 
 const TOOL_PARAM_NORMALIZATION: Record<string, { primaryKey: string; aliases: string[] }> = {
@@ -141,6 +162,21 @@ const TOOL_PARAM_NORMALIZATION: Record<string, { primaryKey: string; aliases: st
       'target',
       'filename',
       'source',
+    ],
+  },
+  write_to_file: {
+    primaryKey: 'TargetFile',
+    aliases: [
+      'AbsolutePath',
+      'absolute_path',
+      'absolutePath',
+      'target_file',
+      'targetFile',
+      'path',
+      'file_path',
+      'filePath',
+      'file',
+      'FilePath',
     ],
   },
   write_file: {
@@ -253,134 +289,55 @@ const TOOL_PARAM_NORMALIZATION: Record<string, { primaryKey: string; aliases: st
   },
 };
 
+const hasOwn = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
+
 /**
- * Normalizes parameter names from external models to match Antigravity's expected PascalCase format.
+ * Resolve explicit legacy aliases only. Live declarations take precedence over
+ * historical tool signatures; arbitrary values must never become file paths.
  */
 export function normalizeToolArgs(
   name: string,
   args: Record<string, unknown> | null | undefined,
+  schemas?: ToolSchemas,
 ): Record<string, unknown> {
   if (!args || typeof args !== 'object') return args || {};
 
   // Handle array args
   if (Array.isArray(args)) {
-    const config = TOOL_PARAM_NORMALIZATION[name];
-    if (config && args.length > 0 && typeof args[0] === 'string') {
+    const config = hasOwn(TOOL_PARAM_NORMALIZATION, name) ? TOOL_PARAM_NORMALIZATION[name] : undefined;
+    if (!schemas && config && args.length > 0 && typeof args[0] === 'string') {
       return { [config.primaryKey]: args[0] };
     }
     return {};
   }
 
-  const config = TOOL_PARAM_NORMALIZATION[name];
-  if (!config) {
-    return applyUniversalPathFallback(args);
+  const config = hasOwn(TOOL_PARAM_NORMALIZATION, name) ? TOOL_PARAM_NORMALIZATION[name] : undefined;
+  const normalized = { ...args };
+  if (!config) return normalized;
+  let properties: Record<string, unknown> | undefined;
+  if (schemas) {
+    const schema = schemas.get(name);
+    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return normalized;
+    const declared = (schema as { properties?: unknown }).properties;
+    if (!declared || typeof declared !== 'object' || Array.isArray(declared)) return normalized;
+    properties = declared as Record<string, unknown>;
   }
-
-  const normalized: Record<string, unknown> = {};
-  const usedKeys = new Set<string>();
-
+  const rules = [
+    config,
+    ...Object.entries(TOOL_PARAM_NORMALIZATION)
+      .filter(([key]) => key.startsWith(name + '.'))
+      .map(([, value]) => value),
+  ];
   for (const [key, value] of Object.entries(args)) {
-    let matched = false;
-
-    if (key === config.primaryKey || (config.aliases && config.aliases.includes(key))) {
-      normalized[config.primaryKey] = value;
-      usedKeys.add(key);
-      matched = true;
-    }
-
-    if (!matched) {
-      const subConfigKey = name + '.' + key;
-      const subConfig = TOOL_PARAM_NORMALIZATION[subConfigKey];
-      if (subConfig) {
-        normalized[subConfig.primaryKey] = value;
-        usedKeys.add(key);
-        matched = true;
-      }
-    }
-
-    if (!matched) {
-      for (const [ck, cv] of Object.entries(TOOL_PARAM_NORMALIZATION)) {
-        if (ck.startsWith(name + '.') && cv.aliases && cv.aliases.includes(key)) {
-          normalized[cv.primaryKey] = value;
-          usedKeys.add(key);
-          matched = true;
-          break;
-        }
-      }
-    }
-
-    if (!matched) {
-      normalized[key] = value;
-    }
+    // A valid caller-defined property is never renamed to a historical alias.
+    if (properties && hasOwn(properties, key)) continue;
+    const rule = rules.find((candidate) => candidate.aliases.includes(key));
+    if (!rule || (properties && !hasOwn(properties, rule.primaryKey))) continue;
+    // Keep an explicit canonical argument even if a conflicting alias follows it.
+    if (!hasOwn(normalized, rule.primaryKey)) normalized[rule.primaryKey] = value;
+    delete normalized[key];
   }
-
-  if (!normalized[config.primaryKey]) {
-    const unassigned = Object.entries(args).filter(([k]) => !usedKeys.has(k));
-    let found = unassigned.find(
-      ([, v]) => typeof v === 'string' && (v.includes('/') || v.includes('\\') || v.includes('.')),
-    );
-    if (!found) found = unassigned.find(([, v]) => typeof v === 'string' && v.length > 0);
-    if (!found) {
-      found = Object.entries(args).find(
-        ([, v]) => typeof v === 'string' && (v.includes('/') || v.includes('\\') || v.includes('.')),
-      );
-      if (!found) found = Object.entries(args).find(([, v]) => typeof v === 'string' && v.length > 0);
-    }
-    if (found) {
-      normalized[config.primaryKey] = found[1];
-      log.info(
-        `[Utils] normalizeToolArgs fallback: "${name}" extracted ${config.primaryKey}=${found[1]} from key "${found[0]}"`,
-      );
-    } else {
-      log.warn(
-        `[Utils] normalizeToolArgs: "${name}" could not find value for "${config.primaryKey}". args=${JSON.stringify(args)}`,
-      );
-    }
-  }
-
   return normalized;
-}
-
-function applyUniversalPathFallback(args: Record<string, unknown>): Record<string, unknown> {
-  const result = { ...args };
-  const aliasMap: Record<string, string> = {
-    path: 'AbsolutePath',
-    file_path: 'AbsolutePath',
-    filePath: 'AbsolutePath',
-    file: 'AbsolutePath',
-    filename: 'AbsolutePath',
-    target: 'AbsolutePath',
-    directory_path: 'DirectoryPath',
-    directoryPath: 'DirectoryPath',
-    dir: 'DirectoryPath',
-    directory: 'DirectoryPath',
-    folder: 'DirectoryPath',
-    target_file: 'TargetFile',
-    targetFile: 'TargetFile',
-    source: 'SourcePath',
-    sourcePath: 'SourcePath',
-    source_path: 'SourcePath',
-    dest: 'DestinationPath',
-    destination: 'DestinationPath',
-  };
-
-  for (const [key, value] of Object.entries(args)) {
-    const mappedKey = aliasMap[key];
-    if (mappedKey) {
-      result[mappedKey] = value;
-      delete result[key];
-      return result;
-    }
-  }
-
-  for (const [, value] of Object.entries(args)) {
-    if (typeof value === 'string' && (value.includes('/') || value.includes('\\') || value.includes('.'))) {
-      result['AbsolutePath'] = value;
-      return result;
-    }
-  }
-
-  return result;
 }
 
 // ─── Utility Functions ────────────────────────────────────────────────────
@@ -417,7 +374,10 @@ export function fixParamTypes(properties: Record<string, unknown> | undefined): 
 /**
  * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
  */
-export function translateToolCallToNative(name: string, args: ToolCallArgs): TranslatedToolCall {
+export function translateToolCallToNative(name: string, args: ToolCallArgs, schemas?: ToolSchemas): TranslatedToolCall {
+  // With live declarations, preserve the requested tool and its semantics.
+  // Guessing an equivalent file tool can introduce undeclared names/arguments.
+  if (schemas) return { name, args: args as Record<string, unknown> };
   if (name !== 'run_command' || !args || !args.CommandLine) {
     return { name, args: args as Record<string, unknown> };
   }

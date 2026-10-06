@@ -5,6 +5,41 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import * as shared from '../proxy/shared';
 import { mapGeminiToOpenAI, mapOpenAIToGemini, mapOpenAIChunkToGemini } from '../proxy/translators/openai';
 
+const toolArgumentCases: Array<{
+  name: string;
+  args: Record<string, unknown>;
+  schemas?: ReadonlyMap<string, unknown>;
+}> = [
+  {
+    name: 'write_to_file',
+    args: {
+      TargetFile: '/workspace/example.txt',
+      CodeContent: 'Hello.\nKeep /literal/path unchanged.',
+      Overwrite: false,
+    },
+  },
+  {
+    name: 'mcp__files__write',
+    args: { path: '/workspace/example.txt', content: 'Hello.', metadata: { file: 'notes.md' } },
+  },
+  { name: 'send_note', args: { message: 'This is a sentence.', priority: 'normal' } },
+  {
+    name: 'write_file',
+    args: { path: '/workspace/example.txt', content: 'A declared lowercase path must stay lowercase.' },
+    schemas: new Map([
+      [
+        'write_file',
+        {
+          type: 'object',
+          properties: { path: { type: 'string' }, content: { type: 'string' } },
+          required: ['path', 'content'],
+          additionalProperties: false,
+        },
+      ],
+    ]),
+  },
+];
+
 // Reset shared state before each test
 beforeEach(() => {
   shared.modelToolCallIds.clear();
@@ -20,6 +55,31 @@ beforeEach(() => {
 // ─── mapGeminiToOpenAI ─────────────────────────────────────────────────────
 
 describe('mapGeminiToOpenAI', () => {
+  it('preserves parametersJsonSchema properties, references, and additional-property constraints', () => {
+    const parametersJsonSchema = {
+      type: 'object',
+      $defs: { filePath: { type: 'string', minLength: 1 } },
+      properties: {
+        TargetFile: { $ref: '#/$defs/filePath' },
+        CodeContent: { type: 'string' },
+        Overwrite: { type: 'boolean' },
+      },
+      required: ['TargetFile', 'CodeContent', 'Overwrite'],
+      additionalProperties: false,
+    };
+    const original = structuredClone(parametersJsonSchema);
+    const result = mapGeminiToOpenAI(
+      {
+        contents: [],
+        tools: [{ functionDeclarations: [{ name: 'write_to_file', parametersJsonSchema }] }],
+      },
+      'external-model',
+    );
+    expect(result.tools![0].function.parameters).toEqual(original);
+    expect(result.tools![0].function.parameters).not.toBe(parametersJsonSchema);
+    expect(parametersJsonSchema).toEqual(original);
+  });
+
   it('should convert systemInstruction to system message', () => {
     const body = {
       systemInstruction: { parts: [{ text: 'You are helpful.' }] },
@@ -158,6 +218,78 @@ describe('mapGeminiToOpenAI', () => {
 // ─── mapOpenAIToGemini ─────────────────────────────────────────────────────
 
 describe('mapOpenAIToGemini', () => {
+  it('keeps valid write_to_file arguments within the schema sent to the provider', () => {
+    const args = { TargetFile: '/workspace/example.txt', CodeContent: 'Hello.', Overwrite: false };
+    const parameters = {
+      type: 'OBJECT',
+      properties: { TargetFile: { type: 'STRING' }, CodeContent: { type: 'STRING' }, Overwrite: { type: 'BOOLEAN' } },
+      required: ['TargetFile', 'CodeContent', 'Overwrite'],
+      additionalProperties: false,
+    };
+    const request = mapGeminiToOpenAI(
+      {
+        contents: [],
+        tools: [{ functionDeclarations: [{ name: 'write_to_file', parameters }] }],
+      },
+      'qwen-test',
+    );
+    const sentSchema = request.tools![0].function.parameters;
+    expect(sentSchema).toMatchObject({
+      properties: { TargetFile: { type: 'string' }, CodeContent: { type: 'string' }, Overwrite: { type: 'boolean' } },
+      required: parameters.required,
+      additionalProperties: false,
+    });
+    const result = mapOpenAIToGemini(
+      {
+        choices: [
+          {
+            message: {
+              tool_calls: [
+                {
+                  id: 'write-call',
+                  type: 'function',
+                  function: { name: 'write_to_file', arguments: JSON.stringify(args) },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      },
+      'qwen-test',
+    );
+    const call = result.candidates[0].content.parts[0].functionCall!;
+    expect(call).toEqual({ name: 'write_to_file', args, id: 'write-call' });
+    expect(Object.keys(call.args).sort()).toEqual(Object.keys(sentSchema.properties!).sort());
+  });
+
+  it.each(toolArgumentCases)(
+    'preserves valid $name arguments without guessing path fields',
+    ({ name, args, schemas }) => {
+      const result = mapOpenAIToGemini(
+        {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    id: 'preserved-call',
+                    type: 'function',
+                    function: { name, arguments: JSON.stringify(args) },
+                  },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+        'external-model',
+        schemas,
+      );
+      expect(result.candidates[0].content.parts[0].functionCall).toEqual({ name, args, id: 'preserved-call' });
+    },
+  );
+
   it('should convert simple text response', () => {
     const res = {
       choices: [{ message: { content: 'Hello!' }, finish_reason: 'stop' }],
@@ -253,6 +385,46 @@ describe('mapOpenAIToGemini', () => {
 // ─── mapOpenAIChunkToGemini (Streaming) ────────────────────────────────────
 
 describe('mapOpenAIChunkToGemini', () => {
+  describe.each(['tool_calls', 'stop'])('when finishing with %s', (finishReason) => {
+    it.each(toolArgumentCases)('preserves fragmented $name arguments', ({ name, args, schemas }) => {
+      const streamKey = `preserve-${finishReason}-${name}`;
+      const serialized = JSON.stringify(args);
+      const fragments = [serialized.slice(0, 9), serialized.slice(9, 31), serialized.slice(31)];
+      for (const [index, fragment] of fragments.entries()) {
+        const result = mapOpenAIChunkToGemini(
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      ...(index === 0 ? { id: 'fragmented-call' } : {}),
+                      function: { ...(index === 0 ? { name } : {}), arguments: fragment },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          'external-model',
+          streamKey,
+          schemas,
+        );
+        expect(result).toBeNull();
+      }
+      const result = mapOpenAIChunkToGemini(
+        { choices: [{ delta: {}, finish_reason: finishReason }] },
+        'external-model',
+        streamKey,
+        schemas,
+      );
+      expect(result?.finishReason).toBe('TOOL_CALL');
+      expect(result?.content.parts).toEqual([{ functionCall: { name, args, id: 'fragmented-call' } }]);
+      expect(shared.activeStreamContexts.has(streamKey)).toBe(false);
+    });
+  });
+
   it('should return text delta chunk', () => {
     const chunk = {
       id: 'stream_1',

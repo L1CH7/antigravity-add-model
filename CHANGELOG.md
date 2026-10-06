@@ -2,6 +2,12 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — File-tool parameter preservation
+
+- Fix a proxy bug matching [issue #7](https://github.com/vahapogut/antigravity-add-model/issues/7): valid file-writing calls could acquire an undeclared `AbsolutePath` argument and be rejected repeatedly.
+- Preserve unknown/custom tool arguments, prefer each request's declared schema over historical parameter names, and resolve only explicit aliases without guessing paths from file content or descriptions.
+- Apply the fix to OpenAI-compatible and Anthropic JSON/streaming responses, retain `parametersJsonSchema` declarations, and keep schema state isolated between concurrent requests.
+
 ### Unreleased — More providers and searchable catalogs
 
 - Add desktop and gateway presets for Together AI, Hugging Face Inference Providers, SambaNova, SiliconFlow, Novita AI, and Alibaba Cloud Model Studio.
