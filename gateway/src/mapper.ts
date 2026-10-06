@@ -91,12 +91,18 @@ export function mapContentsToMessages(contents: Content[], systemInstruction?: s
   const messages: OpenAIMessage[] = [];
   let callIndex = 0;
   const recentCallIds: Map<string, string[]> = new Map();
+  const pendingToolFeedback: OpenAIMessage[] = [];
+  const flushToolFeedback = () => {
+    messages.push(...pendingToolFeedback);
+    pendingToolFeedback.length = 0;
+  };
 
   for (const content of contents) {
     const role = content.role === 'model' ? 'assistant' : content.role as OpenAIMessage['role'];
     const parts = content.parts || (Array.isArray(content.content) ? content.content : []);
 
     if (parts.length === 0 && content.content && typeof content.content === 'string') {
+      flushToolFeedback();
       messages.push({ role, content: content.content });
       continue;
     }
@@ -123,6 +129,7 @@ export function mapContentsToMessages(contents: Content[], systemInstruction?: s
     const googleToolResults = parts.filter((p: any) => p.functionResponse);
     const sdkToolCalls = googleToolResults.length === 0 ? parts.filter((p: any) => p.type === 'tool-call') : [];
     const sdkToolResults = googleToolResults.length === 0 ? parts.filter((p: any) => p.type === 'tool-result') : [];
+    if (googleToolResults.length === 0 && sdkToolResults.length === 0) flushToolFeedback();
 
     if (googleToolCalls.length > 0 || sdkToolCalls.length > 0) {
       const toolParts = googleToolCalls.length > 0 ? googleToolCalls : sdkToolCalls;
@@ -148,6 +155,10 @@ export function mapContentsToMessages(contents: Content[], systemInstruction?: s
         const id = ids.shift() || callId(name, callIndex++);
         messages.push({ role: 'tool', tool_call_id: id, content: contentStr });
       }
+      // Antigravity can put validation failures beside an otherwise empty tool
+      // response. Defer it until consecutive result messages finish so feedback
+      // cannot interrupt the results of parallel calls.
+      if (textParts) pendingToolFeedback.push({ role: 'user', content: textParts });
     } else if (imageParts.length > 0) {
       const content: OpenAIContentPart[] = [];
       if (textParts) {
@@ -160,6 +171,7 @@ export function mapContentsToMessages(contents: Content[], systemInstruction?: s
     }
   }
 
+  flushToolFeedback();
   return { system: systemInstruction, messages };
 }
 
@@ -190,9 +202,10 @@ export function mapTools(tools: Tool[] | undefined): Record<string, CoreTool> | 
   for (const tool of tools) {
     if (tool.functionDeclarations) {
       for (const fd of tool.functionDeclarations) {
+        const parameters = fd.parametersJsonSchema ?? fd.parameters;
         result[fd.name] = {
           description: fd.description || '',
-          parameters: fd.parameters ? mapSchema(fd.parameters) : undefined,
+          parameters: parameters == null ? undefined : mapSchema(parameters),
         };
       }
     }
@@ -207,20 +220,43 @@ const TYPE_MAP: Record<string, string> = {
   ARRAY: 'array',
   OBJECT: 'object',
   NUMBER: 'number',
+  NULL: 'null',
 };
 
-function mapSchema(schema: any): Record<string, unknown> {
-  const result: Record<string, unknown> = { type: TYPE_MAP[schema.type] || schema.type || 'object' };
-  if (schema.description) result.description = schema.description;
-  if (schema.properties) {
-    result.properties = Object.fromEntries(
-      Object.entries(schema.properties).map(([key, val]: [string, any]) => [key, mapSchema(val)])
-    );
-  }
-  if (schema.required) result.required = schema.required;
-  if (schema.enum) result.enum = schema.enum;
-  if (schema.items) result.items = mapSchema(schema.items);
+function mapSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const result = structuredClone(schema);
+  normalizeSchemaTypes(result);
   return result;
+}
+
+function normalizeSchemaTypes(schema: unknown): void {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return;
+  const node = schema as Record<string, unknown>;
+  if (typeof node.type === 'string') {
+    node.type = TYPE_MAP[node.type] || node.type;
+  } else if (Array.isArray(node.type)) {
+    node.type = node.type.map(type => typeof type === 'string' ? TYPE_MAP[type] || type : type);
+  }
+
+  // Only visit schema-bearing keywords: values in const, enum, default and
+  // examples are application data, even when they contain a property "type".
+  for (const key of ['$defs', 'definitions', 'properties', 'patternProperties', 'dependentSchemas', 'dependencies']) {
+    const children = node[key];
+    if (children && typeof children === 'object' && !Array.isArray(children)) {
+      for (const child of Object.values(children)) normalizeSchemaTypes(child);
+    }
+  }
+  for (const key of ['additionalProperties', 'unevaluatedProperties', 'propertyNames', 'additionalItems', 'unevaluatedItems', 'contains', 'not', 'if', 'then', 'else', 'contentSchema']) {
+    normalizeSchemaTypes(node[key]);
+  }
+  for (const key of ['items', 'prefixItems', 'allOf', 'anyOf', 'oneOf']) {
+    const children = node[key];
+    if (Array.isArray(children)) {
+      for (const child of children) normalizeSchemaTypes(child);
+    } else {
+      normalizeSchemaTypes(children);
+    }
+  }
 }
 
 export function mapGenerationConfig(config: GenerationConfig | null | undefined): MappedConfig {

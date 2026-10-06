@@ -148,6 +148,51 @@ describe('mapGeminiToAnthropic', () => {
     expect(blocks.some((b) => b.type === 'tool_result')).toBe(true);
   });
 
+  it.each([false, true])('keeps tool failure text after matching tool results (split items: %s)', (splitItems) => {
+    const failure = 'WRITE_ERROR: invalid tool call: additional properties AbsolutePath not allowed';
+    const body = {
+      contents: [
+        {
+          role: 'model',
+          parts: [
+            { functionCall: { name: 'write_to_file', id: 'write-1', args: { TargetFile: '/tmp/first.txt' } } },
+            { functionCall: { name: 'write_to_file', id: 'write-2', args: { TargetFile: '/tmp/second.txt' } } },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [
+            { text: failure },
+            { functionResponse: { name: 'write_to_file', id: 'write-2', response: {} } },
+            { text: 'Internal note', thought: true },
+            { text: 'Correct the arguments before retrying.' },
+            { functionResponse: { name: 'write_to_file', id: 'write-1', response: { error: 'Permission denied' } } },
+          ],
+        },
+      ],
+    };
+    if (splitItems) {
+      const results = body.contents.pop()!;
+      body.contents.push(
+        { ...results, parts: results.parts.slice(0, 2) },
+        { ...results, parts: results.parts.slice(2) },
+      );
+    }
+    const original = structuredClone(body);
+    const result = mapGeminiToAnthropic(body, 'external-model');
+    expect(result.messages[1]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'write-2', content: '{}' },
+        { type: 'tool_result', tool_use_id: 'write-1', content: '{"error":"Permission denied"}' },
+        { type: 'text', text: failure },
+        { type: 'text', text: 'Correct the arguments before retrying.' },
+      ],
+    });
+    expect(result.messages[0].content).toMatchObject([{ id: 'write-1' }, { id: 'write-2' }]);
+    expect(body).toEqual(original);
+  });
+
   it('should set max_tokens from generationConfig', () => {
     const body = {
       contents: [],

@@ -80,6 +80,15 @@ function mapGeminiToolsToAnthropic(geminiTools) {
 function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
     const messages = [];
     const historyCallIds = new Map();
+    const pendingToolResults = [];
+    const pendingToolResponseTexts = [];
+    const flushToolResults = () => {
+        if (!pendingToolResults.length)
+            return;
+        messages.push({ role: 'user', content: [...pendingToolResults, ...pendingToolResponseTexts] });
+        pendingToolResults.length = 0;
+        pendingToolResponseTexts.length = 0;
+    };
     let system = undefined;
     if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
         system = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
@@ -89,6 +98,8 @@ function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
             if (item.parts) {
                 const hasFunctionCall = item.parts.some((p) => p.functionCall);
                 const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+                if (!hasFunctionResponse)
+                    flushToolResults();
                 if (hasFunctionCall && item.role === 'model') {
                     const contentBlocks = [];
                     for (const p of item.parts) {
@@ -119,8 +130,9 @@ function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
                     messages.push({ role: 'assistant', content: contentBlocks });
                 }
                 else if (hasFunctionResponse) {
-                    const contentBlocks = [];
                     for (const p of item.parts) {
+                        if (p.text && !p.thought)
+                            pendingToolResponseTexts.push({ type: 'text', text: p.text });
                         if (p.functionResponse) {
                             const funcName = p.functionResponse.name || '';
                             const modelTCIds = shared_1.modelToolCallIds.get(stateKey) || {};
@@ -140,14 +152,13 @@ function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
                             else {
                                 contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
                             }
-                            contentBlocks.push({
+                            pendingToolResults.push({
                                 type: 'tool_result',
                                 tool_use_id: toolCallId,
                                 content: contentStr,
                             });
                         }
                     }
-                    messages.push({ role: 'user', content: contentBlocks });
                 }
                 else {
                     const roleStr = item.role === 'model' ? 'assistant' : item.role || 'user';
@@ -191,6 +202,8 @@ function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
             }
         }
     }
+    // Anthropic requires tool results before text, even when Gemini splits the results across items.
+    flushToolResults();
     const result = {
         model: modelName,
         messages,

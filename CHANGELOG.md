@@ -2,6 +2,12 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — Tool failure feedback
+
+- Preserve explanatory text beside tool results when converting conversation history for OpenAI-compatible and Anthropic providers. An empty tool result no longer hides an error sent in a sibling text part.
+- Keep tool replies grouped before accompanying feedback and preserve OpenAI assistant text beside tool calls. HTTP regressions verify that a later model request receives the failure and can correct the call.
+- Apply the same feedback preservation to the optional gateway and retain declared JSON-schema constraints, including `parametersJsonSchema`, when forwarding its tools to providers.
+
 ### Unreleased — File-tool parameter preservation
 
 - Fix a proxy bug matching [issue #7](https://github.com/vahapogut/antigravity-add-model/issues/7): valid file-writing calls could acquire an undeclared `AbsolutePath` argument and be rejected repeatedly.

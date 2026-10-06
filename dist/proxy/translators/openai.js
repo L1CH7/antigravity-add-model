@@ -82,6 +82,13 @@ function mapGeminiToolsToOpenAI(geminiTools) {
 function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
     const messages = [];
     const historyCallIds = new Map();
+    const pendingToolResponseTexts = [];
+    const flushToolResponseTexts = () => {
+        if (!pendingToolResponseTexts.length)
+            return;
+        messages.push({ role: 'user', content: pendingToolResponseTexts.join('\n') });
+        pendingToolResponseTexts.length = 0;
+    };
     if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
         const systemText = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
         if (systemText) {
@@ -93,6 +100,8 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
             if (item.parts) {
                 const hasFunctionCall = item.parts.some((p) => p.functionCall);
                 const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+                if (!hasFunctionResponse)
+                    flushToolResponseTexts();
                 if (hasFunctionCall && item.role === 'model') {
                     const toolCalls = [];
                     for (const p of item.parts) {
@@ -118,10 +127,16 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
                             });
                         }
                     }
-                    messages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+                    const text = item.parts
+                        .filter((p) => p.text && !p.thought)
+                        .map((p) => p.text)
+                        .join('');
+                    messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
                 }
                 else if (hasFunctionResponse) {
                     for (const p of item.parts) {
+                        if (p.text && !p.thought)
+                            pendingToolResponseTexts.push(p.text);
                         if (p.functionResponse) {
                             const funcName = p.functionResponse.name || '';
                             const modelTCIds = shared_1.modelToolCallIds.get(stateKey) || {};
@@ -200,6 +215,8 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
             }
         }
     }
+    // Keep feedback after all consecutive tool results, including split parallel responses.
+    flushToolResponseTexts();
     // Inject reasoning_content into assistant messages missing it
     let lastAssistantIdx = -1;
     for (let i = 0; i < messages.length; i++) {
@@ -314,6 +331,8 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
             }
             return { functionCall: { name: translated.name, args: translated.args, id: tc.id } };
         });
+        if (choice.message.content)
+            parts.unshift({ text: choice.message.content });
         return {
             candidates: [{ content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 }],
             usageMetadata: {

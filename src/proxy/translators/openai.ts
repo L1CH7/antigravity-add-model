@@ -212,6 +212,12 @@ export function mapGeminiToOpenAI(
 ): OpenAIRequestBody {
   const messages: OpenAIMessage[] = [];
   const historyCallIds = new Map<string, string[]>();
+  const pendingToolResponseTexts: string[] = [];
+  const flushToolResponseTexts = () => {
+    if (!pendingToolResponseTexts.length) return;
+    messages.push({ role: 'user', content: pendingToolResponseTexts.join('\n') });
+    pendingToolResponseTexts.length = 0;
+  };
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
     const systemText = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
@@ -225,6 +231,7 @@ export function mapGeminiToOpenAI(
       if (item.parts) {
         const hasFunctionCall = item.parts.some((p) => p.functionCall);
         const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+        if (!hasFunctionResponse) flushToolResponseTexts();
 
         if (hasFunctionCall && item.role === 'model') {
           const toolCalls: OpenAIToolCall[] = [];
@@ -251,9 +258,14 @@ export function mapGeminiToOpenAI(
               });
             }
           }
-          messages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+          const text = item.parts
+            .filter((p) => p.text && !p.thought)
+            .map((p) => p.text)
+            .join('');
+          messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
         } else if (hasFunctionResponse) {
           for (const p of item.parts) {
+            if (p.text && !p.thought) pendingToolResponseTexts.push(p.text);
             if (p.functionResponse) {
               const funcName = p.functionResponse.name || '';
               const modelTCIds = modelToolCallIds.get(stateKey) || {};
@@ -325,6 +337,8 @@ export function mapGeminiToOpenAI(
       }
     }
   }
+  // Keep feedback after all consecutive tool results, including split parallel responses.
+  flushToolResponseTexts();
 
   // Inject reasoning_content into assistant messages missing it
   let lastAssistantIdx = -1;
@@ -448,6 +462,7 @@ export function mapOpenAIToGemini(
       }
       return { functionCall: { name: translated.name, args: translated.args as Record<string, unknown>, id: tc.id } };
     });
+    if (choice.message.content) parts.unshift({ text: choice.message.content });
     return {
       candidates: [{ content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 }],
       usageMetadata: {

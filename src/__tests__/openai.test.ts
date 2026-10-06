@@ -125,6 +125,74 @@ describe('mapGeminiToOpenAI', () => {
     expect(result.messages[0].tool_calls![0].function.name).toBe('search');
   });
 
+  it('preserves assistant text alongside tool calls without exposing thought parts', () => {
+    const result = mapGeminiToOpenAI(
+      {
+        contents: [
+          {
+            role: 'model',
+            parts: [
+              { text: 'The previous write failed. ' },
+              { text: 'Internal reasoning', thought: true },
+              { functionCall: { name: 'write_to_file', id: 'retry-write', args: { TargetFile: '/tmp/retry.txt' } } },
+              { text: 'Retrying with the corrected path.' },
+            ],
+          },
+        ],
+      },
+      'external-model',
+    );
+    expect(result.messages[0].content).toBe('The previous write failed. Retrying with the corrected path.');
+    expect(result.messages[0].tool_calls).toEqual([
+      {
+        id: 'retry-write',
+        type: 'function',
+        function: { name: 'write_to_file', arguments: '{"TargetFile":"/tmp/retry.txt"}' },
+      },
+    ]);
+  });
+
+  it.each([false, true])('keeps tool failure text after all matching tool results (split items: %s)', (splitItems) => {
+    const failure = 'WRITE_ERROR: invalid tool call: additional properties AbsolutePath not allowed';
+    const body = {
+      contents: [
+        {
+          role: 'model',
+          parts: [
+            { functionCall: { name: 'write_to_file', id: 'write-1', args: { TargetFile: '/tmp/first.txt' } } },
+            { functionCall: { name: 'write_to_file', id: 'write-2', args: { TargetFile: '/tmp/second.txt' } } },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [
+            { text: failure },
+            { functionResponse: { name: 'write_to_file', id: 'write-2', response: {} } },
+            { text: 'Internal note', thought: true },
+            { text: 'Correct the arguments before retrying.' },
+            { functionResponse: { name: 'write_to_file', id: 'write-1', response: { error: 'Permission denied' } } },
+          ],
+        },
+      ],
+    };
+    if (splitItems) {
+      const results = body.contents.pop()!;
+      body.contents.push(
+        { ...results, parts: results.parts.slice(0, 2) },
+        { ...results, parts: results.parts.slice(2) },
+      );
+    }
+    const original = structuredClone(body);
+    const result = mapGeminiToOpenAI(body, 'external-model');
+    expect(result.messages.slice(1)).toEqual([
+      { role: 'tool', tool_call_id: 'write-2', content: '{}' },
+      { role: 'tool', tool_call_id: 'write-1', content: '{"error":"Permission denied"}' },
+      { role: 'user', content: `${failure}\nCorrect the arguments before retrying.` },
+    ]);
+    expect(result.messages[0].tool_calls!.map((call) => call.id)).toEqual(['write-1', 'write-2']);
+    expect(body).toEqual(original);
+  });
+
   it('should handle functionResponse parts as tool messages', () => {
     const body = {
       contents: [
@@ -218,6 +286,36 @@ describe('mapGeminiToOpenAI', () => {
 // ─── mapOpenAIToGemini ─────────────────────────────────────────────────────
 
 describe('mapOpenAIToGemini', () => {
+  it('preserves a failure explanation beside a retry tool call in a JSON response', () => {
+    const explanation = 'The write failed because the tool rejected AbsolutePath. I will retry with TargetFile.';
+    const args = { TargetFile: '/tmp/retry.txt', CodeContent: 'hello', Overwrite: false };
+    const result = mapOpenAIToGemini(
+      {
+        choices: [
+          {
+            message: {
+              content: explanation,
+              tool_calls: [
+                {
+                  id: 'retry-write',
+                  type: 'function',
+                  function: { name: 'write_to_file', arguments: JSON.stringify(args) },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      },
+      'external-model',
+    );
+    expect(result.candidates[0].content.parts).toEqual([
+      { text: explanation },
+      { functionCall: { name: 'write_to_file', args, id: 'retry-write' } },
+    ]);
+    expect(result.candidates[0].finishReason).toBe('TOOL_CALL');
+  });
+
   it('keeps valid write_to_file arguments within the schema sent to the provider', () => {
     const args = { TargetFile: '/workspace/example.txt', CodeContent: 'Hello.', Overwrite: false };
     const parameters = {

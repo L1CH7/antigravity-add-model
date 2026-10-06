@@ -58,6 +58,110 @@ describe('mapContentsToMessages', () => {
     assert.equal(result.messages[0].content, '{"content":"file content"}');
   });
 
+  it('preserves validation feedback beside a file-tool response', () => {
+    const error = "Error invalid tool call: invalid arguments: additional properties 'AbsolutePath' not allowed";
+    const result = mapContentsToMessages([
+      {
+        role: 'model',
+        parts: [{ functionCall: { name: 'write_to_file', args: '{"AbsolutePath":"/tmp/test.txt"}' } }],
+      },
+      {
+        role: 'user',
+        parts: [
+          { functionResponse: { name: 'write_to_file', response: '{}' } },
+          { text: error },
+        ],
+      },
+    ]);
+
+    assert.deepEqual(result.messages.slice(1), [
+      { role: 'tool', tool_call_id: 'call_write_to_file_0', content: '{}' },
+      { role: 'user', content: error },
+    ]);
+  });
+
+  it('keeps all tool responses together before sibling feedback', () => {
+    const result = mapContentsToMessages([
+      {
+        role: 'model',
+        parts: [
+          { functionCall: { name: 'write_to_file', args: '{}' } },
+          { functionCall: { name: 'view_file', args: '{}' } },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          { text: 'The write operation failed. Retry with TargetFile.' },
+          { functionResponse: { name: 'write_to_file', response: '{}' } },
+          { functionResponse: { name: 'view_file', response: '{"content":"existing file"}' } },
+        ],
+      },
+    ]);
+
+    assert.deepEqual(result.messages.slice(1), [
+      { role: 'tool', tool_call_id: 'call_write_to_file_0', content: '{}' },
+      { role: 'tool', tool_call_id: 'call_view_file_1', content: '{"content":"existing file"}' },
+      { role: 'user', content: 'The write operation failed. Retry with TargetFile.' },
+    ]);
+  });
+
+  it('preserves sibling error text in SDK tool-result content', () => {
+    const result = mapContentsToMessages([
+      {
+        role: 'model',
+        content: [{ type: 'tool-call', toolName: 'write_to_file', args: {} }],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool-result', toolName: 'write_to_file', result: { success: false } },
+          { type: 'text', text: 'Invalid arguments: TargetFile is required.' },
+        ],
+      },
+    ]);
+
+    assert.deepEqual(result.messages.slice(1), [
+      { role: 'tool', tool_call_id: 'call_write_to_file_0', content: '{"success":false}' },
+      { role: 'user', content: 'Invalid arguments: TargetFile is required.' },
+    ]);
+  });
+
+  it('defers feedback until consecutive parallel tool-response messages finish', () => {
+    const result = mapContentsToMessages([
+      {
+        role: 'model',
+        parts: [
+          { functionCall: { name: 'write_to_file', args: '{}' } },
+          { functionCall: { name: 'view_file', args: '{}' } },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          { functionResponse: { name: 'write_to_file', response: '{}' } },
+          { text: 'Write failed: TargetFile is required.' },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          { functionResponse: { name: 'view_file', response: '{"content":"existing file"}' } },
+          { text: 'The existing file was read successfully.' },
+        ],
+      },
+      { role: 'user', content: 'Try writing again.' },
+    ]);
+
+    assert.deepEqual(result.messages.slice(1), [
+      { role: 'tool', tool_call_id: 'call_write_to_file_0', content: '{}' },
+      { role: 'tool', tool_call_id: 'call_view_file_1', content: '{"content":"existing file"}' },
+      { role: 'user', content: 'Write failed: TargetFile is required.' },
+      { role: 'user', content: 'The existing file was read successfully.' },
+      { role: 'user', content: 'Try writing again.' },
+    ]);
+  });
+
   it('should handle thought parts', () => {
     const contents = [
       {
@@ -121,6 +225,107 @@ describe('mapTools', () => {
     assert.ok(result);
     assert.ok(result!['view_file']);
     assert.equal(result!['view_file'].description, 'View file contents');
+  });
+
+  it('prefers the current parametersJsonSchema over legacy parameters', () => {
+    const schema = {
+      type: 'object',
+      properties: { TargetFile: { type: 'string' }, CodeContent: { type: 'string' } },
+      required: ['TargetFile', 'CodeContent'],
+      additionalProperties: false,
+    };
+    const tools = [{
+      functionDeclarations: [{
+        name: 'write_to_file',
+        description: 'Write a file',
+        parameters: { type: 'object', properties: { AbsolutePath: { type: 'string' } } },
+        parametersJsonSchema: schema,
+      }],
+    }];
+
+    assert.deepEqual(mapTools(tools)!.write_to_file.parameters, schema);
+  });
+
+  it('supports tools declared only with parametersJsonSchema', () => {
+    const schema = {
+      type: 'object',
+      properties: { TargetFile: { type: 'string' } },
+      required: ['TargetFile'],
+      additionalProperties: false,
+    };
+    const tools = [{
+      functionDeclarations: [{ name: 'write_to_file', description: 'Write a file', parametersJsonSchema: schema }],
+    }];
+
+    assert.deepEqual(mapTools(tools as any)!.write_to_file.parameters, schema);
+  });
+
+  it('retains nested schema constraints that reject invalid file arguments', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        TargetFile: { type: 'string', minLength: 1, pattern: '^/' },
+        CodeContent: { type: 'string', maxLength: 100000 },
+        Options: {
+          type: 'object',
+          properties: { Overwrite: { type: 'boolean', default: false } },
+          additionalProperties: false,
+        },
+      },
+      required: ['TargetFile', 'CodeContent'],
+      additionalProperties: false,
+      oneOf: [{ required: ['Options'] }, { not: { required: ['Options'] } }],
+    };
+    const tools = [{ functionDeclarations: [{ name: 'write_to_file', description: 'Write', parameters: schema }] }];
+
+    assert.deepEqual(mapTools(tools)!.write_to_file.parameters, schema);
+  });
+
+  it('retains refs, enum-only and boolean schemas without adding an object type', () => {
+    const schema = {
+      type: 'object',
+      $defs: { filePath: { type: 'string', minLength: 1 } },
+      properties: {
+        TargetFile: { $ref: '#/$defs/filePath' },
+        Mode: { enum: ['create', 'overwrite'] },
+        Forbidden: false,
+      },
+      additionalProperties: false,
+    };
+    const tools = [{ functionDeclarations: [{ name: 'write_to_file', description: 'Write', parameters: schema }] }];
+
+    assert.deepEqual(mapTools(tools as any)!.write_to_file.parameters, schema);
+  });
+
+  it('normalizes Gemini types while preserving literal data and the input schema', () => {
+    const schema = {
+      type: 'OBJECT',
+      properties: {
+        TargetFile: { type: 'STRING', minLength: 1 },
+        Settings: {
+          type: 'ARRAY',
+          items: { type: 'OBJECT', properties: { type: { type: 'STRING', const: 'STRING' } } },
+          default: [{ type: 'STRING' }],
+        },
+        Fallback: { anyOf: [{ type: 'STRING' }, { type: 'NULL' }] },
+        Optional: { type: ['STRING', 'NULL'] },
+      },
+      additionalProperties: false,
+    };
+    const original = structuredClone(schema);
+    const expected = structuredClone(schema);
+    expected.type = 'object';
+    expected.properties.TargetFile.type = 'string';
+    expected.properties.Settings.type = 'array';
+    expected.properties.Settings.items.type = 'object';
+    expected.properties.Settings.items.properties.type.type = 'string';
+    expected.properties.Fallback.anyOf[0].type = 'string';
+    expected.properties.Fallback.anyOf[1].type = 'null';
+    expected.properties.Optional.type = ['string', 'null'];
+    const tools = [{ functionDeclarations: [{ name: 'write_to_file', description: 'Write', parameters: schema }] }];
+
+    assert.deepEqual(mapTools(tools)!.write_to_file.parameters, expected);
+    assert.deepEqual(schema, original);
   });
 
   it('should return undefined for empty tools', () => {

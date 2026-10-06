@@ -141,7 +141,7 @@ function toolReply(
 }
 
 async function readToolCalls(response: Response, stream: boolean) {
-  type ToolCall = { name: string; args: Record<string, unknown> };
+  type ToolCall = { id?: string; name: string; args: Record<string, unknown> };
   type Payload = { candidates?: { content?: { parts?: { functionCall?: ToolCall }[] } }[] };
   const payloads: Payload[] = stream
     ? (await response.text())
@@ -156,6 +156,68 @@ async function readToolCalls(response: Response, stream: boolean) {
 }
 
 describe('real upstream HTTP routing', () => {
+  it.each([
+    { provider: 'openai' as const, stream: false },
+    { provider: 'anthropic' as const, stream: true },
+  ])(
+    'returns file validation feedback to $provider so the next turn can correct the call',
+    async ({ provider, stream }) => {
+      const errorText = 'File write failed: invalid arguments: additional properties AbsolutePath not allowed';
+      const invalidArgs = { AbsolutePath: '/tmp/followup.txt', content: 'hello' };
+      const correctedArgs = { path: '/tmp/followup.txt', content: 'hello' };
+      const upstreamRequests: { messages: unknown[] }[] = [];
+      const upstream = await serve(async (req, res) => {
+        const input = await body(req);
+        upstreamRequests.push(input);
+        const receivedError = JSON.stringify(input.messages).includes(errorText);
+        toolReply(res, provider, stream, 'write_file', receivedError ? correctedArgs : invalidArgs);
+      });
+      const configured = model(upstream, { provider });
+      const url = await serve(async (req, res) => {
+        const input = await body(req);
+        void runCustomModelRequest(res, configured, input, stream, [configured], false);
+      });
+      const tools = [
+        {
+          functionDeclarations: [
+            {
+              name: 'write_file',
+              parametersJsonSchema: {
+                type: 'object',
+                properties: { path: { type: 'string' }, content: { type: 'string' } },
+                required: ['path', 'content'],
+                additionalProperties: false,
+              },
+            },
+          ],
+        },
+      ];
+      const prompt = { role: 'user', parts: [{ text: 'Write hello to /tmp/followup.txt' }] };
+      const request = async (contents: unknown[]) => {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents, tools }),
+        });
+        expect(response.status).toBe(200);
+        return readToolCalls(response, stream);
+      };
+      const [firstCall] = await request([prompt]);
+      expect(firstCall).toMatchObject({ name: 'write_file', args: invalidArgs });
+      const nextCalls = await request([
+        prompt,
+        { role: 'model', parts: [{ functionCall: firstCall }] },
+        {
+          role: 'user',
+          parts: [{ functionResponse: { id: firstCall.id, name: firstCall.name, response: {} } }, { text: errorText }],
+        },
+      ]);
+      expect(upstreamRequests).toHaveLength(2);
+      expect(JSON.stringify(upstreamRequests[1].messages)).toContain(errorText);
+      expect(nextCalls).toEqual([expect.objectContaining({ name: 'write_file', args: correctedArgs })]);
+    },
+  );
+
   describe.each(['openai', 'anthropic'] as const)('%s tool arguments', (provider) => {
     it.each([
       {

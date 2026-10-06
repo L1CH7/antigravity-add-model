@@ -184,6 +184,14 @@ export function mapGeminiToAnthropic(
 ): AnthropicRequestBody {
   const messages: AnthropicMessage[] = [];
   const historyCallIds = new Map<string, string[]>();
+  const pendingToolResults: AnthropicContentBlock[] = [];
+  const pendingToolResponseTexts: AnthropicContentBlock[] = [];
+  const flushToolResults = () => {
+    if (!pendingToolResults.length) return;
+    messages.push({ role: 'user', content: [...pendingToolResults, ...pendingToolResponseTexts] });
+    pendingToolResults.length = 0;
+    pendingToolResponseTexts.length = 0;
+  };
   let system: string | undefined = undefined;
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
@@ -195,6 +203,7 @@ export function mapGeminiToAnthropic(
       if (item.parts) {
         const hasFunctionCall = item.parts.some((p) => p.functionCall);
         const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+        if (!hasFunctionResponse) flushToolResults();
 
         if (hasFunctionCall && item.role === 'model') {
           const contentBlocks: AnthropicContentBlock[] = [];
@@ -225,8 +234,8 @@ export function mapGeminiToAnthropic(
           }
           messages.push({ role: 'assistant', content: contentBlocks });
         } else if (hasFunctionResponse) {
-          const contentBlocks: AnthropicContentBlock[] = [];
           for (const p of item.parts) {
+            if (p.text && !p.thought) pendingToolResponseTexts.push({ type: 'text', text: p.text });
             if (p.functionResponse) {
               const funcName = p.functionResponse.name || '';
               const modelTCIds = modelToolCallIds.get(stateKey) || {};
@@ -244,14 +253,13 @@ export function mapGeminiToAnthropic(
               } else {
                 contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
               }
-              contentBlocks.push({
+              pendingToolResults.push({
                 type: 'tool_result',
                 tool_use_id: toolCallId,
                 content: contentStr,
               });
             }
           }
-          messages.push({ role: 'user', content: contentBlocks });
         } else {
           const roleStr = item.role === 'model' ? 'assistant' : item.role || 'user';
           let content = '';
@@ -291,6 +299,8 @@ export function mapGeminiToAnthropic(
       }
     }
   }
+  // Anthropic requires tool results before text, even when Gemini splits the results across items.
+  flushToolResults();
 
   const result: AnthropicRequestBody = {
     model: modelName,

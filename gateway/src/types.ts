@@ -33,16 +33,18 @@ export interface Tool {
 export interface FunctionDeclaration {
   name: string;
   description: string;
-  parameters: Schema | null;
+  parameters?: Schema | null;
+  parametersJsonSchema?: Record<string, unknown> | null;
 }
 
 export interface Schema {
-  type: string;
+  [key: string]: unknown;
+  type?: string | string[];
   description?: string;
-  properties?: Record<string, Schema>;
+  properties?: Record<string, Schema | boolean>;
   required?: string[];
-  items?: Schema;
-  enum?: string[];
+  items?: Schema | boolean | Array<Schema | boolean>;
+  enum?: unknown[];
 }
 
 export interface GenerationConfig {
