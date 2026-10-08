@@ -1090,11 +1090,14 @@ function handleRequest(req, res) {
                 if (modelName || modelId) {
                     const customModels = loadCustomModels();
                     const cleanModelName = (modelName || '').replace(/^models\//, '');
-                    const matchedCustomModel = customModels.find((m) => {
+                    let matchedCustomModel = customModels.find((m) => {
                         const enumName = generateModelPlaceholderId(m);
                         const slug = toSlug(m);
+                        const cleanMName = (m.name || '').replace(/^models\//, '');
+                        const cleanExtName = (m.externalModelName || '').replace(/^models\//, '');
                         return (m.name === modelName ||
-                            m.name === cleanModelName ||
+                            cleanMName === cleanModelName ||
+                            cleanExtName === cleanModelName ||
                             slug === modelName ||
                             slug === cleanModelName ||
                             'models/' + slug === modelName ||
@@ -1103,6 +1106,19 @@ function handleRequest(req, res) {
                             'models/' + enumName === modelName ||
                             enumName === modelId);
                     });
+                    // Subagent / Background task fallback:
+                    // If subagent requests internal Google model (e.g., gemini-3.8-flash-tiered, gemini-3.5-flash-lite),
+                    // automatically route to local Antigravity Manager instead of leaking to blocked direct Cloud Code!
+                    if (!matchedCustomModel && (cleanModelName.startsWith('gemini-') || cleanModelName.startsWith('claude-'))) {
+                        const defaultModel = customModels.find(m => (m.externalModelName || '').includes('gemini-3.7-flash-high')) || customModels[0];
+                        if (defaultModel) {
+                            electron_log_1.default.info(`[Proxy] Subagent model fallback: ${modelName} -> routing via ${defaultModel.displayName} (${defaultModel.externalModelName})`);
+                            matchedCustomModel = {
+                                ...defaultModel,
+                                externalModelName: cleanModelName
+                            };
+                        }
+                    }
                     if (matchedCustomModel) {
                         electron_log_1.default.info(`[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`);
                         const isStream = req.url.includes('streamGenerateContent') || req.url.includes('alt=sse');
