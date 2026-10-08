@@ -20,6 +20,7 @@ exports.validateCustomModels = validateCustomModels;
 exports.validateGenerateContentRequest = validateGenerateContentRequest;
 exports.validateOpenAiChunk = validateOpenAiChunk;
 exports.validateAnthropicEvent = validateAnthropicEvent;
+const providers_1 = require("./providers");
 /**
  * Validates a Gemini candidate object structure.
  */
@@ -99,7 +100,7 @@ function validateCustomModel(model) {
     }
     const provider = m.provider;
     // Validate provider is one of the supported types
-    const validProviders = ['openai', 'anthropic', 'google', 'ollama', 'custom', 'openrouter', 'deepseek', 'groq', 'mistral', 'cerebras', 'kimi', 'fireworks', 'lmstudio', 'llamacpp', 'nvidia'];
+    const validProviders = providers_1.PROVIDERS.map((provider) => provider.id);
     if (!validProviders.includes(provider)) {
         return { valid: false, error: `Unsupported provider: ${provider}. Must be one of: ${validProviders.join(', ')}` };
     }
@@ -109,6 +110,9 @@ function validateCustomModel(model) {
         const url = new URL(apiUrl);
         if (!['http:', 'https:'].includes(url.protocol)) {
             return { valid: false, error: 'API URL must use http or https protocol' };
+        }
+        if (url.username || url.password) {
+            return { valid: false, error: 'Use the API key or custom headers field instead of embedding credentials in the API URL' };
         }
     }
     catch (e) {
@@ -126,6 +130,94 @@ function validateCustomModel(model) {
     }
     if (m.allowUnauthorized !== undefined && typeof m.allowUnauthorized !== 'boolean') {
         return { valid: false, error: 'allowUnauthorized must be a boolean' };
+    }
+    if (m.apiFormat !== undefined && !['openai', 'anthropic', 'google'].includes(m.apiFormat)) {
+        return { valid: false, error: 'apiFormat must be openai, anthropic or google' };
+    }
+    if (m.provider === 'google-cloudcode' && m.apiFormat !== undefined && m.apiFormat !== 'google')
+        return { valid: false, error: 'Google Cloud Code requires the google API format' };
+    for (const field of ['enabled', 'rawUrl', 'gateway', 'supportsVision', 'supportsThinking', 'encryptedHeaders', 'encryptedGoogleAccounts']) {
+        if (m[field] !== undefined && typeof m[field] !== 'boolean')
+            return { valid: false, error: `${field} must be a boolean` };
+    }
+    if (m.reasoningEffort !== undefined && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(m.reasoningEffort)) {
+        return { valid: false, error: 'Invalid reasoningEffort' };
+    }
+    for (const field of ['contextWindow', 'maxOutputTokens', 'thinkingBudget', 'timeout', 'idleTimeout', 'retryBudgetMs', 'maxRetries']) {
+        const value = m[field];
+        const minimum = field === 'thinkingBudget' || field === 'maxRetries' ? 0 : 1;
+        const maximum = field === 'maxRetries' ? 5 : ['timeout', 'idleTimeout', 'retryBudgetMs'].includes(field) ? 3600000 : 1000000000;
+        if (value !== undefined && (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum)) {
+            return { valid: false, error: `${field} must be an integer from ${minimum} to ${maximum}` };
+        }
+    }
+    if (m.contextWindow !== undefined && m.maxOutputTokens !== undefined && Number(m.maxOutputTokens) >= Number(m.contextWindow)) {
+        return { valid: false, error: 'maxOutputTokens must be smaller than contextWindow' };
+    }
+    if (m.fallbackModels !== undefined && (!Array.isArray(m.fallbackModels) || m.fallbackModels.length > 20 || m.fallbackModels.some((value) => typeof value !== 'string' || !value.trim()))) {
+        return { valid: false, error: 'fallbackModels must contain up to 20 saved model names' };
+    }
+    if (m.circuitBreaker !== undefined) {
+        if (!m.circuitBreaker || typeof m.circuitBreaker !== 'object' || Array.isArray(m.circuitBreaker))
+            return { valid: false, error: 'circuitBreaker must be an object' };
+        const options = m.circuitBreaker;
+        if (options.enabled !== undefined && typeof options.enabled !== 'boolean')
+            return { valid: false, error: 'circuitBreaker.enabled must be boolean' };
+        for (const field of ['failureThreshold', 'cooldownMs']) {
+            if (options[field] !== undefined && (!Number.isSafeInteger(options[field]) || Number(options[field]) < 1 || Number(options[field]) > 3600000)) {
+                return { valid: false, error: `circuitBreaker.${field} must be a positive integer up to 3600000` };
+            }
+        }
+    }
+    if (m.customHeaders !== undefined) {
+        if (!m.customHeaders || typeof m.customHeaders !== 'object' || Array.isArray(m.customHeaders))
+            return { valid: false, error: 'customHeaders must be an object' };
+        for (const [key, value] of Object.entries(m.customHeaders)) {
+            if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key) || /^(host|content-length|connection|transfer-encoding)$/i.test(key) || typeof value !== 'string' || /[\r\n]/.test(value)) {
+                return { valid: false, error: 'customHeaders contains a reserved or invalid header' };
+            }
+        }
+    }
+    if (m.extraBody !== undefined) {
+        if (!m.extraBody || typeof m.extraBody !== 'object' || Array.isArray(m.extraBody))
+            return { valid: false, error: 'extraBody must be an object' };
+        const reserved = ['model', 'messages', 'contents', 'system', 'systemInstruction', 'tools', 'stream'];
+        for (const key of Object.keys(m.extraBody)) {
+            if (reserved.includes(key))
+                return { valid: false, error: `extraBody cannot override ${key}` };
+        }
+    }
+    if (m.googleProject !== undefined && typeof m.googleProject !== 'string')
+        return { valid: false, error: 'googleProject must be a string' };
+    if (m.googleAccounts !== undefined) {
+        if (!Array.isArray(m.googleAccounts) || m.googleAccounts.length > 50)
+            return { valid: false, error: 'googleAccounts must be an array with at most 50 accounts' };
+        const ids = new Set();
+        for (const entry of m.googleAccounts) {
+            if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string' || !entry.id.trim() || ids.has(entry.id))
+                return { valid: false, error: 'Each Google account needs a unique id' };
+            ids.add(entry.id);
+            for (const field of ['label', 'refreshToken', 'accessToken', 'clientId', 'clientSecret', 'project']) {
+                if (entry[field] !== undefined && typeof entry[field] !== 'string')
+                    return { valid: false, error: `Google account ${field} must be a string` };
+            }
+            if (entry.expiresAt !== undefined && (!Number.isSafeInteger(entry.expiresAt) || entry.expiresAt < 0))
+                return { valid: false, error: 'Google account expiresAt must be a timestamp in milliseconds' };
+            if (entry.enabled !== undefined && typeof entry.enabled !== 'boolean')
+                return { valid: false, error: 'Google account enabled must be a boolean' };
+        }
+    }
+    if (m.googlePool !== undefined) {
+        if (!m.googlePool || typeof m.googlePool !== 'object' || Array.isArray(m.googlePool))
+            return { valid: false, error: 'googlePool must be an object' };
+        const options = m.googlePool;
+        if (options.strategy !== undefined && !['round-robin', 'least-loaded', 'quota'].includes(options.strategy))
+            return { valid: false, error: 'Invalid Google pool strategy' };
+        for (const field of ['maxConcurrency', 'cooldownMs']) {
+            const maximum = field === 'maxConcurrency' ? 100 : 3600000;
+            if (options[field] !== undefined && (!Number.isSafeInteger(options[field]) || Number(options[field]) < 1 || Number(options[field]) > maximum))
+                return { valid: false, error: `googlePool.${field} must be a positive integer up to ${maximum}` };
+        }
     }
     return { valid: true };
 }

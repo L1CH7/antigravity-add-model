@@ -7,7 +7,7 @@ export declare function backupFile(filePath: string): void;
  */
 export declare function isEncryptionAvailable(): boolean;
 /**
- * Encrypts a plaintext string. Falls back to base64 with a prefix if safeStorage is unavailable.
+ * Use OS-backed storage when available; otherwise AES-GCM with a local user key.
  */
 export declare function encryptString(plainText: string): string;
 /**

@@ -26,12 +26,35 @@ export interface CustomModel {
   _slug?: string;
   timeout?: number;
   maxRetries?: number;
+  enabled?: boolean;
+  apiFormat?: import('./providers').ApiFormat;
+  fallbackModels?: string[];
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  thinkingBudget?: number;
+  maxOutputTokens?: number;
+  contextWindow?: number;
+  idleTimeout?: number;
+  retryBudgetMs?: number;
+  circuitBreaker?: import('./proxy/circuitBreaker').CircuitBreakerOptions;
+  customHeaders?: Record<string, string>;
+  encryptedHeaders?: boolean;
+  extraBody?: Record<string, unknown>;
+  rawUrl?: boolean;
+  gateway?: boolean;
+  supportsVision?: boolean;
+  supportsThinking?: boolean;
+  googleProject?: string;
+  googleAccounts?: import('./googleAccounts').GoogleAccount[];
+  googlePool?: import('./googleAccounts').GooglePoolOptions;
+  encryptedGoogleAccounts?: boolean;
 }
 
 interface GeminiRequestBody {
   model?: string;
   modelId?: string;
   model_id?: string;
+  sessionId?: string;
+  conversationId?: string;
   request?: GeminiRequestBody;
   systemInstruction?: { parts: { text?: string }[] };
   contents?: {
@@ -59,16 +82,16 @@ import {
   activeStreamContexts,
   translatedToolCalls,
   stateTimestamps,
-  touchStateTimestamp,
   startCleanupInterval,
   stopCleanupInterval,
 } from './proxy/shared';
 
 // Model configuration & capability detection
-import { detectModelCapabilities, detectModelCapabilitiesByName } from './proxy/modelUtils';
+import { detectModelCapabilities } from './proxy/modelUtils';
 
-// Provider translator registry (auto-discovers translators from proxy/translators/)
-import * as registry from './proxy/registry';
+// Custom request transport and model storage
+import { runCustomModelRequest, getProxyMetrics, stopCustomRequests } from './proxy/customRequest';
+import { readModelConfig, writeJsonAtomic } from './modelStore';
 import { getRequiredProxyPort, listenProxy } from './proxy/listen';
 
 // Dynamic imports (stays require for Electron-specific modules)
@@ -156,40 +179,84 @@ function loadCustomModels(): CustomModel[] {
   }
 
   try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const parsed = JSON.parse(content) as { models?: CustomModel[] };
-    const models = parsed.models || [];
+    const models = readModelConfig(filePath) as CustomModel[];
 
     // Auto-migration check
-    const needsMigration = models.some(
-      (m) =>
-        !m.encrypted &&
-        m.apiKey &&
-        m.apiKey !== 'none' &&
-        !m.apiKey.startsWith('enc:') &&
-        !m.apiKey.startsWith('fallback:'),
+    const unprotected = (value: unknown) => typeof value === 'string' && value && value !== 'none' && !/^(enc:|fallback:|local-gcm:)/.test(value);
+    const needsMigration = models.some((m) =>
+      (!m.encrypted && unprotected(m.apiKey)) ||
+      (!m.encryptedHeaders && Object.values(m.customHeaders || {}).some(unprotected)) ||
+      (!m.encryptedGoogleAccounts && (m.googleAccounts || []).some((account) => [account.accessToken, account.refreshToken, account.clientSecret].some(unprotected))),
     );
     if (needsMigration) {
       log.info('[Proxy] Plaintext custom_models.json detected. Migrating to encrypted format...');
       cryptoStore.backupFile(filePath);
       const encryptedModels = cryptoStore.encryptModels(models);
+      for (const model of encryptedModels) {
+        if (model.customHeaders && !model.encryptedHeaders) {
+          model.customHeaders = Object.fromEntries(Object.entries(model.customHeaders).map(([name, value]) => [name, unprotected(value) ? cryptoStore.encryptString(value) : value]));
+          model.encryptedHeaders = true;
+        }
+        if (model.googleAccounts && !model.encryptedGoogleAccounts) {
+          model.googleAccounts = model.googleAccounts.map((account) => {
+            const encrypted = { ...account };
+            for (const field of ['accessToken', 'refreshToken', 'clientSecret']) if (unprotected(encrypted[field])) encrypted[field] = cryptoStore.encryptString(encrypted[field]);
+            return encrypted;
+          });
+          model.encryptedGoogleAccounts = true;
+        }
+      }
       try {
-        fs.writeFileSync(filePath, JSON.stringify({ models: encryptedModels }, null, 2), 'utf-8');
+        writeJsonAtomic(filePath, { models: encryptedModels });
         log.info('[Proxy] Successfully migrated custom_models.json to encrypted format.');
-        return cryptoStore.decryptModels(encryptedModels);
+        // Continue through validation and enabled filtering below.
       } catch (err) {
         log.error('[Proxy] Failed to write encrypted custom_models.json during migration:', err);
       }
     }
 
     const decrypted = cryptoStore.decryptModels(models) as CustomModel[];
+    for (const model of decrypted) {
+      if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(model.apiKey || '')) {
+        model.enabled = false;
+        log.warn('[Proxy] Skipping a model whose API key could not be decrypted');
+        continue;
+      }
+      if (model.googleAccounts) {
+        model.googleAccounts = model.googleAccounts.flatMap((account) => {
+          const decryptedAccount = { ...account };
+          for (const field of ['accessToken', 'refreshToken', 'clientSecret'] as const) {
+            const value = decryptedAccount[field];
+            if (!value) continue;
+            if (model.encryptedGoogleAccounts) decryptedAccount[field] = cryptoStore.decryptString(value);
+            if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(decryptedAccount[field] || '')) {
+              log.warn('[Proxy] Skipping a Google account whose credentials could not be decrypted');
+              return [];
+            }
+          }
+          return [decryptedAccount];
+        });
+        model.encryptedGoogleAccounts = false;
+      }
+      if (model.encryptedHeaders && model.customHeaders) {
+        model.customHeaders = Object.fromEntries(Object.entries(model.customHeaders).map(([key, value]) => {
+          const decryptedHeader = cryptoStore.decryptString(value);
+          if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(decryptedHeader || '')) {
+            model.enabled = false;
+            log.warn('[Proxy] Skipping a model whose custom header could not be decrypted');
+          }
+          return [key, decryptedHeader];
+        }));
+        model.encryptedHeaders = false;
+      }
+    }
 
     // Validate all models
     const validModels: CustomModel[] = [];
     for (let i = 0; i < decrypted.length; i++) {
       const validation = validateCustomModel(decrypted[i]) as { valid: boolean; error?: string };
       if (validation.valid) {
-        validModels.push(decrypted[i]);
+        if (decrypted[i].enabled !== false) validModels.push(decrypted[i]);
       } else {
         log.warn(`[Proxy] Skipping invalid model at index ${i}: ${validation.error}`);
       }
@@ -359,340 +426,8 @@ function downloadFileContent(url: string, authHeader: string): Promise<string> {
 
 // ─── Custom Model Request Handler ─────────────────────────────────────────
 
-/**
- * Parses the Retry-After header from upstream responses (RFC 7231 §7.1.3).
- * Returns delay in milliseconds, or 0 if no valid header is present.
- */
-function parseRetryAfter(headers: Record<string, string | string[] | undefined>): number {
-  const val = headers['retry-after'];
-  if (!val) return 0;
-
-  const raw = Array.isArray(val) ? val[0] : val;
-  if (!raw) return 0;
-
-  // Try delta-seconds (e.g. "120")
-  const seconds = parseInt(raw.trim(), 10);
-  if (!isNaN(seconds) && seconds >= 0) {
-    return seconds * 1000;
-  }
-
-  // Try HTTP-date (e.g. "Wed, 21 Oct 2015 07:28:00 GMT")
-  const date = new Date(raw);
-  if (!isNaN(date.getTime())) {
-    const delay = date.getTime() - Date.now();
-    return delay > 0 ? delay : 0;
-  }
-
-  return 0;
-}
-
-function handleCustomModelRequest(
-  res: http.ServerResponse,
-  model: CustomModel,
-  geminiBody: GeminiRequestBody,
-  isStream: boolean,
-  retryCount = 0,
-): void {
-  // P3-18: Configurable max retries per model (default 3, min 0, max 5)
-  const MAX_RETRIES = Math.min(Math.max(model.maxRetries ?? 3, 0), 5);
-  // For streaming & thinking models, allow up to 15 minutes by default; for non-streaming 2 minutes
-  const REQUEST_TIMEOUT_MS = model.timeout || (isStream ? 900_000 : 120_000);
-
-  const provider = model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
-
-  const payload = registry.translateRequest(provider, geminiBody, model.externalModelName);
-  const headers = registry.getProviderHeaders(provider, model.apiKey);
-
-  if (isStream && registry.supportsStreaming(provider)) {
-    // Only OpenAI-compatible providers expect "stream: true" inside JSON payload.
-    // Google AI Studio native endpoints reject "stream" field (streaming is determined by :streamGenerateContent URL method).
-    if (provider !== "google") {
-      (payload as Record<string, unknown>).stream = true;
-    }
-  }
-
-  let finalUrlStr = model.apiUrl;
-  // P3-15: Google AI Studio uses dynamic URL construction for streaming vs non-streaming
-  // P3-16: Ollama uses URL normalization for default port and endpoint
-  if (provider === 'google' || provider === 'ollama') {
-    const providerTranslator = registry.getTranslator(provider);
-    finalUrlStr = registry.getProviderUrl(finalUrlStr, model.externalModelName, isStream, providerTranslator);
-  } else if (provider === 'openai' || model.provider === 'custom' || model.provider === 'openrouter') {
-    const urlLower = finalUrlStr.toLowerCase();
-    if (!urlLower.includes('/chat/completions') && !urlLower.includes('/completions')) {
-      if (finalUrlStr.endsWith('/v1')) {
-        finalUrlStr += '/chat/completions';
-      } else if (!finalUrlStr.endsWith('/')) {
-        finalUrlStr += '/v1/chat/completions';
-      } else {
-        finalUrlStr += 'v1/chat/completions';
-      }
-    }
-  }
-  const url = new URL(finalUrlStr);
-  const client = url.protocol === 'https:' ? https : http;
-
-  const options: https.RequestOptions = {
-    method: 'POST',
-    headers: headers as Record<string, string>,
-  };
-
-  // P0-2: SSL bypass ONLY when user explicitly opts in via allowUnauthorized.
-  // Custom providers no longer bypass SSL automatically.
-  if (model.allowUnauthorized) {
-    log.warn(
-      `[Proxy] SSL verification DISABLED for ${model.name} (allowUnauthorized=true). Connection is vulnerable to MITM.`,
-    );
-    (options as Record<string, unknown>).rejectUnauthorized = false;
-  }
-
-  log.info(
-    `[Proxy] Routing ${model.name} to ${model.provider} (${model.apiUrl}) (isStream: ${!!isStream})${retryCount > 0 ? ` (retry ${retryCount})` : ''}`,
-  );
-
-  const request = client.request(url, options, (apiRes) => {
-    apiRes.on('error', (err) => {
-      log.error(`[Proxy] Upstream stream error for ${model.name}:`, err.message);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Upstream connection error: ' + err.message } }));
-      } else {
-        res.end();
-      }
-    });
-
-    if (isStream) {
-      // Check for API errors BEFORE writing streaming headers
-      if (apiRes.statusCode! >= 400) {
-        let errorBody = '';
-        apiRes.on('data', (chunk: Buffer) => errorBody += chunk.toString());
-        apiRes.on('end', () => {
-          log.error(`[Proxy] Stream API error (${apiRes.statusCode}) for ${model.name}: ${errorBody.substring(0, 300)}`);
-          if (retryCount < MAX_RETRIES) {
-            log.warn(`[Proxy] Stream error, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), 1000 * (retryCount + 1));
-            return;
-          }
-          res.writeHead(apiRes.statusCode!, { 'Content-Type': 'application/json' });
-          res.end(errorBody);
-        });
-        return;
-      }
-
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
-
-      let buffer = '';
-      apiRes.on('data', (chunk: Buffer) => {
-        request.setTimeout(REQUEST_TIMEOUT_MS);
-        buffer += chunk.toString('utf-8');
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          if (trimmed.startsWith('data: ')) {
-            const dataStr = trimmed.substring(6).trim();
-            if (dataStr === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(dataStr);
-              const mapped = registry.translateStreamChunk(provider, parsed, model.name);
-
-              if (mapped) {
-                const cloudCodeResponse = {
-                  response: { candidates: [mapped] },
-                  traceId: '',
-                  metadata: {},
-                };
-                res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
-              }
-            } catch (err) {
-              // Partial/invalid JSON chunks are normal during streaming; debug-level only
-              log.debug(`[Proxy] Stream chunk parse warning for ${model.name}:`, (err as Error).message);
-            }
-          }
-        }
-      });
-
-      apiRes.on('end', () => {
-        if (buffer.trim().startsWith('data: ')) {
-          const dataStr = buffer.trim().substring(6).trim();
-          if (dataStr !== '[DONE]') {
-            try {
-              const parsed = JSON.parse(dataStr);
-              const mapped = registry.translateStreamChunk(provider, parsed, model.name);
-              if (mapped) {
-                const cloudCodeResponse = {
-                  response: { candidates: [mapped] },
-                  traceId: '',
-                  metadata: {},
-                };
-                res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
-              }
-            } catch (e) {
-              log.debug(`[Proxy] Stream buffer drain parse warning for ${model.name}:`, (e as Error).message);
-            }
-          }
-        }
-
-        const finalChunk = {
-          response: {
-            candidates: [
-              {
-                content: { parts: [], role: 'model' },
-                finishReason: 'STOP',
-                index: 0,
-              },
-            ],
-          },
-          traceId: '',
-          metadata: {},
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-        res.end();
-      });
-    } else {
-      let body = '';
-      apiRes.on('data', (chunk: Buffer) => (body += chunk));
-      apiRes.on('end', () => {
-        // Retry on 5xx with exponential backoff
-        if (apiRes.statusCode! >= 500 && apiRes.statusCode! < 600 && retryCount < MAX_RETRIES) {
-          const retryAfter = parseRetryAfter(apiRes.headers);
-          const delay = retryAfter > 0 ? retryAfter : 1000 * Math.pow(2, retryCount);
-          log.warn(
-            `[Proxy] Server error ${apiRes.statusCode} for ${model.name}, retrying in ${delay}ms (${retryCount + 1}/${MAX_RETRIES})...`,
-          );
-          setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), delay);
-          return;
-        }
-
-        // Retry on 429 with Retry-After header support + exponential backoff
-        if (apiRes.statusCode === 429 && retryCount < MAX_RETRIES) {
-          const retryAfter = parseRetryAfter(apiRes.headers);
-          const delay = retryAfter > 0 ? retryAfter : 2000 * Math.pow(2, retryCount);
-          log.warn(
-            `[Proxy] Rate limited (429) for ${model.name}, retrying in ${delay}ms (${retryCount + 1}/${MAX_RETRIES})...`,
-          );
-          setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1), delay);
-          return;
-        }
-
-        if (apiRes.statusCode! >= 400) {
-          // P0-3: Only log status code and model name, NOT response body content
-          log.error(`[Proxy] API error (${apiRes.statusCode}) for ${model.name}`);
-          res.writeHead(apiRes.statusCode!, { 'Content-Type': 'application/json' });
-          res.end(body);
-          return;
-        }
-
-        try {
-          const parsed = JSON.parse(body) as Record<string, unknown>;
-
-          const reasoning =
-            (parsed as { choices?: { message?: { reasoning_content?: string; reasoning?: string } }[] }).choices?.[0]
-              ?.message?.reasoning_content ||
-            (parsed as { choices?: { message?: { reasoning_content?: string; reasoning?: string } }[] }).choices?.[0]
-              ?.message?.reasoning;
-          if (reasoning) {
-            modelReasoningContent.set(model.name, reasoning);
-            touchStateTimestamp(stateTimestamps.reasoning, model.name);
-          }
-
-          const providerForResponse =
-            model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
-          const mapped = registry.translateResponse(providerForResponse, parsed, model.name);
-
-          const cloudCodeResponse = {
-            response: mapped,
-            traceId: '',
-            metadata: {},
-          };
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(cloudCodeResponse));
-        } catch (e) {
-          log.error('[Proxy] Failed to map response:', e);
-
-          if (retryCount < MAX_RETRIES) {
-            log.warn(`[Proxy] Parse error for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            setTimeout(
-              () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1),
-              1000 * (retryCount + 1),
-            );
-            return;
-          }
-
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'Failed to translate model response' } }));
-        }
-      });
-    }
-  });
-
-  request.setTimeout(REQUEST_TIMEOUT_MS, () => {
-    log.error(`[Proxy] Request timeout (${REQUEST_TIMEOUT_MS}ms) for ${model.name}`);
-    request.destroy();
-
-    if (retryCount < MAX_RETRIES) {
-      log.warn(`[Proxy] Timeout for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-      setTimeout(
-        () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1),
-        1000 * (retryCount + 1),
-      );
-      return;
-    }
-
-    if (!res.headersSent) {
-      res.writeHead(504, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `Request timeout after ${REQUEST_TIMEOUT_MS / 1000}s` } }));
-    }
-  });
-
-  request.on('error', (err) => {
-    log.error('[Proxy] Custom Model Request Error:', err);
-
-    if (retryCount < MAX_RETRIES) {
-      log.warn(`[Proxy] Network error for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-      setTimeout(
-        () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1),
-        1000 * (retryCount + 1),
-      );
-      return;
-    }
-
-    if (isStream) {
-      if (!res.headersSent) {
-        const errResponse = {
-          response: {
-            candidates: [
-              {
-                content: { parts: [{ text: 'Network error: ' + err.message }], role: 'model' },
-                finishReason: 'STOP',
-                index: 0,
-              },
-            ],
-          },
-          traceId: '',
-          metadata: {},
-        };
-        res.write('data: ' + JSON.stringify(errResponse) + '\n\n');
-      }
-      res.end();
-    } else {
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Custom model request failed: ' + err.message } }));
-      }
-    }
-  });
-
-  request.write(JSON.stringify(payload));
-  request.end();
+function handleCustomModelRequest(res: http.ServerResponse, model: CustomModel, body: GeminiRequestBody, isStream: boolean, cloudEnvelope = true): void {
+  void runCustomModelRequest(res, model, body as import('./proxy/requestOptions').GeminiBody, isStream, loadCustomModels(), cloudEnvelope);
 }
 
 // ─── Protobuf Utilities ────────────────────────────────────────────────────
@@ -930,7 +665,15 @@ function handleGetAvailableModelsProxy(
   reqBody: Buffer,
   lsUrl: string,
 ): void {
-  const lsParsed = new URL(lsUrl);
+  let lsParsed: URL;
+  try {
+    lsParsed = new URL(lsUrl);
+    if (!['http:', 'https:'].includes(lsParsed.protocol)) throw new Error('Invalid protocol');
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'Invalid language server URL' } }));
+    return;
+  }
   const client = lsParsed.protocol === 'https:' ? https : http;
 
   const options: https.RequestOptions = {
@@ -1005,9 +748,19 @@ function handleGetAvailableModelsProxy(
 // ─── Main Request Handler ─────────────────────────────────────────────────
 
 function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-  req.url = req.url!.replace(/^.*\/dummy_path_padding/, '');
-  // Strip binary patch padding (from LS hostname replacement)
-  req.url = req.url!.replace(/\/v1internal\/x{7}/, '');
+  let requestUrl: URL;
+  try {
+    req.url = (req.url || '/').replace(/^.*\/dummy_path_padding/, '');
+    // Strip binary patch padding (from LS hostname replacement)
+    req.url = req.url.replace(/\/v1internal\/x{7}/, '');
+    // This listener routes fixed upstreams; authority-form targets must never replace them.
+    if (!req.url.startsWith('/') || /^[\\/]{2}/.test(req.url)) throw new Error('Invalid target');
+    requestUrl = new URL(req.url, 'http://localhost');
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'Invalid request target' } }));
+    return;
+  }
 
   // Health check
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/healthz')) {
@@ -1032,6 +785,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         timestamp: new Date().toISOString(),
       }),
     );
+    return;
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/metrics') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(getProxyMetrics()));
     return;
   }
 
@@ -1111,8 +870,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               const slug = toSlug(m);
               mappedCustom[slug] = {
                 displayName: m.displayName,
-                maxTokens: 1048576,
-                maxOutputTokens: 4096,
+                maxTokens: detectModelCapabilities(m).maxTokens,
+                maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
                 model: generateModelPlaceholderId(m),
                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
@@ -1247,8 +1006,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                 const entry = {
                   displayName: m.displayName,
                   recommended: true,
-                  maxTokens: 1048576,
-                  maxOutputTokens: 4096,
+                  maxTokens: detectModelCapabilities(m).maxTokens,
+                  maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
                   tokenizerType: 'LLAMA_WITH_SPECIAL',
                   model: placeholderId,
                   apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
@@ -1294,8 +1053,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               const placeholderId = generateModelPlaceholderId(m);
               const entry = {
                 displayName: m.displayName,
-                maxTokens: 1048576,
-                maxOutputTokens: 4096,
+                maxTokens: detectModelCapabilities(m).maxTokens,
+                maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
                 model: placeholderId,
                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
@@ -1320,8 +1079,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           const placeholderId = generateModelPlaceholderId(m);
           const entry = {
             displayName: m.displayName,
-            maxTokens: 1048576,
-            maxOutputTokens: 4096,
+            maxTokens: detectModelCapabilities(m).maxTokens,
+            maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
             model: placeholderId,
             apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
             modelProvider: 'MODEL_PROVIDER_GOOGLE',
@@ -1390,8 +1149,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               version: '1.0',
               displayName: m.displayName,
               description: m.description,
-              inputTokenLimit: 1048576,
-              outputTokenLimit: 4096,
+              inputTokenLimit: detectModelCapabilities(m).maxTokens,
+              outputTokenLimit: detectModelCapabilities(m).maxOutputTokens,
               supportedGenerationMethods: ['generateContent', 'countTokens'],
               temperature: 0.7,
               topP: 0.9,
@@ -1414,8 +1173,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               version: '1.0',
               displayName: m.displayName,
               description: m.description,
-              inputTokenLimit: 1048576,
-              outputTokenLimit: 4096,
+              inputTokenLimit: detectModelCapabilities(m).maxTokens,
+              outputTokenLimit: detectModelCapabilities(m).maxOutputTokens,
               supportedGenerationMethods: ['generateContent', 'countTokens'],
             }));
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1477,7 +1236,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               `[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`,
             );
             const isStream = req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse');
-            const actualGeminiBody = (reqJson.request || reqJson) as GeminiRequestBody;
+            const actualGeminiBody = { ...(reqJson.request || reqJson) as GeminiRequestBody };
+            if (typeof reqJson.sessionId === 'string') actualGeminiBody.sessionId = reqJson.sessionId;
+            if (typeof reqJson.conversationId === 'string') actualGeminiBody.conversationId = reqJson.conversationId;
             // Resolve fileData URIs then route to translator
             resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
               handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream);
@@ -1498,7 +1259,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     const isStandardStream = !!streamMatch;
 
     if (req.method === 'POST' && (isGenerate || isStandardStream)) {
-      const matchedModelName = isGenerate ? generateMatch![1] : streamMatch![1];
+      let matchedModelName: string;
+      try { matchedModelName = decodeURIComponent(isGenerate ? generateMatch![1] : streamMatch![1]); }
+      catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid model URL encoding' } }));
+        return;
+      }
       const customModels = loadCustomModels();
       const matchedCustomModel = customModels.find((m) => {
         const enumName = generateModelPlaceholderId(m);
@@ -1515,7 +1282,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         try {
           const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
           resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream);
+            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false);
           });
           return;
         } catch (e) {
@@ -1574,6 +1341,7 @@ export function stopProxy(): Promise<void> {
       }
     }
     stopCleanupInterval();
+    stopCustomRequests();
     if (server) {
       const closingServer = server;
       await new Promise<void>((resolve) => closingServer.close(() => resolve()));

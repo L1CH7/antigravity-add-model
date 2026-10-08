@@ -11,6 +11,7 @@ import {
   formatTranslatedResponse,
   normalizeToolArgs,
   ToolCallArgs,
+  ToolSchemas,
 } from './utils';
 import {
   modelToolCallIds,
@@ -32,6 +33,7 @@ interface GeminiFunctionDeclaration {
   name: string;
   description?: string;
   parameters?: GeminiParameters;
+  parametersJsonSchema?: Record<string, unknown>;
 }
 
 interface GeminiParameters {
@@ -154,8 +156,9 @@ function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[] {
   for (const toolGroup of geminiTools) {
     if (toolGroup.functionDeclarations && Array.isArray(toolGroup.functionDeclarations)) {
       for (const func of toolGroup.functionDeclarations) {
-        const params = func.parameters
-          ? (JSON.parse(JSON.stringify(func.parameters)) as Record<string, unknown>)
+        const declaration = func.parametersJsonSchema ?? func.parameters;
+        const params = declaration
+          ? (JSON.parse(JSON.stringify(declaration)) as Record<string, unknown>)
           : { type: 'OBJECT', properties: {} };
         if (params.type && typeof params.type === 'string') {
           (params as Record<string, string>).type = (params.type as string).toLowerCase();
@@ -174,8 +177,21 @@ function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[] {
   return anthropicTools;
 }
 
-export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string): AnthropicRequestBody {
+export function mapGeminiToAnthropic(
+  geminiBody: GeminiRequestBody,
+  modelName: string,
+  stateKey = modelName,
+): AnthropicRequestBody {
   const messages: AnthropicMessage[] = [];
+  const historyCallIds = new Map<string, string[]>();
+  const pendingToolResults: AnthropicContentBlock[] = [];
+  const pendingToolResponseTexts: AnthropicContentBlock[] = [];
+  const flushToolResults = () => {
+    if (!pendingToolResults.length) return;
+    messages.push({ role: 'user', content: [...pendingToolResults, ...pendingToolResponseTexts] });
+    pendingToolResults.length = 0;
+    pendingToolResponseTexts.length = 0;
+  };
   let system: string | undefined = undefined;
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
@@ -187,6 +203,7 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
       if (item.parts) {
         const hasFunctionCall = item.parts.some((p) => p.functionCall);
         const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+        if (!hasFunctionResponse) flushToolResults();
 
         if (hasFunctionCall && item.role === 'model') {
           const contentBlocks: AnthropicContentBlock[] = [];
@@ -194,6 +211,9 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
             if (p.text) contentBlocks.push({ type: 'text', text: p.text });
             if (p.functionCall) {
               const callId = p.functionCall.id || 'call_' + Math.random().toString(36).slice(2, 10);
+              const ids = historyCallIds.get(p.functionCall.name) || [];
+              ids.push(callId);
+              historyCallIds.set(p.functionCall.name, ids);
               let originalName = p.functionCall.name;
               let originalArgs = p.functionCall.args;
               const translatedInfo = translatedToolCalls.get(callId);
@@ -214,12 +234,17 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
           }
           messages.push({ role: 'assistant', content: contentBlocks });
         } else if (hasFunctionResponse) {
-          const contentBlocks: AnthropicContentBlock[] = [];
           for (const p of item.parts) {
+            if (p.text && !p.thought) pendingToolResponseTexts.push({ type: 'text', text: p.text });
             if (p.functionResponse) {
               const funcName = p.functionResponse.name || '';
-              const modelTCIds = modelToolCallIds.get(modelName) || {};
-              const toolCallId = p.functionResponse.id || modelTCIds[funcName] || 'call_' + funcName;
+              const modelTCIds = modelToolCallIds.get(stateKey) || {};
+              const ids = historyCallIds.get(funcName) || [];
+              const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+              if (p.functionResponse.id) {
+                const matched = ids.indexOf(p.functionResponse.id);
+                if (matched >= 0) ids.splice(matched, 1);
+              }
               const responseData = p.functionResponse.response;
               let contentStr = '';
               const translatedInfo = translatedToolCalls.get(toolCallId);
@@ -228,23 +253,40 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
               } else {
                 contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
               }
-              contentBlocks.push({
+              pendingToolResults.push({
                 type: 'tool_result',
                 tool_use_id: toolCallId,
                 content: contentStr,
               });
             }
           }
-          messages.push({ role: 'user', content: contentBlocks });
         } else {
           const roleStr = item.role === 'model' ? 'assistant' : item.role || 'user';
           let content = '';
           if (item.parts) {
             const partsContent: string[] = [];
             for (const p of item.parts) {
-              if (p.text) { partsContent.push(p.text); }
-              else if ((p as any).fileData) { const fd = (p as any).fileData; try { const url = new URL(fd.fileUri); if (url.protocol === 'file:') { const fs = require('fs'); partsContent.push(`[File:\n${fs.readFileSync(url.pathname.replace(/^\//, '').replace(/\//g, path.sep), 'utf-8')}\n]`); } else { partsContent.push(`[File: ${fd.fileUri} (${fd.mimeType})]`); } } catch { partsContent.push(`[File: ${fd.fileUri} (${fd.mimeType})]`); } }
-              else if ((p as any).inlineData) { const id = (p as any).inlineData; partsContent.push(`[${id.mimeType}: ${id.data}]`); }
+              if (p.text) {
+                partsContent.push(p.text);
+              } else if ((p as any).fileData) {
+                const fd = (p as any).fileData;
+                try {
+                  const url = new URL(fd.fileUri);
+                  if (url.protocol === 'file:') {
+                    const fs = require('fs');
+                    partsContent.push(
+                      `[File:\n${fs.readFileSync(url.pathname.replace(/^\//, '').replace(/\//g, path.sep), 'utf-8')}\n]`,
+                    );
+                  } else {
+                    partsContent.push(`[File: ${fd.fileUri} (${fd.mimeType})]`);
+                  }
+                } catch {
+                  partsContent.push(`[File: ${fd.fileUri} (${fd.mimeType})]`);
+                }
+              } else if ((p as any).inlineData) {
+                const id = (p as any).inlineData;
+                partsContent.push(`[${id.mimeType}: ${id.data}]`);
+              }
             }
             content = partsContent.join('\n');
           }
@@ -257,6 +299,8 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
       }
     }
   }
+  // Anthropic requires tool results before text, even when Gemini splits the results across items.
+  flushToolResults();
 
   const result: AnthropicRequestBody = {
     model: modelName,
@@ -282,7 +326,11 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
 
 // ─── RESPONSE: Anthropic → Gemini ─────────────────────────────────────────
 
-export function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: string): GeminiGenerateContentResponse {
+export function mapAnthropicToGemini(
+  anthRes: AnthropicResponse,
+  modelName: string,
+  toolSchemas?: ToolSchemas,
+): GeminiGenerateContentResponse {
   const contentBlocks = anthRes.content || [];
   const parts: GeminiPart[] = [];
   const functionCalls: GeminiPart[] = [];
@@ -298,10 +346,10 @@ export function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: stri
       modelToolCallIds.set(modelName, modelTCIds);
       touchStateTimestamp(stateTimestamps.toolCallIds, modelName);
 
-      const normalizedInput = normalizeToolArgs(block.name || '', block.input || {});
-      const translated = translateToolCallToNative(block.name || '', normalizedInput);
+      const normalizedInput = normalizeToolArgs(block.name || '', block.input || {}, toolSchemas);
+      const translated = translateToolCallToNative(block.name || '', normalizedInput, toolSchemas);
       if (translated.name !== block.name) {
-        translated.args = normalizeToolArgs(translated.name, translated.args) as Record<string, unknown>;
+        translated.args = normalizeToolArgs(translated.name, translated.args, toolSchemas) as Record<string, unknown>;
         translatedToolCalls.set(block.id || '', {
           originalName: block.name || '',
           translatedName: translated.name,
@@ -345,9 +393,14 @@ export function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: stri
 
 // ─── STREAM CHUNK: Anthropic SSE → Gemini ─────────────────────────────────
 
-export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: string): GeminiCandidate | null {
+export function mapAnthropicChunkToGemini(
+  chunk: AnthropicResponse,
+  modelName: string,
+  streamKey?: string,
+  toolSchemas?: ToolSchemas,
+): GeminiCandidate | null {
   const type = chunk.type;
-  const streamId = chunk.message?.id || 'anthropic_stream';
+  const streamId = streamKey || chunk.message?.id || 'anthropic_stream';
 
   if (!activeStreamContexts.has(streamId)) {
     activeStreamContexts.set(streamId, { accumulatedText: '', accumulatedReasoning: '', toolCalls: {} });
@@ -359,7 +412,11 @@ export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: s
     const block = chunk.content_block;
     const idx = chunk.index ?? 0;
     if (block?.type === 'tool_use') {
-      context.toolCalls[idx] = { id: block.id || '', name: block.name || '', arguments: '' };
+      context.toolCalls[idx] = {
+        id: block.id || '',
+        name: block.name || '',
+        arguments: block.input && Object.keys(block.input).length ? JSON.stringify(block.input) : '',
+      };
     }
   }
 
@@ -378,7 +435,7 @@ export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: s
         finishReason: 'OTHER',
         index: 0,
       };
-    } else if (delta?.type === 'input_delta') {
+    } else if (delta?.type === 'input_json_delta' || delta?.type === 'input_delta') {
       if (context.toolCalls[idx]) {
         context.toolCalls[idx].arguments += delta.partial_json || '';
       }
@@ -391,17 +448,17 @@ export function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: s
       const parts: GeminiPart[] = Object.values(context.toolCalls).map((tc) => {
         let args: ToolCallArgs = {};
         try {
-          args = JSON.parse(tc.arguments);
+          args = JSON.parse(tc.arguments || '{}');
         } catch (e) {
           log.debug('[Anthropic] Stream tool args parse fallback:', (e as Error).message);
           args = {};
         }
-        args = normalizeToolArgs(tc.name, args) as ToolCallArgs;
+        args = normalizeToolArgs(tc.name, args, toolSchemas) as ToolCallArgs;
         const modelTCIds = modelToolCallIds.get(modelName) || {};
         modelTCIds[tc.name] = tc.id;
         modelToolCallIds.set(modelName, modelTCIds);
         touchStateTimestamp(stateTimestamps.toolCallIds, modelName);
-        const translated = translateToolCallToNative(tc.name, args);
+        const translated = translateToolCallToNative(tc.name, args, toolSchemas);
         if (translated.name !== tc.name) {
           translatedToolCalls.set(tc.id, {
             originalName: tc.name,

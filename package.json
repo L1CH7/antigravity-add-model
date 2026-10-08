@@ -22,7 +22,16 @@
     "lint:fix": "npx eslint src/**/*.ts --fix",
     "format": "npx prettier --write \"src/**/*.ts\"",
     "format:check": "npx prettier --check \"src/**/*.ts\"",
-    "clean": "npx tsc --build --clean"
+    "clean": "npx tsc --build --clean",
+    "gateway:install": "npm --prefix gateway ci --ignore-scripts",
+    "gateway:build": "npm --prefix gateway run build",
+    "gateway:test": "npm --prefix gateway test",
+    "gateway": "node scripts/gateway.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "doctor:repair": "node scripts/deploy.mjs",
+    "patch:check": "node scripts/deploy.mjs --check",
+    "patch:restore": "node scripts/deploy.mjs --restore",
+    "test:integration": "node scripts/integration-smoke.mjs"
   },
   "dependencies": {
     "chrome-devtools-mcp": "^0.23.0",
@@ -37,6 +46,7 @@
     "@typescript-eslint/parser": "^8.44.1",
     "eslint": "^9.33.0",
     "eslint-config-prettier": "^10.1.8",
+    "jsdom": "^29.1.1",
     "prettier": "^3.6.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.7"

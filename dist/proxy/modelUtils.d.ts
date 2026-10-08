@@ -7,6 +7,10 @@ export interface CustomModelConfig {
     provider: string;
     externalModelName?: string;
     displayName?: string;
+    contextWindow?: number;
+    maxOutputTokens?: number;
+    supportsVision?: boolean;
+    supportsThinking?: boolean;
 }
 export interface ModelCapabilities {
     isThinking: boolean;

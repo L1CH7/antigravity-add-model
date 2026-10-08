@@ -1,3 +1,4 @@
+import { ToolSchemas } from './utils';
 interface GeminiTool {
     functionDeclarations?: GeminiFunctionDeclaration[];
 }
@@ -5,6 +6,7 @@ interface GeminiFunctionDeclaration {
     name: string;
     description?: string;
     parameters?: GeminiParameters;
+    parametersJsonSchema?: Record<string, unknown>;
 }
 interface GeminiParameters {
     type: string;
@@ -108,8 +110,8 @@ interface GeminiUsageMetadata {
     totalTokenCount: number;
 }
 declare function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[];
-export declare function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string): AnthropicRequestBody;
-export declare function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: string): GeminiGenerateContentResponse;
-export declare function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: string): GeminiCandidate | null;
+export declare function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string, stateKey?: string): AnthropicRequestBody;
+export declare function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: string, toolSchemas?: ToolSchemas): GeminiGenerateContentResponse;
+export declare function mapAnthropicChunkToGemini(chunk: AnthropicResponse, modelName: string, streamKey?: string, toolSchemas?: ToolSchemas): GeminiCandidate | null;
 export { mapGeminiToolsToAnthropic };
 //# sourceMappingURL=anthropic.d.ts.map

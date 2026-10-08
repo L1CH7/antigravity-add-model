@@ -6,7 +6,6 @@
  * parsing and proper endpoint URL handling.
  */
 
-import log from 'electron-log';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -59,12 +58,15 @@ interface GeminiRequestBody {
  * Google AI Studio uses the same Gemini format — just pass through.
  * The caller handles URL routing (streamGenerateContent vs generateContent).
  */
-export function mapGeminiToGoogle(geminiBody: GeminiRequestBody, modelName: string): GeminiRequestBody {
-  // Ensure the external model name is set
-  const body: GeminiRequestBody = { ...geminiBody };
-  if (modelName && !body.model) {
-    body.model = modelName;
-  }
+export function mapGeminiToGoogle(geminiBody: GeminiRequestBody, _modelName: string): GeminiRequestBody {
+  // Native Gemini identifies the model and streaming method in the URL.
+  const body = { ...geminiBody } as GeminiRequestBody & { stream?: boolean; model_id?: string; sessionId?: string; conversationId?: string };
+  delete body.model;
+  delete body.modelId;
+  delete body.model_id;
+  delete body.stream;
+  delete body.sessionId;
+  delete body.conversationId;
   return body;
 }
 
@@ -136,30 +138,17 @@ export function mapGoogleChunkToGemini(chunk: unknown, _modelName: string): Gemi
  * If the user's URL already contains one of these endpoints, it's kept as-is.
  */
 export function getGoogleApiUrl(baseUrl: string, modelName: string, isStream: boolean): string {
-  let url = baseUrl;
-
-  // If the URL doesn't already specify a method, append one
-  if (!url.includes(':generateContent') && !url.includes(':streamGenerateContent')) {
-    // Strip trailing slash if present
-    url = url.replace(/\/$/, '');
-
-    // Check if the URL ends with the model path (e.g. /models/gemini-1.5-pro)
-    const modelPathPattern = /\/models\/([^\/]+)$/;
-    const modelMatch = modelPathPattern.exec(url);
-
-    if (modelMatch) {
-      // URL like .../v1beta/models/gemini-1.5-pro → append :method
-      const method = isStream ? ':streamGenerateContent' : ':generateContent';
-      url += method;
-    } else if (modelName) {
-      // Append full path with model name
-      const method = isStream ? ':streamGenerateContent' : ':generateContent';
-      url += `/models/${modelName}${method}`; // Added leading slash to prevent /v1betamodels 404
-    } else {
-      // Fallback: assume the URL is already complete
-      log.warn('[GoogleTranslator] Could not determine model name for URL construction');
-    }
-  }
-
-  return url;
+  const url = new URL(baseUrl);
+  let pathname = url.pathname.replace(/\/+$/, '').replace(/:(?:streamGenerateContent|generateContent)$/, '');
+  const modelsIndex = pathname.lastIndexOf('/models/');
+  const existingModel = modelsIndex >= 0 ? pathname.slice(modelsIndex + 8) : '';
+  const chosenModel = (modelName || '').replace(/^models\//, '') || decodeURIComponent(existingModel);
+  if (!chosenModel) throw new Error('Google endpoint requires a model name');
+  if (modelsIndex >= 0) pathname = pathname.slice(0, modelsIndex);
+  else if (pathname.endsWith('/models')) pathname = pathname.slice(0, -7);
+  if (!pathname) pathname = '/v1beta';
+  url.pathname = `${pathname}/models/${encodeURIComponent(chosenModel)}:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
+  if (isStream) url.searchParams.set('alt', 'sse');
+  else if (url.searchParams.get('alt') === 'sse') url.searchParams.delete('alt');
+  return url.toString();
 }

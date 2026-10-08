@@ -125,5 +125,6 @@ declare global {
         wsl: WslAPI;
     }
 }
+import './customPreload';
 export {};
 //# sourceMappingURL=preload.d.ts.map

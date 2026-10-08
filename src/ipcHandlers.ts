@@ -8,8 +8,7 @@ import { extensionAuthorities } from './customScheme';
 import { updateTrayAgentCount } from './tray';
 import { StorageManager } from './storage';
 import { getIdeInstallPath } from './ideInstall/constants';
-import { setupCustomModelIpc, CustomModelFileEntry, TestModelParams, ConnectionTestResult } from './customModelIpc';
-export { CustomModelFileEntry, TestModelParams, ConnectionTestResult };
+import { registerCustomModelHandlers } from './customIpc';
 
 /**
  * Registers all IPC handlers for the main process.
@@ -104,12 +103,7 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   ipcMain.handle('storage:get-items', async () => {
     return storageManager.getItems();
   });
-  ipcMain.handle('storage:update-items', async (_event, changes: Record<string, string | null>) => {
-    await storageManager.updateItems(changes);
-  });
-
-  // Custom Models
-  setupCustomModelIpc(ipcMain);
+  registerCustomModelHandlers();
 
   // Logs
   ipcMain.handle('logs:electron', async () => {

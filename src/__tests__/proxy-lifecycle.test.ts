@@ -3,6 +3,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
+import * as http from 'node:http';
+import * as net from 'node:net';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { getRequiredProxyPort, listenProxy } from '../proxy/listen';
@@ -56,7 +58,7 @@ function fixture(fixed = true) {
   const directory = fs.mkdtempSync(path.join(tmpdir(), 'agy-proxy-lifecycle-'));
   if (fixed) fs.writeFileSync(path.join(directory, 'antigravity-proxy.json'), '{"requiredPort":50999}');
   const servers: FakeServer[] = [];
-  const createServer = vi.fn(() => {
+  const createServer = vi.fn((_listener: http.RequestListener) => {
     const server = new FakeServer();
     servers.push(server);
     return server;
@@ -70,9 +72,17 @@ function fixture(fixed = true) {
     path,
     electron: { app: { getAppPath: () => directory } },
     'electron-log': { info: vi.fn(), error: vi.fn() },
-    './proxy/shared': { startCleanupInterval, stopCleanupInterval },
+    './proxy/shared': {
+      startCleanupInterval,
+      stopCleanupInterval,
+      activeStreamContexts: new Map(),
+      modelToolCallIds: new Map(),
+      translatedToolCalls: new Map(),
+      modelReasoningContent: new Map(),
+    },
     './proxy/modelUtils': {},
-    './proxy/registry': {},
+    './proxy/customRequest': { stopCustomRequests: vi.fn(), getProxyMetrics: () => ({ requests: 0 }) },
+    './modelStore': {},
     './cryptoStore': {},
     // These are the production marker parser and listener, with only the socket mocked.
     './proxy/listen': { getRequiredProxyPort, listenProxy },
@@ -86,12 +96,58 @@ function fixture(fixed = true) {
       return dependencies[id];
     },
     console,
+    URL,
+    Buffer,
+    process,
   });
   fixtures.push({ module: module.exports, directory, servers });
   return { ...module.exports, servers, createServer, startCleanupInterval, stopCleanupInterval };
 }
 
 describe('proxy lifecycle across language-server restarts', () => {
+  it('rejects malformed request and language-server targets without losing its HTTP listener', async () => {
+    const proxy = fixture();
+    const started = proxy.startProxy();
+    proxy.servers[0].ready();
+    await started;
+    const server = http.createServer(proxy.createServer.mock.calls[0][0]);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as net.AddressInfo).port;
+    const rawRequest = (target: string) =>
+      new Promise<string>((resolve, reject) => {
+        const socket = net.connect(port, '127.0.0.1', () => {
+          socket.write(`GET ${target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`);
+        });
+        let response = '';
+        socket.setEncoding('utf8');
+        socket.setTimeout(2000, () => socket.destroy(new Error('HTTP response timed out')));
+        socket.on('data', (chunk) => {
+          response += chunk;
+        });
+        socket.on('end', () => resolve(response));
+        socket.on('error', reject);
+      });
+    try {
+      for (const target of [
+        '//[',
+        '//example.invalid/',
+        '/\\example.invalid/',
+        'http://example.invalid/',
+        '/GetAvailableModels?ls=%2F%2F%5B',
+        '/GetAvailableModels?ls=file%3A%2F%2F%2Ftmp',
+      ]) {
+        expect(await rawRequest(target)).toMatch(/^HTTP\/1\.1 400 /);
+      }
+      expect(await rawRequest('/health')).toMatch(/^HTTP\/1\.1 200 /);
+      const metrics = await rawRequest('/metrics?check=1');
+      expect(metrics).toMatch(/^HTTP\/1\.1 200 /);
+      expect(metrics).toContain('"requests":0');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it('reuses its existing listener when the fixed-port language server restarts', async () => {
     const proxy = fixture();
     const initial = proxy.startProxy();

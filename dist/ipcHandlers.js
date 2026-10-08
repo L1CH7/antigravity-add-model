@@ -46,7 +46,7 @@ const path = __importStar(require("path"));
 const customScheme_1 = require("./customScheme");
 const tray_1 = require("./tray");
 const constants_1 = require("./ideInstall/constants");
-const customModelIpc_1 = require("./customModelIpc");
+const customIpc_1 = require("./customIpc");
 /**
  * Registers all IPC handlers for the main process.
  */
@@ -136,11 +136,7 @@ function registerIpcHandlers(storageManager) {
     electron_1.ipcMain.handle('storage:get-items', async () => {
         return storageManager.getItems();
     });
-    electron_1.ipcMain.handle('storage:update-items', async (_event, changes) => {
-        await storageManager.updateItems(changes);
-    });
-    // Custom Models
-    (0, customModelIpc_1.setupCustomModelIpc)(electron_1.ipcMain);
+    (0, customIpc_1.registerCustomModelHandlers)();
     // Logs
     electron_1.ipcMain.handle('logs:electron', async () => {
         try {

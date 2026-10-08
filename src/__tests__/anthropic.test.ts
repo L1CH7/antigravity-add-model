@@ -2,6 +2,41 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as shared from '../proxy/shared';
 import { mapGeminiToAnthropic, mapAnthropicToGemini, mapAnthropicChunkToGemini } from '../proxy/translators/anthropic';
 
+const toolArgumentCases: Array<{
+  name: string;
+  args: Record<string, unknown>;
+  schemas?: ReadonlyMap<string, unknown>;
+}> = [
+  {
+    name: 'write_to_file',
+    args: {
+      TargetFile: '/workspace/example.txt',
+      CodeContent: 'Hello.\nKeep /literal/path unchanged.',
+      Overwrite: false,
+    },
+  },
+  {
+    name: 'mcp__files__write',
+    args: { path: '/workspace/example.txt', content: 'Hello.', metadata: { file: 'notes.md' } },
+  },
+  { name: 'send_note', args: { message: 'This is a sentence.', priority: 'normal' } },
+  {
+    name: 'write_file',
+    args: { path: '/workspace/example.txt', content: 'A declared lowercase path must stay lowercase.' },
+    schemas: new Map([
+      [
+        'write_file',
+        {
+          type: 'object',
+          properties: { path: { type: 'string' }, content: { type: 'string' } },
+          required: ['path', 'content'],
+          additionalProperties: false,
+        },
+      ],
+    ]),
+  },
+];
+
 // Mock detectModelCapabilitiesByName to avoid importing the full module chain
 vi.mock('../proxy/modelUtils', () => ({
   detectModelCapabilitiesByName: vi.fn((name: string) => ({
@@ -26,6 +61,31 @@ beforeEach(() => {
 // ─── mapGeminiToAnthropic ──────────────────────────────────────────────────
 
 describe('mapGeminiToAnthropic', () => {
+  it('preserves parametersJsonSchema properties, references, and additional-property constraints', () => {
+    const parametersJsonSchema = {
+      type: 'object',
+      $defs: { filePath: { type: 'string', minLength: 1 } },
+      properties: {
+        TargetFile: { $ref: '#/$defs/filePath' },
+        CodeContent: { type: 'string' },
+        Overwrite: { type: 'boolean' },
+      },
+      required: ['TargetFile', 'CodeContent', 'Overwrite'],
+      additionalProperties: false,
+    };
+    const original = structuredClone(parametersJsonSchema);
+    const result = mapGeminiToAnthropic(
+      {
+        contents: [],
+        tools: [{ functionDeclarations: [{ name: 'write_to_file', parametersJsonSchema }] }],
+      },
+      'external-model',
+    );
+    expect(result.tools![0].input_schema).toEqual(original);
+    expect(result.tools![0].input_schema).not.toBe(parametersJsonSchema);
+    expect(parametersJsonSchema).toEqual(original);
+  });
+
   it('should convert systemInstruction to system parameter', () => {
     const body = {
       systemInstruction: { parts: [{ text: 'You are helpful.' }] },
@@ -88,6 +148,51 @@ describe('mapGeminiToAnthropic', () => {
     expect(blocks.some((b) => b.type === 'tool_result')).toBe(true);
   });
 
+  it.each([false, true])('keeps tool failure text after matching tool results (split items: %s)', (splitItems) => {
+    const failure = 'WRITE_ERROR: invalid tool call: additional properties AbsolutePath not allowed';
+    const body = {
+      contents: [
+        {
+          role: 'model',
+          parts: [
+            { functionCall: { name: 'write_to_file', id: 'write-1', args: { TargetFile: '/tmp/first.txt' } } },
+            { functionCall: { name: 'write_to_file', id: 'write-2', args: { TargetFile: '/tmp/second.txt' } } },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [
+            { text: failure },
+            { functionResponse: { name: 'write_to_file', id: 'write-2', response: {} } },
+            { text: 'Internal note', thought: true },
+            { text: 'Correct the arguments before retrying.' },
+            { functionResponse: { name: 'write_to_file', id: 'write-1', response: { error: 'Permission denied' } } },
+          ],
+        },
+      ],
+    };
+    if (splitItems) {
+      const results = body.contents.pop()!;
+      body.contents.push(
+        { ...results, parts: results.parts.slice(0, 2) },
+        { ...results, parts: results.parts.slice(2) },
+      );
+    }
+    const original = structuredClone(body);
+    const result = mapGeminiToAnthropic(body, 'external-model');
+    expect(result.messages[1]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'write-2', content: '{}' },
+        { type: 'tool_result', tool_use_id: 'write-1', content: '{"error":"Permission denied"}' },
+        { type: 'text', text: failure },
+        { type: 'text', text: 'Correct the arguments before retrying.' },
+      ],
+    });
+    expect(result.messages[0].content).toMatchObject([{ id: 'write-1' }, { id: 'write-2' }]);
+    expect(body).toEqual(original);
+  });
+
   it('should set max_tokens from generationConfig', () => {
     const body = {
       contents: [],
@@ -138,6 +243,54 @@ describe('mapGeminiToAnthropic', () => {
 // ─── mapAnthropicToGemini ──────────────────────────────────────────────────
 
 describe('mapAnthropicToGemini', () => {
+  it('keeps valid write_to_file arguments within the schema sent to the provider', () => {
+    const args = { TargetFile: '/workspace/example.txt', CodeContent: 'Hello.', Overwrite: false };
+    const parameters = {
+      type: 'OBJECT',
+      properties: { TargetFile: { type: 'STRING' }, CodeContent: { type: 'STRING' }, Overwrite: { type: 'BOOLEAN' } },
+      required: ['TargetFile', 'CodeContent', 'Overwrite'],
+      additionalProperties: false,
+    };
+    const request = mapGeminiToAnthropic(
+      {
+        contents: [],
+        tools: [{ functionDeclarations: [{ name: 'write_to_file', parameters }] }],
+      },
+      'claude-test',
+    );
+    const sentSchema = request.tools![0].input_schema;
+    expect(sentSchema).toMatchObject({
+      properties: { TargetFile: { type: 'string' }, CodeContent: { type: 'string' }, Overwrite: { type: 'boolean' } },
+      required: parameters.required,
+      additionalProperties: false,
+    });
+    const result = mapAnthropicToGemini(
+      {
+        content: [{ type: 'tool_use', id: 'write-call', name: 'write_to_file', input: args }],
+        stop_reason: 'tool_use',
+      },
+      'claude-test',
+    );
+    const call = result.candidates[0].content.parts[0].functionCall!;
+    expect(call).toEqual({ name: 'write_to_file', args, id: 'write-call' });
+    expect(Object.keys(call.args).sort()).toEqual(Object.keys(sentSchema.properties!).sort());
+  });
+
+  it.each(toolArgumentCases)(
+    'preserves valid $name arguments without guessing path fields',
+    ({ name, args, schemas }) => {
+      const result = mapAnthropicToGemini(
+        {
+          content: [{ type: 'tool_use', id: 'preserved-call', name, input: args }],
+          stop_reason: 'tool_use',
+        },
+        'external-model',
+        schemas,
+      );
+      expect(result.candidates[0].content.parts[0].functionCall).toEqual({ name, args, id: 'preserved-call' });
+    },
+  );
+
   it('should convert text content blocks', () => {
     const res = {
       content: [{ type: 'text' as const, text: 'Hello!' }],
@@ -224,6 +377,49 @@ describe('mapAnthropicToGemini', () => {
 // ─── mapAnthropicChunkToGemini (Streaming SSE) ─────────────────────────────
 
 describe('mapAnthropicChunkToGemini', () => {
+  it.each(toolArgumentCases)('preserves fragmented $name input_json_delta arguments', ({ name, args, schemas }) => {
+    const streamKey = `preserve-${name}`;
+    expect(
+      mapAnthropicChunkToGemini(
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'fragmented-call', name, input: {} },
+        },
+        'external-model',
+        streamKey,
+        schemas,
+      ),
+    ).toBeNull();
+    const serialized = JSON.stringify(args);
+    for (const fragment of [serialized.slice(0, 9), serialized.slice(9, 31), serialized.slice(31)]) {
+      expect(
+        mapAnthropicChunkToGemini(
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'input_json_delta', partial_json: fragment },
+          },
+          'external-model',
+          streamKey,
+          schemas,
+        ),
+      ).toBeNull();
+    }
+    const result = mapAnthropicChunkToGemini(
+      {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use' },
+      },
+      'external-model',
+      streamKey,
+      schemas,
+    );
+    expect(result?.finishReason).toBe('TOOL_CALL');
+    expect(result?.content.parts).toEqual([{ functionCall: { name, args, id: 'fragmented-call' } }]);
+    expect(shared.activeStreamContexts.has(streamKey)).toBe(false);
+  });
+
   it('should handle content_block_start for tool_use', () => {
     const chunk = {
       type: 'content_block_start',

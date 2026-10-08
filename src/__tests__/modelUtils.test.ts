@@ -53,6 +53,25 @@ describe('detectModelCapabilities', () => {
     expect(result.maxOutputTokens).toBe(16_384);
   });
 
+  it('honors explicit thinking capabilities over provider and alias heuristics', () => {
+    for (const provider of ['google', 'anthropic', 'openai', 'openrouter']) {
+      expect(
+        detectModelCapabilities({
+          name: 'models/reasoning-alias',
+          provider,
+          supportsThinking: false,
+        }).isThinking,
+      ).toBe(false);
+    }
+    expect(
+      detectModelCapabilities({
+        name: 'models/plain-alias',
+        provider: 'google',
+        supportsThinking: true,
+      }).isThinking,
+    ).toBe(true);
+  });
+
   it('detects anthropic models as claude regardless of name', () => {
     const result = detectModelCapabilities({ name: 'some-unknown-model', provider: 'anthropic' });
     expect(result.isClaude).toBe(true);

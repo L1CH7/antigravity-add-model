@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as asar from '@electron/asar';
+import { planRuntimePatch } from './runtime-patch.mjs';
 
 const PROJECT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STATE_DIR = '.antigravity-model-patch';
@@ -16,39 +17,29 @@ const HASH = /^[a-f0-9]{64}$/;
 const ORIGINAL_URL = Buffer.from('https://daily-cloudcode-pa.googleapis.com');
 const PATCHED_URL = Buffer.from('http://localhost:50999/v1internal/xxxxxxx');
 export const REQUIRED_BUILD_FILES = [
-  'main.js',
-  'preload.js',
+  'desktop.js',
+  'customPreload.js',
+  'customIpc.js',
+  'modelStore.js',
+  'modelManagement.js',
+  'googleAccounts.js',
+  'googleOAuth.js',
+  'providers.js',
   'proxy.js',
-  'languageServer.js',
-  'ipcHandlers.js',
   'cryptoStore.js',
   'schemaValidator.js',
   'proxy/registry.js',
   'proxy/shared.js',
+  'proxy/customRequest.js',
+  'proxy/requestOptions.js',
+  'proxy/circuitBreaker.js',
   'proxy/translators/openai.js',
   'proxy/translators/anthropic.js',
   'proxy/translators/google.js',
   'proxy/translators/ollama.js',
-  'constants.js',
-  'customScheme.js',
-  'keybindings.js',
-  'loadingOverlay.js',
-  'menu.js',
-  'paths.js',
-  'storage.js',
-  'tray.js',
-  'updater.js',
-  'utils.js',
-  'ideInstall/constants.js',
-  'ideInstall/index.js',
-  'ideInstall/service.js',
-  'ideInstall/wizard.js',
-  'ideInstall/wizardHtml.js',
-  'ideInstall/wizardPreload.js',
   'proxy/listen.js',
   'proxy/modelUtils.js',
   'proxy/translators/utils.js',
-  'services/settingsService.js',
 ];
 export const MODULAR_BUILD_FILES = [
   'loader.js',
@@ -314,10 +305,12 @@ export function preflight(options = {}) {
   if (exists(path.join(resources, 'app', 'out'))) unsupported();
   const files = locations(resources);
   for (const filename of Object.values(files)) assertNoLinks(resources, filename);
-  const info = inspectArchive(files.archive);
+  let info = inspectArchive(files.archive);
   const state = readState(resources);
   const current = fingerprint(resources);
   const dist = path.resolve(options.dist || path.join(PROJECT, 'dist'));
+  let vendorFiles = files;
+  let runtimePatch;
   if (!options.restore) {
     const requiredFiles = options.modular ? MODULAR_BUILD_FILES : REQUIRED_BUILD_FILES;
     for (const item of requiredFiles) {
@@ -327,6 +320,21 @@ export function preflight(options = {}) {
     }
     if (walk(dist).some(({ stat }) => stat.isSymbolicLink()))
       fail('UNSAFE_BUILD', 'Compiled dist must not contain symlinks.');
+    // A repeated installation (including upgrades from the old overlay installer)
+    // must start from the verified original for THIS exact installed version.
+    // Never compose hooks on already patched files or reuse a stale legacy backup.
+    if (state && equal(state.patched, current)) {
+      vendorFiles = locations(verifyBackup(resources, state));
+      info = inspectArchive(vendorFiles.archive);
+    }
+    if (!options.modular) {
+      runtimePatch = planRuntimePatch(
+        (name) => extractFile(vendorFiles.archive, name),
+        (name) => fs.readFileSync(path.join(dist, name)),
+      );
+    } else {
+      runtimePatch = [];
+    }
   }
   const plan = options.restore ? null : binaryPlan(resources, options.patchLanguageServer);
   if (options.restore && (!state || !equal(state.patched, current))) {
@@ -335,7 +343,7 @@ export function preflight(options = {}) {
       'The current app does not match this installer’s last patched archive, unpacked files, and binary. An app update or external change must not be overwritten.',
     );
   }
-  return { resources, files, ...info, state, current, dist, plan };
+  return { resources, files, ...info, state, current, dist, plan, vendorFiles, runtimePatch };
 }
 function copyIfPresent(source, destination) {
   if (exists(source))
@@ -498,9 +506,8 @@ export async function deploy(options = {}, operations = {}) {
         fail('BACKUP_INVALID', 'The prepared restore does not match the original backup.');
     } else {
       const source = path.join(staging, 'source');
-      // Extract CURRENT app, never app.asar.backup from an older release.
-      asar.extractAll(files.archive, source);
       if (options.modular) {
+        asar.extractAll(files.archive, source);
         for (const file of MODULAR_BUILD_FILES) {
           const srcFile = path.join(info.dist, file);
           const destFile = path.join(source, 'dist', file);
@@ -512,7 +519,20 @@ export async function deploy(options = {}, operations = {}) {
         pkg.main = 'dist/loader.js';
         fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + '\n');
       } else {
-        fs.cpSync(info.dist, path.join(source, 'dist'), { recursive: true, force: true });
+        // Preserve the installed vendor runtime. Our modules live in their own
+        // directory; only three validated integration hooks change vendor files.
+        asar.extractAll(info.vendorFiles.archive, source);
+        for (const file of REQUIRED_BUILD_FILES) {
+          const target = path.join(source, 'dist', 'modelPatch', file);
+          assertNoLinks(source, target);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.copyFileSync(path.join(info.dist, file), target);
+        }
+        for (const [name, contents] of info.runtimePatch) {
+          const target = path.join(source, name);
+          assertNoLinks(source, target);
+          fs.writeFileSync(target, contents);
+        }
       }
       const marker = path.join(source, 'antigravity-proxy.json');
       if (info.plan.mode === 'fixed') fs.writeFileSync(marker, JSON.stringify({ requiredPort: 50999 }) + '\n');
@@ -520,19 +540,29 @@ export async function deploy(options = {}, operations = {}) {
       // Rebuild referenced unpacked entries cleanly; then preserve unlisted vendor
       // extras without overwriting newly generated files or following live links.
       await (operations.pack || packCandidate)(source, candidate.archive, info.entries);
-      copyMissingUnpacked(files.unpacked, candidate.unpacked);
+      copyMissingUnpacked(info.vendorFiles.unpacked, candidate.unpacked);
       fs.chmodSync(candidate.archive, fs.statSync(files.archive).mode & 0o777);
       inspectArchive(candidate.archive);
       verifyArchiveIntegrity(candidate.archive);
-      const verifyFiles = options.modular ? MODULAR_BUILD_FILES : REQUIRED_BUILD_FILES;
-      for (const file of verifyFiles) {
-        if (!extractFile(candidate.archive, `dist/${file}`).equals(fs.readFileSync(path.join(info.dist, file))))
-          fail('PACK_INVALID', `Packaged patch does not match the build: ${file}`);
-      }
       if (options.modular) {
+        for (const file of MODULAR_BUILD_FILES) {
+          if (!extractFile(candidate.archive, `dist/${file}`).equals(fs.readFileSync(path.join(info.dist, file))))
+            fail('PACK_INVALID', `Packaged patch does not match the build: ${file}`);
+        }
         const candidatePkg = JSON.parse(extractFile(candidate.archive, 'package.json').toString());
         if (candidatePkg.main !== 'dist/loader.js')
           fail('PACK_INVALID', 'Packaged patch does not set package.json main to dist/loader.js');
+      } else {
+        for (const file of REQUIRED_BUILD_FILES) {
+          if (
+            !extractFile(candidate.archive, `dist/modelPatch/${file}`).equals(fs.readFileSync(path.join(info.dist, file)))
+          )
+            fail('PACK_INVALID', `Packaged patch does not match the build: ${file}`);
+        }
+        for (const [name, contents] of info.runtimePatch) {
+          if (!extractFile(candidate.archive, name).equals(contents))
+            fail('PACK_INVALID', `Packaged runtime hook does not match preflight: ${name}`);
+        }
       }
       copyIfPresent(files.binary, candidate.binary);
       if (info.plan.bytes) {
