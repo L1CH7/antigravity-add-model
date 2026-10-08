@@ -134,7 +134,7 @@ export async function runCustomModelRequest(
   res.once('close', onClose);
   let completed = false;
   let upstreamOutput = false;
-  const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 120_000, 120_000));
+  const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 300_000, 300_000));
   let failure = new UpstreamError('No configured model is currently available.', 503);
 
   const writeCandidate = (candidate: unknown) => {
@@ -265,12 +265,12 @@ export async function runCustomModelRequest(
               resolve,
             );
             request.once('error', reject);
-            request.setTimeout(model.idleTimeout ?? 30_000, () =>
+            request.setTimeout(model.idleTimeout ?? 180_000, () =>
               request?.destroy(new UpstreamError('Upstream idle timeout.', 504)),
             );
             totalTimer = setTimeout(
               () => request?.destroy(new UpstreamError('Upstream request timeout.', 504)),
-              Math.min(model.timeout ?? 120_000, remaining),
+              Math.min(model.timeout ?? 300_000, remaining),
             );
             signal.addEventListener('abort', abort, { once: true });
             request.end(JSON.stringify(payload));

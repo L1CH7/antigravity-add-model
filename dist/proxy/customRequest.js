@@ -166,7 +166,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
     res.once('close', onClose);
     let completed = false;
     let upstreamOutput = false;
-    const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 120000, 120000));
+    const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 300000, 300000));
     let failure = new UpstreamError('No configured model is currently available.', 503);
     const writeCandidate = (candidate) => {
         if (signal.aborted || res.destroyed)
@@ -277,8 +277,8 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     const upstream = await new Promise((resolve, reject) => {
                         request = (url.protocol === 'https:' ? https : http).request(url, { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized }, resolve);
                         request.once('error', reject);
-                        request.setTimeout(model.idleTimeout ?? 30000, () => request?.destroy(new UpstreamError('Upstream idle timeout.', 504)));
-                        totalTimer = setTimeout(() => request?.destroy(new UpstreamError('Upstream request timeout.', 504)), Math.min(model.timeout ?? 120000, remaining));
+                        request.setTimeout(model.idleTimeout ?? 180000, () => request?.destroy(new UpstreamError('Upstream idle timeout.', 504)));
+                        totalTimer = setTimeout(() => request?.destroy(new UpstreamError('Upstream request timeout.', 504)), Math.min(model.timeout ?? 300000, remaining));
                         signal.addEventListener('abort', abort, { once: true });
                         request.end(JSON.stringify(payload));
                     });
