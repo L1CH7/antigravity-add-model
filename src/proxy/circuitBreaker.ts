@@ -15,7 +15,8 @@ export class CircuitBreaker {
   constructor(private readonly now: () => number = Date.now) {}
 
   acquire(key: string, options: CircuitBreakerOptions = {}): boolean {
-    if (options.enabled === false) return true;
+    // Only enable circuit breaker if explicitly enabled (options.enabled === true)
+    if (options.enabled !== true) return true;
     const state = this.states.get(key);
     if (!state || state.openedAt === undefined) return true;
     if (state.probing || this.now() - state.openedAt < (options.cooldownMs ?? 30_000)) return false;
