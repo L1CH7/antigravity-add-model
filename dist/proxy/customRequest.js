@@ -151,7 +151,7 @@ function buildFallbackChain(primary, allModels) {
     return chain;
 }
 /** The sole retry/fallback owner; nothing is retried after any model output was received. */
-async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true) {
+async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true, fallbackToGoogle) {
     const toolSchemas = (0, utils_1.collectToolSchemas)(originalBody);
     const controller = new AbortController();
     const { signal } = controller;
@@ -245,7 +245,9 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                             url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
                             url.search = isStream ? '?alt=sse' : '';
                             headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
-                            headers['User-Agent'] = 'antigravity';
+                            if (!headers['User-Agent'] && !headers['user-agent']) {
+                                headers['User-Agent'] = 'antigravity';
+                            }
                             const project = accountLease.account.project || model.googleProject;
                             payload = { model: externalName, ...(project ? { project } : {}), request: payload };
                         }
@@ -473,20 +475,34 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                 break;
         }
         if (!signal.aborted && !res.writableEnded && !res.destroyed) {
-            if (res.headersSent)
+            if (res.headersSent) {
                 res.write(`event: error\ndata: ${JSON.stringify({ error: { message: failure.message, code: failure.status } })}\n\n`);
+                res.end();
+            }
+            else if (fallbackToGoogle) {
+                fallbackToGoogle();
+                return;
+            }
             else {
                 res.writeHead(failure.status, { 'Content-Type': 'application/json' });
                 res.write(JSON.stringify({ error: { message: failure.message } }));
+                res.end();
             }
-            res.end();
         }
     }
     catch {
         if (!signal.aborted && !res.writableEnded && !res.destroyed) {
-            if (!res.headersSent)
+            if (res.headersSent) {
+                res.end();
+            }
+            else if (fallbackToGoogle) {
+                fallbackToGoogle();
+                return;
+            }
+            else {
                 res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Model request failed.' } }));
+                res.end(JSON.stringify({ error: { message: 'Model request failed.' } }));
+            }
         }
     }
     finally {

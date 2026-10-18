@@ -4,8 +4,10 @@
  * Replaces ~9 duplicate regex blocks across proxy.js.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.NATIVE_GOOGLE_MODELS = void 0;
 exports.detectModelCapabilities = detectModelCapabilities;
 exports.detectModelCapabilitiesByName = detectModelCapabilitiesByName;
+exports.isNativeGoogleModelName = isNativeGoogleModelName;
 // ─── Detection ────────────────────────────────────────────────────────────
 const THINKING_PATTERN = /thinking|reasoning|reasoner|o1|o3|r1|opus-4|sonnet-4|claude-4|3-7|4-7|3\.7|4\.7/i;
 const DEEPSEEK_PATTERN = /deepseek/i;
@@ -51,5 +53,38 @@ function detectModelCapabilitiesByName(modelName) {
         isClaudeThinkingModel: CLAUDE_THINKING_PATTERN.test(lower),
         isThinkingModel: THINKING_MODEL_PATTERN.test(lower),
     };
+}
+exports.NATIVE_GOOGLE_MODELS = [
+    { name: 'models/gemini-3.8-flash-high', displayName: 'Gemini 3.8 Flash High' },
+    { name: 'models/gemini-3.8-flash-medium', displayName: 'Gemini 3.8 Flash Medium' },
+    { name: 'models/gemini-3.8-flash-low', displayName: 'Gemini 3.8 Flash Low' },
+    { name: 'models/gemini-3.8-flash-tiered', displayName: 'Gemini 3.8 Flash Tiered' },
+    { name: 'models/gemini-3.7-flash-high', displayName: 'Gemini 3.7 Flash High' },
+    { name: 'models/gemini-3.7-flash-medium', displayName: 'Gemini 3.7 Flash Medium' },
+    { name: 'models/gemini-3.7-flash-low', displayName: 'Gemini 3.7 Flash Low' },
+    { name: 'models/gemini-3.7-flash-tiered', displayName: 'Gemini 3.7 Flash Tiered' },
+    { name: 'models/gemini-3.5-pro', displayName: 'Gemini 3.5 Pro' },
+    { name: 'models/gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
+    { name: 'models/gemini-3.5-flash-lite', displayName: 'Gemini 3.5 Flash Lite' },
+    { name: 'models/gemini-2.5-pro', displayName: 'Gemini 2.5 Pro' },
+    { name: 'models/gemini-2.5-flash', displayName: 'Gemini 2.5 Flash' },
+    { name: 'models/gemini-2.5-flash-lite', displayName: 'Gemini 2.5 Flash Lite' },
+    { name: 'models/claude-3-7-sonnet', displayName: 'Claude 3.7 Sonnet' },
+    { name: 'models/claude-3-5-sonnet', displayName: 'Claude 3.5 Sonnet' },
+];
+function isNativeGoogleModelName(name) {
+    if (!name)
+        return false;
+    const clean = name.replace(/^models\//, '').trim();
+    if (clean.startsWith('custom-') || clean.startsWith('MODEL_PLACEHOLDER_')) {
+        return false;
+    }
+    return (clean.startsWith('gemini-') ||
+        clean.startsWith('claude-') ||
+        clean.startsWith('chat-') ||
+        clean.startsWith('code-') ||
+        clean.startsWith('text-') ||
+        clean.startsWith('embedding-') ||
+        clean === 'auto');
 }
 //# sourceMappingURL=modelUtils.js.map

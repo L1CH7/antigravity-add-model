@@ -25,6 +25,7 @@ export const REQUIRED_BUILD_FILES = [
   'googleAccounts.js',
   'googleOAuth.js',
   'providers.js',
+  'constants.js',
   'paths.js',
   'storage.js',
   'proxy.js',
@@ -52,6 +53,7 @@ export const MODULAR_BUILD_FILES = [
   'googleAccounts.js',
   'googleOAuth.js',
   'providers.js',
+  'constants.js',
   'paths.js',
   'storage.js',
   'proxy.js',
@@ -199,9 +201,14 @@ export function resolveResources(input, platform = process.platform, env = proce
           ]
         : [
             path.join(os.homedir(), '.local/share/Programs/antigravity/resources'),
+            '/opt/Antigravity/resources',
             '/opt/antigravity/resources',
+            '/opt/Antigravity-IDE/resources',
+            '/opt/antigravity-ide/resources',
             '/usr/lib/antigravity/resources',
+            '/usr/lib/Antigravity/resources',
             '/usr/local/lib/antigravity/resources',
+            '/usr/local/lib/Antigravity/resources',
           ];
   for (const candidate of candidates) {
     if (exists(path.join(candidate, 'app.asar')) || exists(path.join(candidate, 'app', 'out')))
@@ -349,11 +356,16 @@ export function preflight(options = {}) {
     }
   }
   const plan = options.restore ? null : binaryPlan(resources, options.patchLanguageServer);
-  if (options.restore && (!state || !equal(state.patched, current))) {
-    fail(
-      'RESTORE_REFUSED',
-      'The current app does not match this installer’s last patched archive, unpacked files, and binary. An app update or external change must not be overwritten.',
-    );
+  if (options.restore) {
+    if (!state || equal(state.original, current)) {
+      return { resources, files, ...info, state: null, current, dist, plan: null, vendorFiles: files, runtimePatch: [], alreadyClean: true };
+    }
+    if (!equal(state.patched, current) && !options.force) {
+      fail(
+        'RESTORE_REFUSED',
+        'The current app does not match this installer’s last patched archive, unpacked files, and binary. An app update or external change was detected. Use --force to restore anyway.',
+      );
+    }
   }
   return { resources, files, ...info, state, current, dist, plan, vendorFiles, runtimePatch };
 }
@@ -488,6 +500,8 @@ export async function deploy(options = {}, operations = {}) {
   const info = preflight(options);
   if (options.check)
     return { action: 'check', resources: info.resources, version: info.version, binaryMode: info.plan?.mode };
+  if (options.restore && info.alreadyClean)
+    return { action: 'restore', resources: info.resources, version: info.version, alreadyClean: true };
   const { resources, files, state, current } = info;
   const meta = path.join(resources, STATE_DIR);
   assertNoLinks(resources, meta);
@@ -496,8 +510,34 @@ export async function deploy(options = {}, operations = {}) {
   let lockFd;
   try {
     lockFd = fs.openSync(lock, 'wx');
-  } catch {
-    fail('DEPLOY_LOCKED', `Another deployment or an interrupted run owns ${lock}. Inspect it before retrying.`);
+  } catch (error) {
+    if (error.code === 'EACCES') {
+      fail('PERMISSION_DENIED', `Permission denied writing to ${lock}. Elevated privileges (sudo) required.`);
+    }
+    // Check if the existing lock file is stale:
+    try {
+      const content = fs.readFileSync(lock, 'utf8');
+      const m = content.match(/pid=(\d+)/);
+      if (m) {
+        const pid = parseInt(m[1], 10);
+        let isRunning = false;
+        try {
+          process.kill(pid, 0);
+          isRunning = true;
+        } catch (e) {
+          isRunning = e.code === 'EPERM';
+        }
+        if (!isRunning) {
+          fs.unlinkSync(lock);
+          lockFd = fs.openSync(lock, 'wx');
+        }
+      }
+    } catch {
+      // ignore
+    }
+    if (!lockFd) {
+      fail('DEPLOY_LOCKED', `Another deployment or an interrupted run owns ${lock}. Inspect it before retrying.`);
+    }
   }
   fs.writeFileSync(lockFd, `pid=${process.pid}\n`);
   let staging;
@@ -593,8 +633,12 @@ export async function deploy(options = {}, operations = {}) {
       };
       originalBackup = path.join(meta, 'backups', nextState.backupId);
       assertNoLinks(resources, originalBackup);
-      if (repeated || exists(originalBackup)) verifyBackup(resources, nextState);
-      else {
+      if (repeated && exists(originalBackup)) {
+        verifyBackup(resources, nextState);
+      } else {
+        if (exists(originalBackup)) {
+          fs.rmSync(originalBackup, { recursive: true, force: true });
+        }
         const backupCandidate = path.join(staging, 'original');
         copyInstallation(resources, backupCandidate);
         if (!equal(fingerprint(backupCandidate), current))
@@ -642,11 +686,14 @@ export function parseArgs(argv) {
       options.resources = argv[++index];
     } else if (arg === '--check') options.check = true;
     else if (arg === '--restore') options.restore = true;
+    else if (arg === '--force') options.force = true;
     else if (arg === '--patch-language-server') options.patchLanguageServer = true;
     else if (arg === '--modular') options.modular = true;
     else if (arg === '--legacy') options.modular = false;
     else if (arg === '--help' || arg === '-h') options.help = true;
-    else fail('USAGE', `Unknown argument: ${arg}`);
+    else if (!arg.startsWith('--') && !options.resources) {
+      options.resources = arg;
+    } else fail('USAGE', `Unknown argument: ${arg}`);
   }
   if ((options.check && options.restore) || (options.restore && options.patchLanguageServer))
     fail('USAGE', '--check/--restore and --restore/--patch-language-server cannot be combined.');
@@ -657,16 +704,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     const options = parseArgs(process.argv.slice(2));
     if (options.help)
       console.log(
-        'Usage: node scripts/deploy.mjs [--resources PATH] [--check|--restore] [--patch-language-server] [--modular|--legacy]\nClose Antigravity before applying/restoring; reopen it manually afterward.',
+        'Usage: node scripts/deploy.mjs [--resources PATH] [--check|--restore] [--force] [--patch-language-server] [--modular|--legacy]\nClose Antigravity before applying/restoring; reopen it manually afterward.',
       );
     else {
       if (!options.check)
         console.log('Close Antigravity before deploying. This installer does not stop or launch applications.');
       if (options.modular === undefined && !options.restore) options.modular = true;
       const result = await deploy(options);
-      console.log(
-        `${result.action === 'check' ? 'CHECK PASSED (no files changed)' : result.action === 'restore' ? 'RESTORED' : 'PATCH INSTALLED'}: ${result.modular ? 'modular' : 'standalone'} ${result.version} at ${result.resources}`,
-      );
+      if (result.alreadyClean) {
+        console.log(`ALREADY CLEAN: Antigravity is in its original unpatched state at ${result.resources}`);
+      } else {
+        console.log(
+          `${result.action === 'check' ? 'CHECK PASSED (no files changed)' : result.action === 'restore' ? 'RESTORED' : 'PATCH INSTALLED'}: ${result.modular ? 'modular' : 'standalone'} ${result.version} at ${result.resources}`,
+        );
+      }
       if (result.backup) console.log(`Original backup: ${result.backup}`);
       if (result.binaryMode === 'fixed')
         console.log('The recognized language-server endpoint requires local proxy port 50999.');

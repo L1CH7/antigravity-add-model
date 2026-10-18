@@ -120,6 +120,7 @@ export async function runCustomModelRequest(
   isStream: boolean,
   allModels: CustomModel[],
   cloudEnvelope = true,
+  fallbackToGoogle?: () => void,
 ): Promise<void> {
   const toolSchemas = collectToolSchemas(originalBody);
   const controller = new AbortController();
@@ -230,7 +231,9 @@ export async function runCustomModelRequest(
               url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
               url.search = isStream ? '?alt=sse' : '';
               headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
-              headers['User-Agent'] = 'antigravity';
+              if (!headers['User-Agent'] && !headers['user-agent']) {
+                headers['User-Agent'] = 'antigravity';
+              }
               const project = accountLease.account.project || model.googleProject;
               payload = { model: externalName, ...(project ? { project } : {}), request: payload };
             }
@@ -464,20 +467,31 @@ export async function runCustomModelRequest(
       if (!failure.mayFallback) break;
     }
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
-      if (res.headersSent)
+      if (res.headersSent) {
         res.write(
           `event: error\ndata: ${JSON.stringify({ error: { message: failure.message, code: failure.status } })}\n\n`,
         );
-      else {
+        res.end();
+      } else if (fallbackToGoogle) {
+        fallbackToGoogle();
+        return;
+      } else {
         res.writeHead(failure.status, { 'Content-Type': 'application/json' });
         res.write(JSON.stringify({ error: { message: failure.message } }));
+        res.end();
       }
-      res.end();
     }
   } catch {
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
-      if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: 'Model request failed.' } }));
+      if (res.headersSent) {
+        res.end();
+      } else if (fallbackToGoogle) {
+        fallbackToGoogle();
+        return;
+      } else {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Model request failed.' } }));
+      }
     }
   } finally {
     res.removeListener('close', onClose);

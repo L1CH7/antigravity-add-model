@@ -38,6 +38,7 @@ export interface CustomModel {
     googlePool?: import('./googleAccounts').GooglePoolOptions;
     encryptedGoogleAccounts?: boolean;
 }
+export { NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtils';
 export declare function startProxy(): Promise<number>;
 export declare function stopProxy(): Promise<void>;
 export declare function getProxyPort(): number;

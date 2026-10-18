@@ -18,3 +18,9 @@ scratch/
 dist/__mocks__/
 dist/*.test.js
 dist/**/*.test.js
+
+# Python & TUI environment
+.venv/
+__pycache__/
+*.pyc
+.history_paths.json

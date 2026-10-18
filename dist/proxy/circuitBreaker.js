@@ -8,8 +8,7 @@ class CircuitBreaker {
         this.states = new Map();
     }
     acquire(key, options = {}) {
-        // Only enable circuit breaker if explicitly enabled (options.enabled === true)
-        if (options.enabled !== true)
+        if (options.enabled === false)
             return true;
         const state = this.states.get(key);
         if (!state || state.openedAt === undefined)

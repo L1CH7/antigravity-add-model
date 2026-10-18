@@ -87,7 +87,8 @@ import {
 } from './proxy/shared';
 
 // Model configuration & capability detection
-import { detectModelCapabilities } from './proxy/modelUtils';
+import { detectModelCapabilities, NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtils';
+export { NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtils';
 
 // Custom request transport and model storage
 import { runCustomModelRequest, getProxyMetrics, stopCustomRequests } from './proxy/customRequest';
@@ -277,16 +278,18 @@ function loadCustomModels(): CustomModel[] {
 // ─── Google Proxy ─────────────────────────────────────────────────────────
 
 function proxyToGoogle(req: http.IncomingMessage, res: http.ServerResponse, reqBody: Buffer): void {
-  const isCloudCodeUrl = req.url!.includes('v1internal') || req.url!.includes('daily-cloudcode');
-  const targetUrl = isCloudCodeUrl
-    ? 'https://daily-cloudcode-pa.googleapis.com'
-    : 'https://generativelanguage.googleapis.com';
+  const isAiStudio =
+    req.url!.includes('generativelanguage.googleapis.com') ||
+    (typeof req.headers.host === 'string' && req.headers.host.includes('generativelanguage'));
+  const isCloudCodeUrl = !isAiStudio;
+  const targetHost = isAiStudio ? 'generativelanguage.googleapis.com' : 'daily-cloudcode-pa.googleapis.com';
+  const targetUrl = `https://${targetHost}`;
   const parsedUrl = new URL(req.url!, targetUrl);
 
   const headers: Record<string, string | string[] | undefined> = {
     ...(req.headers as Record<string, string | string[] | undefined>),
   };
-  headers['host'] = isCloudCodeUrl ? 'daily-cloudcode-pa.googleapis.com' : 'generativelanguage.googleapis.com';
+  headers['host'] = targetHost;
   delete headers['connection'];
   delete headers['keep-alive'];
 
@@ -426,8 +429,23 @@ function downloadFileContent(url: string, authHeader: string): Promise<string> {
 
 // ─── Custom Model Request Handler ─────────────────────────────────────────
 
-function handleCustomModelRequest(res: http.ServerResponse, model: CustomModel, body: GeminiRequestBody, isStream: boolean, cloudEnvelope = true): void {
-  void runCustomModelRequest(res, model, body as import('./proxy/requestOptions').GeminiBody, isStream, loadCustomModels(), cloudEnvelope);
+function handleCustomModelRequest(
+  res: http.ServerResponse,
+  model: CustomModel,
+  body: GeminiRequestBody,
+  isStream: boolean,
+  cloudEnvelope = true,
+  fallbackToGoogle?: () => void,
+): void {
+  void runCustomModelRequest(
+    res,
+    model,
+    body as import('./proxy/requestOptions').GeminiBody,
+    isStream,
+    loadCustomModels(),
+    cloudEnvelope,
+    fallbackToGoogle,
+  );
 }
 
 // ─── Protobuf Utilities ────────────────────────────────────────────────────
@@ -587,6 +605,13 @@ function buildSyntheticGetModelsResponse(customModels: CustomModel[]): Buffer {
   ]);
   const parts: Buffer[] = [];
   const modelTag = (1 << 3) | 2; // Tag 1, length-delimited (wireType 2)
+
+  // Always retain native Google models in synthetic response
+  for (const gm of NATIVE_GOOGLE_MODELS) {
+    const entry = encodeModelEntryForGetModels(gm.name, gm.displayName, fieldMapping);
+    parts.push(encodeVarint(modelTag), encodeVarint(entry.length), entry);
+  }
+
   for (const m of customModels) {
     const placeholderId = generateModelPlaceholderId(m);
     const entry = encodeModelEntryForGetModels(
@@ -711,13 +736,16 @@ function handleGetAvailableModelsProxy(
     lsRes.on('data', (chunk: Buffer) => chunks.push(chunk));
     lsRes.on('end', () => {
       const responseBuf = Buffer.concat(chunks);
-      if (lsRes.statusCode === 200 && responseBuf.length > 5) {
-        lastKnownGetModelsRawBuf = responseBuf;
+      if (lsRes.statusCode !== 200 || responseBuf.length <= 5) {
+        log.warn(`[Proxy] LS returned status ${lsRes.statusCode}, body length ${responseBuf.length}; serving fallback models`);
+        sendFallbackModels(`status ${lsRes.statusCode}`);
+        return;
       }
+      lastKnownGetModelsRawBuf = responseBuf;
       const customModels = loadCustomModels();
       const modifiedBuf = injectCustomModelsIntoProto(responseBuf, customModels);
 
-      res.writeHead(lsRes.statusCode || 200, {
+      res.writeHead(200, {
         'Content-Type': 'application/grpc-web+proto',
         'Content-Length': String(modifiedBuf.length),
       });
@@ -743,6 +771,40 @@ function handleGetAvailableModelsProxy(
 
   lsReq.write(reqBody);
   lsReq.end();
+}
+
+function buildNativeAndCustomModelsMap(customModels: CustomModel[]): Record<string, unknown> {
+  const mapped: Record<string, unknown> = {};
+  NATIVE_GOOGLE_MODELS.forEach((gm) => {
+    const clean = gm.name.replace(/^models\//, '');
+    const entry = {
+      displayName: gm.displayName,
+      maxTokens: 1048576,
+      maxOutputTokens: 65536,
+      model: clean,
+      apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      modelProvider: 'MODEL_PROVIDER_GOOGLE',
+    };
+    mapped[clean] = entry;
+    mapped[gm.name] = entry;
+  });
+  customModels.forEach((m) => {
+    const slug = toSlug(m);
+    const placeholderId = generateModelPlaceholderId(m);
+    const entry = {
+      displayName: m.displayName,
+      maxTokens: detectModelCapabilities(m).maxTokens,
+      maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
+      model: placeholderId,
+      apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      modelProvider: 'MODEL_PROVIDER_GOOGLE',
+    };
+    mapped[slug] = entry;
+    mapped[`models/${slug}`] = entry;
+    mapped[placeholderId] = entry;
+    mapped[`models/${placeholderId}`] = entry;
+  });
+  return mapped;
 }
 
 // ─── Main Request Handler ─────────────────────────────────────────────────
@@ -865,18 +927,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           googleReq.destroy();
           if (!res.headersSent) {
             const customModels = loadCustomModels();
-            const mappedCustom: Record<string, unknown> = {};
-            customModels.forEach((m) => {
-              const slug = toSlug(m);
-              mappedCustom[slug] = {
-                displayName: m.displayName,
-                maxTokens: detectModelCapabilities(m).maxTokens,
-                maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
-                model: generateModelPlaceholderId(m),
-                apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                modelProvider: 'MODEL_PROVIDER_GOOGLE',
-              };
-            });
+            const mappedCustom = buildNativeAndCustomModelsMap(customModels);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ models: mappedCustom }));
           }
@@ -889,6 +940,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             log.info(
               `[Proxy] fetchAvailableModels response status: ${googleRes.statusCode}, body length: ${googleBody.length}`,
             );
+            if (googleRes.statusCode !== 200 || googleBody.length < 5) {
+              throw new Error(`Google PA returned status ${googleRes.statusCode}`);
+            }
 
             const googleJson = JSON.parse(googleBody) as Record<string, unknown>;
             const customModels = loadCustomModels();
@@ -1045,25 +1099,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(googleJson));
           } catch (err) {
-            log.error('[Proxy] Parsing fetchAvailableModels failed, returning custom models:', err);
+            log.error('[Proxy] Parsing fetchAvailableModels failed, returning fallback models:', err);
             const customModels = loadCustomModels();
-            const mappedCustom: Record<string, unknown> = {};
-            customModels.forEach((m) => {
-              const slug = toSlug(m);
-              const placeholderId = generateModelPlaceholderId(m);
-              const entry = {
-                displayName: m.displayName,
-                maxTokens: detectModelCapabilities(m).maxTokens,
-                maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
-                model: placeholderId,
-                apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                modelProvider: 'MODEL_PROVIDER_GOOGLE',
-              };
-              mappedCustom[slug] = entry;
-              mappedCustom[`models/${slug}`] = entry;
-              mappedCustom[placeholderId] = entry;
-              mappedCustom[`models/${placeholderId}`] = entry;
-            });
+            const mappedCustom = buildNativeAndCustomModelsMap(customModels);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ models: mappedCustom }));
           }
@@ -1073,23 +1111,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       googleReq.on('error', (err) => {
         log.error('[Proxy] Forwarding fetchAvailableModels failed:', err);
         const customModels = loadCustomModels();
-        const mappedCustom: Record<string, unknown> = {};
-        customModels.forEach((m) => {
-          const slug = toSlug(m);
-          const placeholderId = generateModelPlaceholderId(m);
-          const entry = {
-            displayName: m.displayName,
-            maxTokens: detectModelCapabilities(m).maxTokens,
-            maxOutputTokens: detectModelCapabilities(m).maxOutputTokens,
-            model: placeholderId,
-            apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-            modelProvider: 'MODEL_PROVIDER_GOOGLE',
-          };
-          mappedCustom[slug] = entry;
-          mappedCustom[`models/${slug}`] = entry;
-          mappedCustom[placeholderId] = entry;
-          mappedCustom[`models/${placeholderId}`] = entry;
-        });
+        const mappedCustom = buildNativeAndCustomModelsMap(customModels);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ models: mappedCustom }));
       });
@@ -1166,8 +1188,17 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(googleJson));
           } catch (err) {
-            log.error('[Proxy] Google list models failed, returning custom models list only:', err);
+            log.error('[Proxy] Google list models failed, returning fallback models list:', err);
             const customModels = loadCustomModels();
+            const nativeMapped = NATIVE_GOOGLE_MODELS.map((gm) => ({
+              name: gm.name,
+              version: '1.0',
+              displayName: gm.displayName,
+              description: 'Official Google model',
+              inputTokenLimit: 1048576,
+              outputTokenLimit: 65536,
+              supportedGenerationMethods: ['generateContent', 'countTokens'],
+            }));
             const mappedCustom = customModels.map((m) => ({
               name: 'models/' + generateModelPlaceholderId(m),
               version: '1.0',
@@ -1178,7 +1209,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               supportedGenerationMethods: ['generateContent', 'countTokens'],
             }));
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ models: mappedCustom }));
+            res.end(JSON.stringify({ models: [...nativeMapped, ...mappedCustom] }));
           }
         });
       });
@@ -1186,17 +1217,20 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       googleReq.on('error', (err) => {
         log.error('[Proxy] Google models list request error:', err);
         const customModels = loadCustomModels();
+        const nativeMapped = NATIVE_GOOGLE_MODELS.map((gm) => ({
+          name: gm.name,
+          displayName: gm.displayName,
+          description: 'Official Google model',
+          supportedGenerationMethods: ['generateContent'],
+        }));
+        const customMapped = customModels.map((m) => ({
+          name: m.name,
+          displayName: m.displayName,
+          description: m.description,
+          supportedGenerationMethods: ['generateContent'],
+        }));
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            models: customModels.map((m) => ({
-              name: m.name,
-              displayName: m.displayName,
-              description: m.description,
-              supportedGenerationMethods: ['generateContent'],
-            })),
-          }),
-        );
+        res.end(JSON.stringify({ models: [...nativeMapped, ...customMapped] }));
       });
       googleReq.end();
       return;
@@ -1216,15 +1250,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         if (modelName || modelId) {
           const customModels = loadCustomModels();
           const cleanModelName = (modelName || '').replace(/^models\//, '');
-          let matchedCustomModel = customModels.find((m) => {
+          const matchedCustomModel = customModels.find((m) => {
             const enumName = generateModelPlaceholderId(m);
             const slug = toSlug(m);
             const cleanMName = (m.name || '').replace(/^models\//, '');
-            const cleanExtName = (m.externalModelName || '').replace(/^models\//, '');
             return (
               m.name === modelName ||
               cleanMName === cleanModelName ||
-              cleanExtName === cleanModelName ||
               slug === modelName ||
               slug === cleanModelName ||
               'models/' + slug === modelName ||
@@ -1235,20 +1267,6 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             );
           });
 
-          // Subagent / Background task fallback:
-          // If subagent requests internal Google model (e.g., gemini-3.8-flash-tiered, gemini-3.5-flash-lite),
-          // automatically route to local Antigravity Manager instead of leaking to blocked direct Cloud Code!
-          if (!matchedCustomModel && (cleanModelName.startsWith('gemini-') || cleanModelName.startsWith('claude-'))) {
-            const defaultModel = customModels.find(m => (m.externalModelName || '').includes('gemini-3.7-flash-high')) || customModels[0];
-            if (defaultModel) {
-              log.info(`[Proxy] Subagent model fallback: ${modelName} -> routing via ${defaultModel.displayName} (${defaultModel.externalModelName})`);
-              matchedCustomModel = {
-                ...defaultModel,
-                externalModelName: cleanModelName
-              };
-            }
-          }
-
           if (matchedCustomModel) {
             log.info(
               `[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`,
@@ -1257,9 +1275,32 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             const actualGeminiBody = { ...(reqJson.request || reqJson) as GeminiRequestBody };
             if (typeof reqJson.sessionId === 'string') actualGeminiBody.sessionId = reqJson.sessionId;
             if (typeof reqJson.conversationId === 'string') actualGeminiBody.conversationId = reqJson.conversationId;
+
+            // Transparent fallback to native Google Cloud Code PA if custom model upstream is offline/fails
+            const fallbackToGoogle = () => {
+              log.warn(
+                `[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) failed or unreachable; transparently falling back to native Google Cloud Code PA`,
+              );
+              let bodyForGoogle = fullBody;
+              try {
+                const parsed = JSON.parse(fullBody.toString('utf-8'));
+                const targetModel = (matchedCustomModel.externalModelName || matchedCustomModel.name || modelName || '').replace(/^models\//, '');
+                if (parsed.model && (parsed.model.includes('MODEL_PLACEHOLDER_') || parsed.model.startsWith('custom-'))) {
+                  parsed.model = targetModel;
+                  if (parsed.request && typeof parsed.request === 'object') {
+                    parsed.request.model = targetModel;
+                  }
+                  bodyForGoogle = Buffer.from(JSON.stringify(parsed), 'utf-8');
+                }
+              } catch {
+                // keep original fullBody
+              }
+              proxyToGoogle(req, res, bodyForGoogle);
+            };
+
             // Resolve fileData URIs then route to translator
             resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-              handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream);
+              handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream, true, fallbackToGoogle);
             });
             return;
           }
@@ -1287,6 +1328,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const customModels = loadCustomModels();
       const matchedCustomModel = customModels.find((m) => {
         const enumName = generateModelPlaceholderId(m);
+        const slug = toSlug(m);
         return (
           m.name === matchedModelName ||
           toSlug(m) === matchedModelName ||
@@ -1299,8 +1341,14 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       if (matchedCustomModel) {
         try {
           const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
+          const fallbackToGoogle = () => {
+            log.warn(
+              `[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) failed or unreachable; transparently falling back to Google PA`,
+            );
+            proxyToGoogle(req, res, fullBody);
+          };
           resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false);
+            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false, fallbackToGoogle);
           });
           return;
         } catch (e) {

@@ -32,4 +32,9 @@ export declare function detectModelCapabilities(m: CustomModelConfig, includeDis
  * Simplified detection for Gemini↔Anthropic translation (checks modelName string only).
  */
 export declare function detectModelCapabilitiesByName(modelName: string): ModelNameCapabilities;
+export declare const NATIVE_GOOGLE_MODELS: {
+    name: string;
+    displayName: string;
+}[];
+export declare function isNativeGoogleModelName(name?: string): boolean;
 //# sourceMappingURL=modelUtils.d.ts.map
