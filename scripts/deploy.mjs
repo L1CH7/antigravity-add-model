@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as asar from '@electron/asar';
-import { planRuntimePatch } from './runtime-patch.mjs';
+import { planRuntimePatch, patchPreload } from './runtime-patch.mjs';
 
 const PROJECT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STATE_DIR = '.antigravity-model-patch';
@@ -25,9 +25,6 @@ export const REQUIRED_BUILD_FILES = [
   'googleAccounts.js',
   'googleOAuth.js',
   'providers.js',
-  'constants.js',
-  'paths.js',
-  'storage.js',
   'proxy.js',
   'cryptoStore.js',
   'schemaValidator.js',
@@ -47,15 +44,12 @@ export const REQUIRED_BUILD_FILES = [
 export const MODULAR_BUILD_FILES = [
   'loader.js',
   'customModelIpc.js',
-  'preload.js',
+  'customPreload.js',
   'modelStore.js',
   'modelManagement.js',
   'googleAccounts.js',
   'googleOAuth.js',
   'providers.js',
-  'constants.js',
-  'paths.js',
-  'storage.js',
   'proxy.js',
   'cryptoStore.js',
   'schemaValidator.js',
@@ -559,13 +553,20 @@ export async function deploy(options = {}, operations = {}) {
     } else {
       const source = path.join(staging, 'source');
       if (options.modular) {
-        asar.extractAll(files.archive, source);
+        asar.extractAll(info.vendorFiles.archive, source);
         for (const file of MODULAR_BUILD_FILES) {
           const srcFile = path.join(info.dist, file);
           const destFile = path.join(source, 'dist', file);
           fs.mkdirSync(path.dirname(destFile), { recursive: true });
           fs.copyFileSync(srcFile, destFile);
         }
+        const preloadPath = path.join(source, 'dist', 'preload.js');
+        const customPreloadPath = path.join(info.dist, 'customPreload.js');
+        const vendorPreloadBytes = fs.readFileSync(preloadPath);
+        const customPreloadBytes = fs.readFileSync(customPreloadPath);
+        const patchedPreload = patchPreload(vendorPreloadBytes, customPreloadBytes);
+        fs.writeFileSync(preloadPath, patchedPreload);
+
         const pkgFile = path.join(source, 'package.json');
         const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
         pkg.main = 'dist/loader.js';

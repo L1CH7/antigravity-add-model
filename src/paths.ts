@@ -4,7 +4,10 @@ import os from 'os';
 import { LS_LOG_FILE_NAME } from './constants';
 
 export function getAppDataDirName(): string {
-  return `antigravity${app.isPackaged ? '' : '-dev'}`;
+  if (!app.isPackaged) {
+    return 'antigravity-dev';
+  }
+  return app.getName().toLowerCase().replace(/\s+/g, '');
 }
 
 export function getAppDataDir(): string {
@@ -22,6 +25,13 @@ export function getSettingsPbPath(): string {
  */
 export function getAppStoragePath(): string {
   return path.join(app.getPath('userData'), 'app_storage.json');
+}
+
+/**
+ * Returns the path to the persistent window geometry and state file.
+ */
+export function getWindowStatePath(): string {
+  return path.join(app.getPath('userData'), 'window_state.json');
 }
 
 /**

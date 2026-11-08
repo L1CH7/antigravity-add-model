@@ -221,7 +221,7 @@ function patchLanguageServer(bytes) {
   return applyEdits(file, source, edits);
 }
 
-function patchPreload(vendorBytes, customBytes) {
+export function patchPreload(vendorBytes, customBytes) {
   const file = 'dist/preload.js';
   const { source } = parse(file, vendorBytes);
   const custom = parse('customPreload.js', customBytes);

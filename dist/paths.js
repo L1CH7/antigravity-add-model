@@ -8,6 +8,7 @@ exports.getAppDataDirName = getAppDataDirName;
 exports.getAppDataDir = getAppDataDir;
 exports.getSettingsPbPath = getSettingsPbPath;
 exports.getAppStoragePath = getAppStoragePath;
+exports.getWindowStatePath = getWindowStatePath;
 exports.getActivePortFilePath = getActivePortFilePath;
 exports.getLsLogPath = getLsLogPath;
 const electron_1 = require("electron");
@@ -15,7 +16,10 @@ const path_1 = __importDefault(require("path"));
 const os_1 = __importDefault(require("os"));
 const constants_1 = require("./constants");
 function getAppDataDirName() {
-    return `antigravity${electron_1.app.isPackaged ? '' : '-dev'}`;
+    if (!electron_1.app.isPackaged) {
+        return 'antigravity-dev';
+    }
+    return electron_1.app.getName().toLowerCase().replace(/\s+/g, '');
 }
 function getAppDataDir() {
     return path_1.default.join(os_1.default.homedir(), '.gemini', getAppDataDirName());
@@ -30,6 +34,12 @@ function getSettingsPbPath() {
  */
 function getAppStoragePath() {
     return path_1.default.join(electron_1.app.getPath('userData'), 'app_storage.json');
+}
+/**
+ * Returns the path to the persistent window geometry and state file.
+ */
+function getWindowStatePath() {
+    return path_1.default.join(electron_1.app.getPath('userData'), 'window_state.json');
 }
 /**
  * Returns the path to the file used to communicate AGY Hub's remote debugging port.

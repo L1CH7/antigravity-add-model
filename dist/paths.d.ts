@@ -8,6 +8,10 @@ export declare function getSettingsPbPath(): string;
  */
 export declare function getAppStoragePath(): string;
 /**
+ * Returns the path to the persistent window geometry and state file.
+ */
+export declare function getWindowStatePath(): string;
+/**
  * Returns the path to the file used to communicate AGY Hub's remote debugging port.
  * Used by recording encoder.
  */
