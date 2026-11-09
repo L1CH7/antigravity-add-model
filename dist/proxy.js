@@ -312,12 +312,19 @@ function proxyToGoogle(req, res, reqBody) {
                 delete modifiedHeaders['content-encoding'];
                 const modifiedBuffer = Buffer.from(text, 'utf-8');
                 modifiedHeaders['content-length'] = String(modifiedBuffer.length);
-                res.writeHead(proxyRes.statusCode || 200, modifiedHeaders);
-                res.end(modifiedBuffer);
+                if (!res.headersSent) {
+                    res.writeHead(proxyRes.statusCode || 200, modifiedHeaders);
+                    res.end(modifiedBuffer);
+                }
+                else {
+                    res.end();
+                }
             });
         }
         else {
-            res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+            if (!res.headersSent) {
+                res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+            }
             proxyRes.on('data', () => {
                 proxyReq.setTimeout(timeoutMs);
             });
@@ -326,8 +333,13 @@ function proxyToGoogle(req, res, reqBody) {
     });
     proxyReq.on('error', (err) => {
         electron_log_1.default.error('[Proxy] Google Forwarding Error:', err);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Proxy forwarding failed: ' + err.message } }));
+        if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'Proxy forwarding failed: ' + err.message } }));
+        }
+        else {
+            res.end();
+        }
     });
     if (reqBody) {
         proxyReq.write(reqBody);
@@ -648,11 +660,13 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
             lastKnownGetModelsRawBuf = responseBuf;
             const customModels = loadCustomModels();
             const modifiedBuf = injectCustomModelsIntoProto(responseBuf, customModels);
-            res.writeHead(200, {
-                'Content-Type': 'application/grpc-web+proto',
-                'Content-Length': String(modifiedBuf.length),
-            });
-            res.end(modifiedBuf);
+            if (!res.headersSent) {
+                res.writeHead(200, {
+                    'Content-Type': 'application/grpc-web+proto',
+                    'Content-Length': String(modifiedBuf.length),
+                });
+                res.end(modifiedBuf);
+            }
         });
         lsRes.on('error', (err) => {
             electron_log_1.default.error('[Proxy] LS error for GetAvailableModels:', err.message);
@@ -970,24 +984,30 @@ function handleRequest(req, res) {
                                 });
                             }
                         }
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify(googleJson));
+                        if (!res.headersSent) {
+                            res.writeHead(200, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify(googleJson));
+                        }
                     }
                     catch (err) {
                         electron_log_1.default.error('[Proxy] Parsing fetchAvailableModels failed, returning fallback models:', err);
-                        const customModels = loadCustomModels();
-                        const mappedCustom = buildNativeAndCustomModelsMap(customModels);
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ models: mappedCustom }));
+                        if (!res.headersSent) {
+                            const customModels = loadCustomModels();
+                            const mappedCustom = buildNativeAndCustomModelsMap(customModels);
+                            res.writeHead(200, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ models: mappedCustom }));
+                        }
                     }
                 });
             });
             googleReq.on('error', (err) => {
                 electron_log_1.default.error('[Proxy] Forwarding fetchAvailableModels failed:', err);
-                const customModels = loadCustomModels();
-                const mappedCustom = buildNativeAndCustomModelsMap(customModels);
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ models: mappedCustom }));
+                if (!res.headersSent) {
+                    const customModels = loadCustomModels();
+                    const mappedCustom = buildNativeAndCustomModelsMap(customModels);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ models: mappedCustom }));
+                }
             });
             if (fullBody && fullBody.length > 0) {
                 googleReq.write(fullBody);
@@ -1049,52 +1069,58 @@ function handleRequest(req, res) {
                         else {
                             googleJson.models = mappedCustom;
                         }
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify(googleJson));
+                        if (!res.headersSent) {
+                            res.writeHead(200, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify(googleJson));
+                        }
                     }
                     catch (err) {
                         electron_log_1.default.error('[Proxy] Google list models failed, returning fallback models list:', err);
-                        const customModels = loadCustomModels();
-                        const nativeMapped = modelUtils_1.NATIVE_GOOGLE_MODELS.map((gm) => ({
-                            name: gm.name,
-                            version: '1.0',
-                            displayName: gm.displayName,
-                            description: 'Official Google model',
-                            inputTokenLimit: 1048576,
-                            outputTokenLimit: 65536,
-                            supportedGenerationMethods: ['generateContent', 'countTokens'],
-                        }));
-                        const mappedCustom = customModels.map((m) => ({
-                            name: 'models/' + generateModelPlaceholderId(m),
-                            version: '1.0',
-                            displayName: m.displayName,
-                            description: m.description,
-                            inputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
-                            outputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
-                            supportedGenerationMethods: ['generateContent', 'countTokens'],
-                        }));
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ models: [...nativeMapped, ...mappedCustom] }));
+                        if (!res.headersSent) {
+                            const customModels = loadCustomModels();
+                            const nativeMapped = modelUtils_1.NATIVE_GOOGLE_MODELS.map((gm) => ({
+                                name: gm.name,
+                                version: '1.0',
+                                displayName: gm.displayName,
+                                description: 'Official Google model',
+                                inputTokenLimit: 1048576,
+                                outputTokenLimit: 65536,
+                                supportedGenerationMethods: ['generateContent', 'countTokens'],
+                            }));
+                            const mappedCustom = customModels.map((m) => ({
+                                name: 'models/' + generateModelPlaceholderId(m),
+                                version: '1.0',
+                                displayName: m.displayName,
+                                description: m.description,
+                                inputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
+                                outputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
+                                supportedGenerationMethods: ['generateContent', 'countTokens'],
+                            }));
+                            res.writeHead(200, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ models: [...nativeMapped, ...mappedCustom] }));
+                        }
                     }
                 });
             });
             googleReq.on('error', (err) => {
                 electron_log_1.default.error('[Proxy] Google models list request error:', err);
-                const customModels = loadCustomModels();
-                const nativeMapped = modelUtils_1.NATIVE_GOOGLE_MODELS.map((gm) => ({
-                    name: gm.name,
-                    displayName: gm.displayName,
-                    description: 'Official Google model',
-                    supportedGenerationMethods: ['generateContent'],
-                }));
-                const customMapped = customModels.map((m) => ({
-                    name: m.name,
-                    displayName: m.displayName,
-                    description: m.description,
-                    supportedGenerationMethods: ['generateContent'],
-                }));
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ models: [...nativeMapped, ...customMapped] }));
+                if (!res.headersSent) {
+                    const customModels = loadCustomModels();
+                    const nativeMapped = modelUtils_1.NATIVE_GOOGLE_MODELS.map((gm) => ({
+                        name: gm.name,
+                        displayName: gm.displayName,
+                        description: 'Official Google model',
+                        supportedGenerationMethods: ['generateContent'],
+                    }));
+                    const customMapped = customModels.map((m) => ({
+                        name: m.name,
+                        displayName: m.displayName,
+                        description: m.description,
+                        supportedGenerationMethods: ['generateContent'],
+                    }));
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ models: [...nativeMapped, ...customMapped] }));
+                }
             });
             googleReq.end();
             return;
