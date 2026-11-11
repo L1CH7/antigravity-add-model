@@ -197,3 +197,37 @@ describe('parseRetryAfter', () => {
     expect(parseRetryAfter({ 'retry-after': '' })).toBe(0);
   });
 });
+
+import { validateCustomModel } from '../schemaValidator';
+
+describe('schemaValidator with reasoningEfforts and max', () => {
+  it('accepts max as reasoningEffort', () => {
+    const res = validateCustomModel({
+      name: 'models/deepseek-test',
+      provider: 'openai',
+      apiUrl: 'https://example.com/v1',
+      reasoningEffort: 'max',
+    });
+    expect(res.valid).toBe(true);
+  });
+
+  it('accepts valid reasoningEfforts array', () => {
+    const res = validateCustomModel({
+      name: 'models/deepseek-test',
+      provider: 'openai',
+      apiUrl: 'https://example.com/v1',
+      reasoningEfforts: ['low', 'medium', 'high', 'max'],
+    });
+    expect(res.valid).toBe(true);
+  });
+
+  it('rejects invalid effort in reasoningEfforts array', () => {
+    const res = validateCustomModel({
+      name: 'models/deepseek-test',
+      provider: 'openai',
+      apiUrl: 'https://example.com/v1',
+      reasoningEfforts: ['low', 'super_mega_ultra'],
+    });
+    expect(res.valid).toBe(false);
+  });
+});

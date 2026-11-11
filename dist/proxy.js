@@ -88,12 +88,40 @@ function generateModelPlaceholderId(model) {
     return `MODEL_PLACEHOLDER_M${num}`;
 }
 function toSlug(model) {
+    if (model._slug)
+        return model._slug;
     return ('custom-' +
         (model.externalModelName || model.name)
             .replace(/^models\//, '')
             .replace(/[^a-zA-Z0-9]+/g, '-')
             .replace(/^-+|-+$/g, '')
             .toLowerCase());
+}
+function expandCustomModels(models) {
+    const result = [];
+    for (const m of models) {
+        if (Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0) {
+            const baseClean = (m.name || '').replace(/^models\//, '');
+            const baseDisplay = m.displayName || baseClean;
+            for (const effort of m.reasoningEfforts) {
+                const effortLabel = effort.charAt(0).toUpperCase() + effort.slice(1);
+                const childName = `models/${baseClean}-${effort}`;
+                const childSlug = `custom-${(m.externalModelName || baseClean).replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase()}-${effort}`;
+                result.push({
+                    ...m,
+                    name: childName,
+                    displayName: `${baseDisplay} ${effortLabel}`,
+                    reasoningEffort: effort,
+                    _slug: childSlug,
+                    reasoningEfforts: undefined,
+                });
+            }
+        }
+        else {
+            result.push(m);
+        }
+    }
+    return result;
 }
 // ─── Model Loading ────────────────────────────────────────────────────────
 function loadCustomModels() {
@@ -232,7 +260,7 @@ function loadCustomModels() {
         if (validModels.length < decrypted.length) {
             electron_log_1.default.info(`[Proxy] Loaded ${validModels.length}/${decrypted.length} valid models (${decrypted.length - validModels.length} skipped)`);
         }
-        return validModels;
+        return expandCustomModels(validModels);
     }
     catch (e) {
         electron_log_1.default.error('[Proxy] Failed to parse custom_models.json', e);
@@ -1160,6 +1188,19 @@ function handleRequest(req, res) {
                             actualGeminiBody.conversationId = reqJson.conversationId;
                         // Transparent fallback to native Google Cloud Code PA if custom model upstream is offline/fails
                         const fallbackToGoogle = () => {
+                            const isGoogleProvider = matchedCustomModel.provider === 'google' || matchedCustomModel.provider === 'google-cloudcode';
+                            if (!isGoogleProvider) {
+                                electron_log_1.default.error(`[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) upstream failed; skipping Google PA fallback since provider is "${matchedCustomModel.provider}"`);
+                                if (!res.headersSent) {
+                                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                                    res.end(JSON.stringify({
+                                        error: {
+                                            message: `Custom model "${matchedCustomModel.displayName}" upstream request failed. See proxy main.log for details.`,
+                                        },
+                                    }));
+                                }
+                                return;
+                            }
                             electron_log_1.default.warn(`[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) failed or unreachable; transparently falling back to native Google Cloud Code PA`);
                             let bodyForGoogle = fullBody;
                             try {
@@ -1219,6 +1260,19 @@ function handleRequest(req, res) {
                 try {
                     const geminiBody = JSON.parse(bodyStr);
                     const fallbackToGoogle = () => {
+                        const isGoogleProvider = matchedCustomModel.provider === 'google' || matchedCustomModel.provider === 'google-cloudcode';
+                        if (!isGoogleProvider) {
+                            electron_log_1.default.error(`[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) upstream failed; skipping Google PA fallback since provider is "${matchedCustomModel.provider}"`);
+                            if (!res.headersSent) {
+                                res.writeHead(502, { 'Content-Type': 'application/json' });
+                                res.end(JSON.stringify({
+                                    error: {
+                                        message: `Custom model "${matchedCustomModel.displayName}" upstream request failed. See proxy main.log for details.`,
+                                    },
+                                }));
+                            }
+                            return;
+                        }
                         electron_log_1.default.warn(`[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) failed or unreachable; transparently falling back to Google PA`);
                         proxyToGoogle(req, res, fullBody);
                     };

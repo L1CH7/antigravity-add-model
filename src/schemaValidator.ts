@@ -143,8 +143,16 @@ export function validateCustomModel(model: unknown): ValidationResult {
   for (const field of ['enabled', 'rawUrl', 'gateway', 'supportsVision', 'supportsThinking', 'encryptedHeaders', 'encryptedGoogleAccounts']) {
     if (m[field] !== undefined && typeof m[field] !== 'boolean') return { valid: false, error: `${field} must be a boolean` };
   }
-  if (m.reasoningEffort !== undefined && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(m.reasoningEffort as string)) {
+  if (m.reasoningEffort !== undefined && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(m.reasoningEffort as string)) {
     return { valid: false, error: 'Invalid reasoningEffort' };
+  }
+  if (m.reasoningEfforts !== undefined) {
+    if (!Array.isArray(m.reasoningEfforts) || m.reasoningEfforts.length === 0 || m.reasoningEfforts.some((e) => !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(e as string))) {
+      return { valid: false, error: 'reasoningEfforts must be an array of valid effort levels' };
+    }
+  }
+  if (m.defaultReasoningEffort !== undefined && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(m.defaultReasoningEffort as string)) {
+    return { valid: false, error: 'Invalid defaultReasoningEffort' };
   }
   for (const field of ['contextWindow', 'maxOutputTokens', 'thinkingBudget', 'timeout', 'idleTimeout', 'retryBudgetMs', 'maxRetries']) {
     const value = m[field];

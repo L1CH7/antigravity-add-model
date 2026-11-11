@@ -19,7 +19,9 @@ export interface CustomModel {
     enabled?: boolean;
     apiFormat?: import('./providers').ApiFormat;
     fallbackModels?: string[];
-    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    reasoningEfforts?: Array<'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>;
+    defaultReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
     thinkingBudget?: number;
     maxOutputTokens?: number;
     contextWindow?: number;

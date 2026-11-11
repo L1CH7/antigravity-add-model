@@ -32,6 +32,9 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getProxyMetrics = getProxyMetrics;
 exports.stopCustomRequests = stopCustomRequests;
@@ -48,6 +51,9 @@ const circuitBreaker_1 = require("./circuitBreaker");
 const requestOptions_1 = require("./requestOptions");
 const shared_1 = require("./shared");
 const utils_1 = require("./translators/utils");
+const electron_log_1 = __importDefault(require("electron-log"));
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 5000 });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 5000 });
 const circuits = new circuitBreaker_1.CircuitBreaker();
 const controllers = new Set();
 const counts = {
@@ -81,7 +87,10 @@ class UpstreamError extends Error {
 function asUpstreamError(error) {
     if (error instanceof googleAccounts_1.GoogleAccountError)
         return new UpstreamError(error.message, error.status, false);
-    return error instanceof UpstreamError ? error : new UpstreamError('Upstream connection failed.');
+    if (error instanceof UpstreamError)
+        return error;
+    const msg = error instanceof Error ? error.message : String(error);
+    return new UpstreamError(`Upstream connection failed: ${msg}`);
 }
 function clearRequestState(key) {
     shared_1.activeStreamContexts.delete(key);
@@ -206,6 +215,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
             const attemptsAllowed = retries + Math.max(0, accountCount - 1);
             for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
                 const stateKey = (0, crypto_1.randomUUID)();
+                const attemptStart = Date.now();
                 let request;
                 let accountLease;
                 let totalTimer;
@@ -276,9 +286,18 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         throw new UpstreamError(`Invalid model configuration: ${error.message}`, 400, false, 0, false);
                     }
                     counts.upstreamAttempts += 1;
+                    const attemptStart = Date.now();
                     const upstream = await new Promise((resolve, reject) => {
-                        request = (url.protocol === 'https:' ? https : http).request(url, { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized }, resolve);
-                        request.once('error', reject);
+                        request = (url.protocol === 'https:' ? https : http).request(url, {
+                            method: 'POST',
+                            headers,
+                            rejectUnauthorized: !model.allowUnauthorized,
+                            agent: url.protocol === 'https:' ? keepAliveHttpsAgent : keepAliveHttpAgent,
+                        }, resolve);
+                        request.once('error', (err) => {
+                            electron_log_1.default.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
+                            reject(err);
+                        });
                         request.setTimeout(model.idleTimeout ?? 180000, () => request?.destroy(new UpstreamError('Upstream idle timeout.', 504)));
                         totalTimer = setTimeout(() => request?.destroy(new UpstreamError('Upstream request timeout.', 504)), Math.min(model.timeout ?? 300000, remaining));
                         signal.addEventListener('abort', abort, { once: true });
@@ -287,8 +306,16 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     const status = upstream.statusCode || 502;
                     if (status < 200 || status >= 300) {
                         const retryAfter = (0, requestOptions_1.parseRetryAfter)(upstream.headers['retry-after']);
+                        const errorChunks = [];
+                        for await (const chunk of upstream) {
+                            errorChunks.push(chunk);
+                            if (errorChunks.reduce((acc, c) => acc + c.length, 0) > 4096)
+                                break;
+                        }
+                        const errorBody = Buffer.concat(errorChunks).toString('utf-8');
+                        electron_log_1.default.error(`[Proxy] Upstream HTTP ${status} for "${model.displayName}" (${url}) [attempt ${attempt + 1}/${attemptsAllowed + 1}]: ${errorBody.slice(0, 500)}`);
                         upstream.destroy();
-                        throw new UpstreamError(`Upstream returned HTTP ${status}.`, status, status === 408 || status === 429 || status >= 500, retryAfter, status !== 400 && status !== 422);
+                        throw new UpstreamError(`Upstream returned HTTP ${status}: ${errorBody.slice(0, 200)}`, status, status === 408 || status === 429 || status >= 500, retryAfter, status !== 400 && status !== 422);
                     }
                     if (isStream && String(upstream.headers['content-type']).includes('text/event-stream')) {
                         const decoder = new string_decoder_1.StringDecoder('utf8');
@@ -429,6 +456,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                 }
                 catch (error) {
                     failure = asUpstreamError(error);
+                    electron_log_1.default.warn(`[Proxy] Request attempt ${attempt + 1}/${attemptsAllowed + 1} for "${model.displayName}" failed after ${Date.now() - attemptStart}ms: ${failure.message}`);
                     accountLease?.release({ status: failure.status, retryAfterMs: failure.retryAfter });
                     if (signal.aborted) {
                         circuits.cancel(circuitKey);

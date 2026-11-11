@@ -10,6 +10,10 @@ import { CircuitBreaker } from './circuitBreaker';
 import { applyRequestOptions, GeminiBody, parseRetryAfter, trimContext } from './requestOptions';
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
 import { collectToolSchemas } from './translators/utils';
+import log from 'electron-log';
+
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 5000 });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 5000 });
 
 const circuits = new CircuitBreaker();
 const controllers = new Set<AbortController>();
@@ -45,7 +49,9 @@ class UpstreamError extends Error {
 }
 function asUpstreamError(error: unknown): UpstreamError {
   if (error instanceof GoogleAccountError) return new UpstreamError(error.message, error.status, false);
-  return error instanceof UpstreamError ? error : new UpstreamError('Upstream connection failed.');
+  if (error instanceof UpstreamError) return error;
+  const msg = error instanceof Error ? error.message : String(error);
+  return new UpstreamError(`Upstream connection failed: ${msg}`);
 }
 function clearRequestState(key: string): void {
   activeStreamContexts.delete(key);
@@ -174,6 +180,7 @@ export async function runCustomModelRequest(
       const attemptsAllowed = retries + Math.max(0, accountCount - 1);
       for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
         const stateKey = randomUUID();
+        const attemptStart = Date.now();
         let request: http.ClientRequest | undefined;
         let accountLease: GoogleAccountLease | undefined;
         let totalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -261,13 +268,22 @@ export async function runCustomModelRequest(
             throw new UpstreamError(`Invalid model configuration: ${(error as Error).message}`, 400, false, 0, false);
           }
           counts.upstreamAttempts += 1;
+          const attemptStart = Date.now();
           const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
             request = (url.protocol === 'https:' ? https : http).request(
               url,
-              { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized },
+              {
+                method: 'POST',
+                headers,
+                rejectUnauthorized: !model.allowUnauthorized,
+                agent: url.protocol === 'https:' ? keepAliveHttpsAgent : keepAliveHttpAgent,
+              },
               resolve,
             );
-            request.once('error', reject);
+            request.once('error', (err) => {
+              log.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
+              reject(err);
+            });
             request.setTimeout(model.idleTimeout ?? 180_000, () =>
               request?.destroy(new UpstreamError('Upstream idle timeout.', 504)),
             );
@@ -281,9 +297,18 @@ export async function runCustomModelRequest(
           const status = upstream.statusCode || 502;
           if (status < 200 || status >= 300) {
             const retryAfter = parseRetryAfter(upstream.headers['retry-after']);
+            const errorChunks: Buffer[] = [];
+            for await (const chunk of upstream) {
+              errorChunks.push(chunk as Buffer);
+              if (errorChunks.reduce((acc, c) => acc + c.length, 0) > 4096) break;
+            }
+            const errorBody = Buffer.concat(errorChunks).toString('utf-8');
+            log.error(
+              `[Proxy] Upstream HTTP ${status} for "${model.displayName}" (${url}) [attempt ${attempt + 1}/${attemptsAllowed + 1}]: ${errorBody.slice(0, 500)}`,
+            );
             upstream.destroy();
             throw new UpstreamError(
-              `Upstream returned HTTP ${status}.`,
+              `Upstream returned HTTP ${status}: ${errorBody.slice(0, 200)}`,
               status,
               status === 408 || status === 429 || status >= 500,
               retryAfter,
@@ -426,6 +451,9 @@ export async function runCustomModelRequest(
           return;
         } catch (error) {
           failure = asUpstreamError(error);
+          log.warn(
+            `[Proxy] Request attempt ${attempt + 1}/${attemptsAllowed + 1} for "${model.displayName}" failed after ${Date.now() - attemptStart}ms: ${failure.message}`,
+          );
           accountLease?.release({ status: failure.status, retryAfterMs: failure.retryAfter });
           if (signal.aborted) {
             circuits.cancel(circuitKey);

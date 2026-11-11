@@ -29,7 +29,9 @@ export interface CustomModel {
   enabled?: boolean;
   apiFormat?: import('./providers').ApiFormat;
   fallbackModels?: string[];
-  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  reasoningEfforts?: Array<'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>;
+  defaultReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   thinkingBudget?: number;
   maxOutputTokens?: number;
   contextWindow?: number;
@@ -118,6 +120,7 @@ function generateModelPlaceholderId(model: CustomModel): string {
 }
 
 function toSlug(model: CustomModel): string {
+  if (model._slug) return model._slug;
   return (
     'custom-' +
     (model.externalModelName || model.name)
@@ -126,6 +129,32 @@ function toSlug(model: CustomModel): string {
       .replace(/^-+|-+$/g, '')
       .toLowerCase()
   );
+}
+
+function expandCustomModels(models: CustomModel[]): CustomModel[] {
+  const result: CustomModel[] = [];
+  for (const m of models) {
+    if (Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0) {
+      const baseClean = (m.name || '').replace(/^models\//, '');
+      const baseDisplay = m.displayName || baseClean;
+      for (const effort of m.reasoningEfforts) {
+        const effortLabel = effort.charAt(0).toUpperCase() + effort.slice(1);
+        const childName = `models/${baseClean}-${effort}`;
+        const childSlug = `custom-${(m.externalModelName || baseClean).replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase()}-${effort}`;
+        result.push({
+          ...m,
+          name: childName,
+          displayName: `${baseDisplay} ${effortLabel}`,
+          reasoningEffort: effort,
+          _slug: childSlug,
+          reasoningEfforts: undefined,
+        });
+      }
+    } else {
+      result.push(m);
+    }
+  }
+  return result;
 }
 
 // ─── Model Loading ────────────────────────────────────────────────────────
@@ -268,7 +297,7 @@ function loadCustomModels(): CustomModel[] {
       );
     }
 
-    return validModels;
+    return expandCustomModels(validModels);
   } catch (e) {
     log.error('[Proxy] Failed to parse custom_models.json', e);
     return [];
@@ -1302,6 +1331,24 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
             // Transparent fallback to native Google Cloud Code PA if custom model upstream is offline/fails
             const fallbackToGoogle = () => {
+              const isGoogleProvider =
+                matchedCustomModel.provider === 'google' || matchedCustomModel.provider === 'google-cloudcode';
+              if (!isGoogleProvider) {
+                log.error(
+                  `[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) upstream failed; skipping Google PA fallback since provider is "${matchedCustomModel.provider}"`,
+                );
+                if (!res.headersSent) {
+                  res.writeHead(502, { 'Content-Type': 'application/json' });
+                  res.end(
+                    JSON.stringify({
+                      error: {
+                        message: `Custom model "${matchedCustomModel.displayName}" upstream request failed. See proxy main.log for details.`,
+                      },
+                    }),
+                  );
+                }
+                return;
+              }
               log.warn(
                 `[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) failed or unreachable; transparently falling back to native Google Cloud Code PA`,
               );
@@ -1366,6 +1413,24 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         try {
           const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
           const fallbackToGoogle = () => {
+            const isGoogleProvider =
+              matchedCustomModel.provider === 'google' || matchedCustomModel.provider === 'google-cloudcode';
+            if (!isGoogleProvider) {
+              log.error(
+                `[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) upstream failed; skipping Google PA fallback since provider is "${matchedCustomModel.provider}"`,
+              );
+              if (!res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(
+                  JSON.stringify({
+                    error: {
+                      message: `Custom model "${matchedCustomModel.displayName}" upstream request failed. See proxy main.log for details.`,
+                    },
+                  }),
+                );
+              }
+              return;
+            }
             log.warn(
               `[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) failed or unreachable; transparently falling back to Google PA`,
             );

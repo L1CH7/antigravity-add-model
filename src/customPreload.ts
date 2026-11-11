@@ -955,6 +955,12 @@ window.addEventListener('DOMContentLoaded', () => {
         'agy-fallback-models',
         Array.isArray(existing?.fallbackModels) ? existing.fallbackModels.join(', ') : '',
       );
+      const efforts = field(
+        advanced,
+        'Reasoning effort levels for menu cascade (comma separated: low, medium, high, xhigh, max)',
+        'agy-reasoning-efforts',
+        Array.isArray(existing?.reasoningEfforts) ? (existing.reasoningEfforts as string[]).join(', ') : '',
+      );
       const headers = jsonField(advanced, 'Custom headers (JSON)', 'agy-custom-headers', existing?.customHeaders);
       const extraBody = jsonField(advanced, 'Additional request fields (JSON)', 'agy-extra-body', existing?.extraBody);
       const breaker = existing?.circuitBreaker as
@@ -1053,6 +1059,13 @@ window.addEventListener('DOMContentLoaded', () => {
                 }
               : undefined,
           reasoningEffort: effort.value || undefined,
+          reasoningEfforts: (() => {
+            const list = efforts.value
+              .split(',')
+              .map((v) => v.trim().toLowerCase())
+              .filter((v) => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(v));
+            return list.length > 0 ? (list as any) : undefined;
+          })(),
           thinkingBudget: readNumber(thinking, 'Thinking budget'),
           maxOutputTokens: readNumber(maxOutput, 'Maximum output tokens', 1),
           contextWindow: readNumber(context, 'Context window', 1),
