@@ -413,7 +413,7 @@ describe('real upstream HTTP routing', () => {
     const response = await fetch(url);
     const text = await response.text();
     expect(text).toContain('partial');
-    expect(text).toContain('event: error');
+    expect(text).toContain('"status":"INTERNAL"');
     expect(attempts).toBe(1);
   });
 
@@ -709,7 +709,7 @@ describe('real upstream HTTP routing', () => {
     );
     const text = await (await fetch(url)).text();
     expect(text).toContain('account-one');
-    expect(text).toContain('event: error');
+    expect(text).toContain('"status":"INTERNAL"');
     expect(captured).toEqual(['Bearer one']);
   });
 });

@@ -141,7 +141,7 @@ export async function runCustomModelRequest(
   res.once('close', onClose);
   let completed = false;
   let upstreamOutput = false;
-  const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 300_000, 300_000));
+  const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 600_000, 600_000));
   let failure = new UpstreamError('No configured model is currently available.', 503);
 
   const writeCandidate = (candidate: unknown) => {
@@ -184,6 +184,7 @@ export async function runCustomModelRequest(
         let request: http.ClientRequest | undefined;
         let accountLease: GoogleAccountLease | undefined;
         let totalTimer: ReturnType<typeof setTimeout> | undefined;
+        let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
         const abort = () => request?.destroy(new Error('Cancelled'));
         try {
           if (signal.aborted) break;
@@ -284,12 +285,12 @@ export async function runCustomModelRequest(
               log.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
               reject(err);
             });
-            request.setTimeout(model.idleTimeout ?? 180_000, () =>
+            request.setTimeout(model.idleTimeout ?? 300_000, () =>
               request?.destroy(new UpstreamError('Upstream idle timeout.', 504)),
             );
             totalTimer = setTimeout(
               () => request?.destroy(new UpstreamError('Upstream request timeout.', 504)),
-              Math.min(model.timeout ?? 300_000, remaining),
+              Math.min(model.timeout ?? 600_000, remaining),
             );
             signal.addEventListener('abort', abort, { once: true });
             request.end(JSON.stringify(payload));
@@ -321,8 +322,28 @@ export async function runCustomModelRequest(
             let buffer = '';
             let dataLines: string[] = [];
             let emitted = false;
+            let hasVisibleContent = false;
             let finalReason = false;
             let terminal = false;
+
+            let streamDurationMs = 0;
+            heartbeatTimer = setInterval(() => {
+              streamDurationMs += 15000;
+              if (res.destroyed || res.writableEnded) return;
+              if (res.headersSent) {
+                // Send keepalive newlines to reset Go client's idleTimeoutReadCloser (5m deadline)
+                res.write('\n\n');
+              } else if (streamDurationMs >= 90000) {
+                // If upstream has been silent for >90s, commit SSE headers and start keepalive
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'X-Accel-Buffering': 'no',
+                });
+                res.write('\n\n');
+              }
+            }, 15000);
+
             const event = () => {
               const data = dataLines.join('\n');
               dataLines = [];
@@ -337,7 +358,18 @@ export async function runCustomModelRequest(
               } catch {
                 throw new UpstreamError('Upstream sent malformed SSE JSON.');
               }
-              if (chunk.error || chunk.type === 'error') throw new UpstreamError('Upstream reported a stream error.');
+              if (chunk.error || chunk.type === 'error') {
+                const errObj = chunk.error && typeof chunk.error === 'object' ? chunk.error : {};
+                const message =
+                  errObj.message ||
+                  chunk.message ||
+                  (typeof chunk.error === 'string' ? chunk.error : 'Upstream reported a stream error.');
+                const code = typeof errObj.code === 'number' ? errObj.code : 502;
+                log.error(`[Proxy] Upstream stream error for "${model.displayName}": ${message}`, {
+                  error: chunk.error || chunk,
+                });
+                throw new UpstreamError(message, code, false);
+              }
               if (cloudCode && chunk.response) chunk = chunk.response;
               const delta = chunk.choices?.[0]?.delta;
               if (
@@ -377,7 +409,14 @@ export async function runCustomModelRequest(
                 finishReason?: string;
               } | null;
               if (mapped) {
-                if (mapped.content?.parts?.length) emitted = true;
+                if (mapped.content?.parts?.length) {
+                  emitted = true;
+                  for (const part of mapped.content.parts as Array<{ text?: string; thought?: boolean; functionCall?: unknown }>) {
+                    if ((part.text && !part.thought) || part.functionCall) {
+                      hasVisibleContent = true;
+                    }
+                  }
+                }
                 if (mapped.finishReason && mapped.finishReason !== 'OTHER') finalReason = true;
                 // A role-only or empty completion must not commit headers and prevent fallback.
                 if (emitted) writeCandidate(mapped);
@@ -404,9 +443,18 @@ export async function runCustomModelRequest(
             if (buffer) buffer += '\n';
             drain();
             event();
+            if (heartbeatTimer) {
+              clearInterval(heartbeatTimer);
+              heartbeatTimer = undefined;
+            }
             if (!emitted) throw new UpstreamError('Upstream returned an empty stream.');
             if (!terminal) throw new UpstreamError('Upstream stream ended before completion.', 502, false);
-            if (!finalReason) writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
+            if (!hasVisibleContent) {
+              writeCandidate({ content: { parts: [{ text: ' ' }], role: 'model' }, finishReason: 'STOP', index: 0 });
+              finalReason = true;
+            } else if (!finalReason) {
+              writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
+            }
           } else {
             let size = 0;
             const chunks: Buffer[] = [];
@@ -483,6 +531,7 @@ export async function runCustomModelRequest(
             break;
           }
         } finally {
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
           if (totalTimer) clearTimeout(totalTimer);
           signal.removeEventListener('abort', abort);
           request?.destroy();
@@ -496,9 +545,14 @@ export async function runCustomModelRequest(
     }
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
       if (res.headersSent) {
-        res.write(
-          `event: error\ndata: ${JSON.stringify({ error: { message: failure.message, code: failure.status } })}\n\n`,
-        );
+        const errorPayload = {
+          error: {
+            code: failure.status || 500,
+            message: failure.message || 'Stream processing failed',
+            status: failure.status === 429 ? 'RESOURCE_EXHAUSTED' : 'INTERNAL',
+          },
+        };
+        res.write(`${JSON.stringify(errorPayload)}\n\n`);
         res.end();
       } else if (fallbackToGoogle) {
         fallbackToGoogle();
