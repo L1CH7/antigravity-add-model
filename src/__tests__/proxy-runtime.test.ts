@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import * as http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { CustomModel } from '../proxy';
-import { buildFallbackChain, getProxyMetrics, runCustomModelRequest, stopCustomRequests } from '../proxy/customRequest';
+import { getProxyMetrics, runCustomModelRequest, stopCustomRequests } from '../proxy/customRequest';
 import { stopCleanupInterval } from '../proxy/shared';
 import { CircuitBreaker } from '../proxy/circuitBreaker';
 import { applyRequestOptions, parseRetryAfter, trimContext } from '../proxy/requestOptions';
@@ -337,7 +337,7 @@ describe('real upstream HTTP routing', () => {
     expect(JSON.stringify(getProxyMetrics())).not.toContain('secret-test-token');
   });
 
-  it('follows configured fallback order, skipping disabled models and duplicates', async () => {
+  it('never switches to another saved model when the selected one fails', async () => {
     const calls: string[] = [];
     const upstream = await serve((req, res) => {
       calls.push(req.url!);
@@ -349,11 +349,10 @@ describe('real upstream HTTP routing', () => {
     });
     const disabled = model(`${upstream}/disabled`, { enabled: false });
     const backup = model(`${upstream}/good`);
-    const primary = model(`${upstream}/bad`, { fallbackModels: ['missing', disabled.name, backup.name, backup.name] });
+    const primary = model(`${upstream}/bad`);
     const url = await proxy([primary, disabled, backup]);
-    expect(await (await fetch(url)).text()).toContain('fallback');
-    expect(calls).toEqual(['/bad/chat/completions', '/good/chat/completions']);
-    expect(buildFallbackChain(primary, [primary, disabled, backup])).toEqual([primary, backup]);
+    expect(await (await fetch(url)).text()).toContain('502');
+    expect(calls).toEqual(['/bad/chat/completions']);
   });
 
   it('does not retry invalid caller requests or run a fallback for HTTP 400', async () => {
@@ -364,12 +363,12 @@ describe('real upstream HTTP routing', () => {
       res.end();
     });
     const backup = model(upstream);
-    const url = await proxy([model(upstream, { maxRetries: 3, fallbackModels: [backup.name] }), backup]);
+    const url = await proxy([model(upstream, { maxRetries: 3 }), backup]);
     expect((await fetch(url)).status).toBe(400);
     expect(attempts).toBe(1);
   });
 
-  it('opens the primary circuit and skips it on the next request', async () => {
+  it('opens the primary circuit and fails honestly on the next request', async () => {
     let primaryCalls = 0;
     const upstream = await serve((req, res) => {
       if (req.url!.includes('/bad')) {
@@ -381,11 +380,10 @@ describe('real upstream HTTP routing', () => {
     const backup = model(`${upstream}/good`);
     const primary = model(`${upstream}/bad`, {
       circuitBreaker: { failureThreshold: 1 },
-      fallbackModels: [backup.name],
     });
     const url = await proxy([primary, backup]);
-    expect((await fetch(url)).status).toBe(200);
-    expect((await fetch(url)).status).toBe(200);
+    expect((await fetch(url)).status).toBe(503);
+    expect((await fetch(url)).status).toBe(503);
     expect(primaryCalls).toBe(1);
   });
 
@@ -409,7 +407,7 @@ describe('real upstream HTTP routing', () => {
       setTimeout(() => res.destroy(), 20);
     });
     const backup = model(upstream);
-    const url = await proxy([model(upstream, { maxRetries: 3, fallbackModels: [backup.name] }), backup], true);
+    const url = await proxy([model(upstream, { maxRetries: 3 }), backup], true);
     const response = await fetch(url);
     const text = await response.text();
     expect(text).toContain('partial');
@@ -431,12 +429,12 @@ describe('real upstream HTTP routing', () => {
       res.end();
     });
     const backup = model(upstream);
-    const url = await proxy([model(upstream, { maxRetries: 3, fallbackModels: [backup.name] }), backup], true);
+    const url = await proxy([model(upstream, { maxRetries: 3 }), backup], true);
     expect((await fetch(url)).status).toBe(502);
     expect(attempts).toBe(1);
   });
 
-  it('falls back from a stream that ends empty before emitting headers', async () => {
+  it('fails honestly from a stream that ends empty before emitting headers', async () => {
     const upstream = await serve((req, res) => {
       if (req.url!.includes('/empty')) {
         res.setHeader('Content-Type', 'text/event-stream');
@@ -445,10 +443,10 @@ describe('real upstream HTTP routing', () => {
       } else success(res, 'recovered');
     });
     const backup = model(`${upstream}/good`);
-    const url = await proxy([model(`${upstream}/empty`, { fallbackModels: [backup.name] }), backup], true);
+    const url = await proxy([model(`${upstream}/empty`), backup], true);
     const response = await fetch(url);
-    expect(response.headers.get('content-type')).toBe('text/event-stream');
-    expect(await response.text()).toContain('recovered');
+    const text = await response.text();
+    expect(text).toContain('empty stream');
   });
 
   it('does not turn incomplete tool JSON into an empty executable tool call', async () => {
@@ -467,7 +465,7 @@ describe('real upstream HTTP routing', () => {
       res.end();
     });
     const backup = model(upstream);
-    const url = await proxy([model(upstream, { maxRetries: 3, fallbackModels: [backup.name] }), backup], true);
+    const url = await proxy([model(upstream, { maxRetries: 3 }), backup], true);
     const response = await fetch(url);
     expect(response.status).toBe(502);
     expect(await response.text()).toContain('incomplete tool arguments');
@@ -801,7 +799,7 @@ describe('provider and configuration contracts', () => {
       /cannot override/,
     );
     expect(validateCustomModel({ ...base, customHeaders: { 'Content-Length': '123' } }).valid).toBe(false);
-    expect(validateCustomModel({ ...base, fallbackModels: [1] }).valid).toBe(false);
+    expect(validateCustomModel({ ...base, maxRetries: -1 }).valid).toBe(false);
     expect(validateCustomModel({ ...base, supportsThinking: false }).valid).toBe(true);
     expect(validateCustomModel({ ...base, supportsThinking: true }).valid).toBe(true);
     expect(validateCustomModel({ ...base, supportsThinking: 'false' }).valid).toBe(false);

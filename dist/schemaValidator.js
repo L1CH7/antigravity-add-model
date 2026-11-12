@@ -162,9 +162,6 @@ function validateCustomModel(model) {
     if (m.contextWindow !== undefined && m.maxOutputTokens !== undefined && Number(m.maxOutputTokens) >= Number(m.contextWindow)) {
         return { valid: false, error: 'maxOutputTokens must be smaller than contextWindow' };
     }
-    if (m.fallbackModels !== undefined && (!Array.isArray(m.fallbackModels) || m.fallbackModels.length > 20 || m.fallbackModels.some((value) => typeof value !== 'string' || !value.trim()))) {
-        return { valid: false, error: 'fallbackModels must contain up to 20 saved model names' };
-    }
     if (m.circuitBreaker !== undefined) {
         if (!m.circuitBreaker || typeof m.circuitBreaker !== 'object' || Array.isArray(m.circuitBreaker))
             return { valid: false, error: 'circuitBreaker must be an object' };

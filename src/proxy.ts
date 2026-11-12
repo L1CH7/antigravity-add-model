@@ -28,7 +28,6 @@ export interface CustomModel {
   maxRetries?: number;
   enabled?: boolean;
   apiFormat?: import('./providers').ApiFormat;
-  fallbackModels?: string[];
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   reasoningEfforts?: Array<'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>;
   defaultReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -474,7 +473,6 @@ function handleCustomModelRequest(
   body: GeminiRequestBody,
   isStream: boolean,
   cloudEnvelope = true,
-  fallbackToGoogle?: () => void,
 ): void {
   void runCustomModelRequest(
     res,
@@ -483,7 +481,6 @@ function handleCustomModelRequest(
     isStream,
     loadCustomModels(),
     cloudEnvelope,
-    fallbackToGoogle,
   );
 }
 
@@ -1329,49 +1326,11 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             if (typeof reqJson.sessionId === 'string') actualGeminiBody.sessionId = reqJson.sessionId;
             if (typeof reqJson.conversationId === 'string') actualGeminiBody.conversationId = reqJson.conversationId;
 
-            // Transparent fallback to native Google Cloud Code PA if custom model upstream is offline/fails
-            const fallbackToGoogle = () => {
-              const isGoogleProvider =
-                matchedCustomModel.provider === 'google' || matchedCustomModel.provider === 'google-cloudcode';
-              if (!isGoogleProvider) {
-                log.error(
-                  `[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) upstream failed; skipping Google PA fallback since provider is "${matchedCustomModel.provider}"`,
-                );
-                if (!res.headersSent) {
-                  res.writeHead(502, { 'Content-Type': 'application/json' });
-                  res.end(
-                    JSON.stringify({
-                      error: {
-                        message: `Custom model "${matchedCustomModel.displayName}" upstream request failed. See proxy main.log for details.`,
-                      },
-                    }),
-                  );
-                }
-                return;
-              }
-              log.warn(
-                `[Proxy] Custom model "${matchedCustomModel.displayName}" (${modelName}) failed or unreachable; transparently falling back to native Google Cloud Code PA`,
-              );
-              let bodyForGoogle = fullBody;
-              try {
-                const parsed = JSON.parse(fullBody.toString('utf-8'));
-                const targetModel = (matchedCustomModel.externalModelName || matchedCustomModel.name || modelName || '').replace(/^models\//, '');
-                if (parsed.model && (parsed.model.includes('MODEL_PLACEHOLDER_') || parsed.model.startsWith('custom-'))) {
-                  parsed.model = targetModel;
-                  if (parsed.request && typeof parsed.request === 'object') {
-                    parsed.request.model = targetModel;
-                  }
-                  bodyForGoogle = Buffer.from(JSON.stringify(parsed), 'utf-8');
-                }
-              } catch {
-                // keep original fullBody
-              }
-              proxyToGoogle(req, res, bodyForGoogle);
-            };
+            // No provider fallback: the request is served by the selected model only.
 
             // Resolve fileData URIs then route to translator
             resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-              handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream, true, fallbackToGoogle);
+              handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream, true);
             });
             return;
           }
@@ -1412,32 +1371,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       if (matchedCustomModel) {
         try {
           const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
-          const fallbackToGoogle = () => {
-            const isGoogleProvider =
-              matchedCustomModel.provider === 'google' || matchedCustomModel.provider === 'google-cloudcode';
-            if (!isGoogleProvider) {
-              log.error(
-                `[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) upstream failed; skipping Google PA fallback since provider is "${matchedCustomModel.provider}"`,
-              );
-              if (!res.headersSent) {
-                res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(
-                  JSON.stringify({
-                    error: {
-                      message: `Custom model "${matchedCustomModel.displayName}" upstream request failed. See proxy main.log for details.`,
-                    },
-                  }),
-                );
-              }
-              return;
-            }
-            log.warn(
-              `[Proxy] Standard custom model "${matchedCustomModel.displayName}" (${matchedModelName}) failed or unreachable; transparently falling back to Google PA`,
-            );
-            proxyToGoogle(req, res, fullBody);
-          };
           resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false, fallbackToGoogle);
+            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false);
           });
           return;
         } catch (e) {

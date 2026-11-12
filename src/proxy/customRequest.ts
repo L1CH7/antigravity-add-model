@@ -25,7 +25,6 @@ const counts = {
   cancelled: 0,
   upstreamAttempts: 0,
   retries: 0,
-  fallbacks: 0,
   circuitSkips: 0,
   accountSwitches: 0,
 };
@@ -37,6 +36,8 @@ export function stopCustomRequests(): void {
 }
 
 class UpstreamError extends Error {
+  upstreamBody?: string;
+  upstreamStatus?: number;
   constructor(
     message: string,
     readonly status = 502,
@@ -105,20 +106,29 @@ function waitForDrain(res: http.ServerResponse): Promise<void> {
   });
 }
 
-export function buildFallbackChain(primary: CustomModel, allModels: CustomModel[]): CustomModel[] {
-  const names = new Set([primary.name]);
-  const chain = [primary];
-  for (const name of primary.fallbackModels || []) {
-    const model = allModels.find((candidate) => candidate.name === name && candidate.enabled !== false);
-    if (model && !names.has(name)) {
-      names.add(name);
-      chain.push(model);
-    }
-  }
-  return chain;
+/** Known upstream error codes mapped to the HTTP status the caller must see. */
+function statusFromUpstreamCode(code: unknown, fallback: number): number {
+  if (typeof code === 'number' && Number.isFinite(code)) return code;
+  if (typeof code !== 'string') return fallback;
+  const known: Record<string, number> = {
+    invalid_request: 400,
+    invalid_request_error: 400,
+    context_length_exceeded: 400,
+    bad_request: 400,
+    authentication_error: 401,
+    invalid_api_key: 401,
+    permission_error: 403,
+    rate_limit: 429,
+    rate_limit_error: 429,
+    rate_limit_exceeded: 429,
+    insufficient_quota: 429,
+    overloaded_error: 503,
+    api_error: 502,
+  };
+  return known[code] ?? fallback;
 }
 
-/** The sole retry/fallback owner; nothing is retried after any model output was received. */
+/** The sole retry owner; the request never switches to another model or provider. */
 export async function runCustomModelRequest(
   res: http.ServerResponse,
   primary: CustomModel,
@@ -126,7 +136,6 @@ export async function runCustomModelRequest(
   isStream: boolean,
   allModels: CustomModel[],
   cloudEnvelope = true,
-  fallbackToGoogle?: () => void,
 ): Promise<void> {
   const toolSchemas = collectToolSchemas(originalBody);
   const controller = new AbortController();
@@ -156,21 +165,28 @@ export async function runCustomModelRequest(
   };
 
   try {
-    const chain = buildFallbackChain(primary, allModels);
-    modelLoop: for (let modelIndex = 0; modelIndex < chain.length; modelIndex++) {
-      const model = chain[modelIndex];
-      if (signal.aborted) break;
+    modelBlock: {
+      const model = primary;
+      if (signal.aborted) return;
       if (Date.now() >= deadline) {
         failure = new UpstreamError('Request retry budget exhausted.', 504, false);
-        break;
+        res.writeHead(failure.status, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({ error: { message: failure.message, code: failure.status, upstreamStatus: failure.status } }),
+        );
+        return;
       }
       // Include transport configuration so editing a broken endpoint does not retain its open circuit.
       const circuitKey = JSON.stringify([model.name, model.apiUrl, model.apiFormat || model.provider]);
       if (!circuits.acquire(circuitKey, model.circuitBreaker)) {
         counts.circuitSkips += 1;
-        continue;
+        failure = new UpstreamError('Model circuit is open after repeated upstream failures.', 503, false);
+        res.writeHead(failure.status, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({ error: { message: failure.message, code: failure.status, upstreamStatus: failure.status } }),
+        );
+        return;
       }
-      if (modelIndex > 0) counts.fallbacks += 1;
       let modelFailed = false;
       const retries = Math.min(5, Math.max(0, model.maxRetries ?? 3));
       const cloudCode = model.provider === 'google-cloudcode';
@@ -301,20 +317,23 @@ export async function runCustomModelRequest(
             const errorChunks: Buffer[] = [];
             for await (const chunk of upstream) {
               errorChunks.push(chunk as Buffer);
-              if (errorChunks.reduce((acc, c) => acc + c.length, 0) > 4096) break;
+              if (errorChunks.reduce((acc, c) => acc + c.length, 0) > 1_048_576) break;
             }
             const errorBody = Buffer.concat(errorChunks).toString('utf-8');
             log.error(
-              `[Proxy] Upstream HTTP ${status} for "${model.displayName}" (${url}) [attempt ${attempt + 1}/${attemptsAllowed + 1}]: ${errorBody.slice(0, 500)}`,
+              `[Proxy] Upstream HTTP ${status} for "${model.displayName}" (${url}) [attempt ${attempt + 1}/${attemptsAllowed + 1}], body bytes ${errorBody.length}: ${errorBody}`,
             );
             upstream.destroy();
-            throw new UpstreamError(
-              `Upstream returned HTTP ${status}: ${errorBody.slice(0, 200)}`,
+            const error = new UpstreamError(
+              errorBody || `Upstream returned HTTP ${status}.`,
               status,
               status === 408 || status === 429 || status >= 500,
               retryAfter,
               status !== 400 && status !== 422,
             );
+            error.upstreamBody = errorBody;
+            error.upstreamStatus = status;
+            throw error;
           }
 
           if (isStream && String(upstream.headers['content-type']).includes('text/event-stream')) {
@@ -325,6 +344,10 @@ export async function runCustomModelRequest(
             let hasVisibleContent = false;
             let finalReason = false;
             let terminal = false;
+            let receivedChunks = 0;
+            let receivedBytes = 0;
+            let firstContentAt = 0;
+            let firstReasoningAt = 0;
 
             let streamDurationMs = 0;
             heartbeatTimer = setInterval(() => {
@@ -364,14 +387,22 @@ export async function runCustomModelRequest(
                   errObj.message ||
                   chunk.message ||
                   (typeof chunk.error === 'string' ? chunk.error : 'Upstream reported a stream error.');
-                const code = typeof errObj.code === 'number' ? errObj.code : 502;
-                log.error(`[Proxy] Upstream stream error for "${model.displayName}": ${message}`, {
-                  error: chunk.error || chunk,
-                });
-                throw new UpstreamError(message, code, false);
+                const code = statusFromUpstreamCode(errObj.code, 502);
+                log.error(
+                  `[Proxy] Upstream stream error for "${model.displayName}": status ${code}, after ${Date.now() - attemptStart}ms, received chunks ${receivedChunks}, bytes ${receivedBytes}, visibleContent ${hasVisibleContent}, terminal ${terminal}`,
+                  { error: chunk.error || chunk },
+                );
+                const error = new UpstreamError(message, code, false, 0, false);
+                error.upstreamBody = data;
+                error.upstreamStatus = code;
+                throw error;
               }
               if (cloudCode && chunk.response) chunk = chunk.response;
+              receivedChunks += 1;
               const delta = chunk.choices?.[0]?.delta;
+              if (delta?.reasoning_content || delta?.reasoning || chunk.delta?.thinking) {
+                if (!firstReasoningAt) firstReasoningAt = Date.now() - attemptStart;
+              }
               if (
                 delta?.content ||
                 delta?.reasoning_content ||
@@ -414,6 +445,7 @@ export async function runCustomModelRequest(
                   for (const part of mapped.content.parts as Array<{ text?: string; thought?: boolean; functionCall?: unknown }>) {
                     if ((part.text && !part.thought) || part.functionCall) {
                       hasVisibleContent = true;
+                      if (!firstContentAt) firstContentAt = Date.now() - attemptStart;
                     }
                   }
                 }
@@ -433,6 +465,7 @@ export async function runCustomModelRequest(
             };
             for await (const bytes of upstream) {
               if (signal.aborted) throw new Error('Cancelled');
+              receivedBytes += (bytes as Buffer).length;
               buffer += decoder.write(bytes as Buffer);
               if (buffer.length + dataLines.join('').length > 2 * 1024 * 1024)
                 throw new UpstreamError('Upstream SSE event is too large.', 502, false);
@@ -449,10 +482,18 @@ export async function runCustomModelRequest(
             }
             if (!emitted) throw new UpstreamError('Upstream returned an empty stream.');
             if (!terminal) throw new UpstreamError('Upstream stream ended before completion.', 502, false);
-            if (!hasVisibleContent) {
-              writeCandidate({ content: { parts: [{ text: ' ' }], role: 'model' }, finishReason: 'STOP', index: 0 });
-              finalReason = true;
-            } else if (!finalReason) {
+            if (!hasVisibleContent && !finalReason) {
+              const error = new UpstreamError(
+                `Upstream finished without visible content after ${Date.now() - attemptStart}ms (chunks ${receivedChunks}, bytes ${receivedBytes}, reasoning at ${firstReasoningAt || 'never'}).`,
+                502,
+                false,
+                0,
+                false,
+              );
+              error.upstreamStatus = 502;
+              throw error;
+            }
+            if (!finalReason) {
               writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
             }
           } else {
@@ -463,13 +504,33 @@ export async function runCustomModelRequest(
               if (size > 20 * 1024 * 1024) throw new UpstreamError('Upstream response exceeds 20 MB.', 502, false);
               chunks.push(bytes as Buffer);
             }
+            const rawBody = Buffer.concat(chunks).toString('utf8');
             let parsed: Record<string, any>;
             try {
-              parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+              parsed = JSON.parse(rawBody);
             } catch {
-              throw new UpstreamError('Upstream returned invalid JSON.');
+              const error = new UpstreamError('Upstream returned invalid JSON.', 502, false, 0, false);
+              error.upstreamBody = rawBody;
+              error.upstreamStatus = 502;
+              throw error;
             }
-            if (parsed.error) throw new UpstreamError('Upstream returned an error response.');
+            if (parsed.error) {
+              const errObj = typeof parsed.error === 'object' ? parsed.error : {};
+              const code = statusFromUpstreamCode(errObj.code, 502);
+              const error = new UpstreamError(
+                errObj.message || (typeof parsed.error === 'string' ? parsed.error : 'Upstream returned an error response.'),
+                code,
+                false,
+                0,
+                false,
+              );
+              error.upstreamBody = rawBody;
+              error.upstreamStatus = code;
+              log.error(
+                `[Proxy] Upstream completion error for "${model.displayName}": status ${code}, after ${Date.now() - attemptStart}ms, body ${rawBody}`,
+              );
+              throw error;
+            }
             if (cloudCode && parsed.response) parsed = parsed.response;
             if (
               (format === 'openai' && !parsed.choices?.[0]?.message) ||
@@ -505,11 +566,11 @@ export async function runCustomModelRequest(
           accountLease?.release({ status: failure.status, retryAfterMs: failure.retryAfter });
           if (signal.aborted) {
             circuits.cancel(circuitKey);
-            break modelLoop;
+            break modelBlock;
           }
           if (res.headersSent || upstreamOutput) {
             circuits.fail(circuitKey, model.circuitBreaker);
-            break modelLoop;
+            break modelBlock;
           }
           if (
             accountLease &&
@@ -541,7 +602,6 @@ export async function runCustomModelRequest(
       }
       if (modelFailed) circuits.fail(circuitKey, model.circuitBreaker);
       else circuits.cancel(circuitKey);
-      if (!failure.mayFallback) break;
     }
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
       if (res.headersSent) {
@@ -550,16 +610,24 @@ export async function runCustomModelRequest(
             code: failure.status || 500,
             message: failure.message || 'Stream processing failed',
             status: failure.status === 429 ? 'RESOURCE_EXHAUSTED' : 'INTERNAL',
+            upstreamStatus: failure.upstreamStatus ?? failure.status,
+            upstreamBody: failure.upstreamBody,
           },
         };
         res.write(`${JSON.stringify(errorPayload)}\n\n`);
         res.end();
-      } else if (fallbackToGoogle) {
-        fallbackToGoogle();
-        return;
       } else {
         res.writeHead(failure.status, { 'Content-Type': 'application/json' });
-        res.write(JSON.stringify({ error: { message: failure.message } }));
+        res.write(
+          JSON.stringify({
+            error: {
+              message: failure.message,
+              code: failure.status,
+              upstreamStatus: failure.upstreamStatus ?? failure.status,
+              upstreamBody: failure.upstreamBody,
+            },
+          }),
+        );
         res.end();
       }
     }
@@ -567,12 +635,17 @@ export async function runCustomModelRequest(
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
       if (res.headersSent) {
         res.end();
-      } else if (fallbackToGoogle) {
-        fallbackToGoogle();
-        return;
       } else {
         res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Model request failed.' } }));
+        res.end(
+          JSON.stringify({
+            error: {
+              message: `Model request failed for "${primary.displayName}".`,
+              code: 502,
+              upstreamStatus: 502,
+            },
+          }),
+        );
       }
     }
   } finally {

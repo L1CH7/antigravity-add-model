@@ -37,91 +37,89 @@ async function serve(handler: http.RequestListener): Promise<string> {
   return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 }
 
-describe('Antigravity Manager Seamless Fallback to Google PA', () => {
-  it('transparently triggers fallbackToGoogle without sending 502 when port 8045 is down/unreachable', async () => {
-    // Port 59998 is closed/not listening (simulates Antigravity Manager stopped)
-    const deadModel: CustomModel = {
-      name: 'models/gemini-3.8-flash-high',
-      displayName: 'Gemini 3.8 Flash High (Native)',
-      provider: 'google',
-      apiUrl: 'http://127.0.0.1:59998/v1beta',
+describe('Antigravity Manager upstream error propagation', () => {
+  it('propagates the real upstream status and body instead of a generic 502', async () => {
+    const upstream = await serve((_req, res) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid_request: content must not be empty', code: 'invalid_request' } }));
+    });
+
+    const model: CustomModel = {
+      name: 'models/test-openai',
+      displayName: 'Test OpenAI',
+      provider: 'openai',
+      apiUrl: `${upstream}/v1/chat/completions`,
       apiKey: 'test-key',
-      externalModelName: 'gemini-3.8-flash-high',
+      externalModelName: 'test-model',
       maxRetries: 0,
-      timeout: 1000,
     };
 
-    let fallbackCalled = false;
-    let clientGotError = false;
-
-    // Simulate incoming client response object
-    const serverUrl = await serve(async (req, res) => {
-      const fallbackToGoogle = () => {
-        fallbackCalled = true;
-        // In actual proxy, this forwards to proxyToGoogle
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ response: 'Served by native Google Cloud Code PA' }));
-      };
-
+    const serverUrl = await serve(async (_req, res) => {
       await runCustomModelRequest(
         res,
-        deadModel,
+        model,
         { contents: [{ role: 'user', parts: [{ text: 'test query' }] }] },
-        true,
-        [deadModel],
-        true,
-        fallbackToGoogle,
+        false,
+        [model],
+        false,
       );
     });
 
     const response = await fetch(serverUrl);
-    expect(fallbackCalled).toBe(true);
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(400);
     const body = await response.json();
-    expect(body.response).toBe('Served by native Google Cloud Code PA');
+    expect(body.error.message).toContain('invalid_request');
+    expect(body.error.upstreamStatus).toBe(400);
   });
 
-  it('uses custom model upstream and does NOT trigger fallback when Antigravity Manager is running', async () => {
-    // Live mock Antigravity Manager server on port
-    const liveUpstream = await serve((req, res) => {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'From Antigravity Manager Pool' } }] })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+  it('serves the configured model and never switches to another one', async () => {
+    const calls: string[] = [];
+    const upstream = await serve((req, res) => {
+      calls.push(req.url!);
+      if (req.url!.includes('/bad')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'bad request', code: 'invalid_request' } }));
+      } else {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'from primary' } }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
     });
 
-    const liveModel: CustomModel = {
-      name: 'models/gemini-3.8-flash-high',
-      displayName: 'Gemini 3.8 Flash High (Native)',
+    const secondary: CustomModel = {
+      name: 'models/secondary',
+      displayName: 'Secondary',
       provider: 'openai',
-      apiUrl: `${liveUpstream}/v1/chat/completions`,
+      apiUrl: `${upstream}/good`,
       apiKey: 'test-key',
-      externalModelName: 'gemini-3.8-flash-high',
+      externalModelName: 'secondary',
+      maxRetries: 0,
+    };
+    const primary: CustomModel = {
+      name: 'models/primary',
+      displayName: 'Primary',
+      provider: 'openai',
+      apiUrl: `${upstream}/bad`,
+      apiKey: 'test-key',
+      externalModelName: 'primary',
       maxRetries: 0,
     };
 
-    let fallbackCalled = false;
-    const serverUrl = await serve(async (req, res) => {
-      const fallbackToGoogle = () => {
-        fallbackCalled = true;
-      };
-
+    const serverUrl = await serve(async (_req, res) => {
       await runCustomModelRequest(
         res,
-        liveModel,
+        primary,
         { contents: [{ role: 'user', parts: [{ text: 'test query' }] }] },
-        true,
-        [liveModel],
-        true,
-        fallbackToGoogle,
+        false,
+        [primary, secondary],
+        false,
       );
     });
 
     const response = await fetch(serverUrl);
-    expect(fallbackCalled).toBe(false);
-    expect(response.status).toBe(200);
-    const text = await response.text();
-    expect(text).toContain('From Antigravity Manager Pool');
+    expect(response.status).toBe(400);
+    expect(calls).toEqual(['/bad/chat/completions']);
   });
 
   it('guarantees NATIVE_GOOGLE_MODELS contains all standard Antigravity Gemini and Claude models', async () => {

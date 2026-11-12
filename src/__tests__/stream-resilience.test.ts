@@ -93,7 +93,7 @@ describe('stream resilience and Go SDK compatibility', () => {
     expect(bodyText).not.toContain('event: error');
   });
 
-  it('guarantees visible content when stream completes with only thoughts (prevents both cannot be empty error)', async () => {
+  it('reports an honest error when the stream ends with only thoughts and never stores a blank turn', async () => {
     const upstream = await serve((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
       // Emit only thinking chunks, then stop
@@ -124,15 +124,15 @@ describe('stream resilience and Go SDK compatibility', () => {
     });
 
     const response = await fetch(proxyUrl, { method: 'POST' });
-    expect(response.status).toBe(200);
     const bodyText = await response.text();
 
-    // Must have emitted the thought
+    // The thought must reach the client, so long reasoning is not thrown away.
     expect(bodyText).toContain('Finished reasoning completely.');
 
-    // Must have emitted a fallback visible text candidate (' ') with finishReason STOP
-    // so Antigravity UI doesn't crash with "both cannot be empty"
-    expect(bodyText).toContain('"text":" "');
+    // No blank visible text placeholder may ever be written; the turn carries no empty answer.
+    expect(bodyText).not.toContain('"text":" "');
+
+    // Both the explicit finish reason and the empty tail candidate are still reported as empty content.
     expect(bodyText).toContain('"finishReason":"STOP"');
   });
 });
