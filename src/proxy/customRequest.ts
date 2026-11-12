@@ -38,6 +38,7 @@ export function stopCustomRequests(): void {
 class UpstreamError extends Error {
   upstreamBody?: string;
   upstreamStatus?: number;
+  clientStatus?: number;
   constructor(
     message: string,
     readonly status = 502,
@@ -54,11 +55,30 @@ function asUpstreamError(error: unknown): UpstreamError {
   const msg = error instanceof Error ? error.message : String(error);
   return new UpstreamError(`Upstream connection failed: ${msg}`);
 }
-function clearRequestState(key: string): void {
-  activeStreamContexts.delete(key);
-  modelReasoningContent.delete(key);
-  modelToolCallIds.delete(key);
-  for (const timestamps of Object.values(stateTimestamps)) timestamps.delete(key);
+function clearStreamState(streamKey: string): void {
+  activeStreamContexts.delete(streamKey);
+  stateTimestamps.streamCtx.delete(streamKey);
+}
+function extractChunkMetadata(chunk: Record<string, any>, format: string): Record<string, unknown> {
+  const meta: Record<string, unknown> = {};
+  if (format === 'google' && chunk.usageMetadata && typeof chunk.usageMetadata === 'object') {
+    meta.usageMetadata = chunk.usageMetadata;
+  } else {
+    const usage = chunk.usage || chunk.message?.usage;
+    if (usage && typeof usage === 'object') {
+      const promptTokenCount = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+      const candidatesTokenCount = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+      const totalTokenCount = Number(usage.total_tokens ?? promptTokenCount + candidatesTokenCount);
+      meta.usageMetadata = { promptTokenCount, candidatesTokenCount, totalTokenCount };
+    } else if (chunk.usageMetadata && typeof chunk.usageMetadata === 'object') {
+      meta.usageMetadata = chunk.usageMetadata;
+    }
+  }
+  const modelVersion = chunk.modelVersion || chunk.model || chunk.message?.model;
+  if (typeof modelVersion === 'string' && modelVersion) meta.modelVersion = modelVersion;
+  const responseId = chunk.responseId || chunk.id || chunk.message?.id;
+  if (typeof responseId === 'string' && responseId) meta.responseId = responseId;
+  return meta;
 }
 function envelope(value: unknown, cloud: boolean): unknown {
   return cloud ? { response: value, traceId: '', metadata: {} } : value;
@@ -106,7 +126,7 @@ function waitForDrain(res: http.ServerResponse): Promise<void> {
   });
 }
 
-/** Known upstream error codes mapped to the HTTP status the caller must see. */
+/** Известные коды ошибок апстрима и соответствующие HTTP-статусы. */
 function statusFromUpstreamCode(code: unknown, fallback: number): number {
   if (typeof code === 'number' && Number.isFinite(code)) return code;
   if (typeof code !== 'string') return fallback;
@@ -118,6 +138,8 @@ function statusFromUpstreamCode(code: unknown, fallback: number): number {
     authentication_error: 401,
     invalid_api_key: 401,
     permission_error: 403,
+    model_not_found: 404,
+    not_found: 404,
     rate_limit: 429,
     rate_limit_error: 429,
     rate_limit_exceeded: 429,
@@ -126,6 +148,38 @@ function statusFromUpstreamCode(code: unknown, fallback: number): number {
     api_error: 502,
   };
   return known[code] ?? fallback;
+}
+
+/** Извлекает код и сообщение ошибки из JSON-тела ответа апстрима. */
+function extractErrorDetails(rawBody: string): { code?: unknown; message?: string } {
+  try {
+    const parsed = JSON.parse(rawBody) as { error?: { code?: unknown; type?: unknown; message?: unknown }; code?: unknown; message?: unknown };
+    return {
+      code: parsed?.error?.code ?? parsed?.error?.type ?? parsed?.code,
+      message: typeof parsed?.error?.message === 'string' ? parsed.error.message : typeof parsed?.message === 'string' ? parsed.message : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Определяет отказ маршрутизации канала, который IDE не должна повторять 9 раз. */
+function isPaidChannelUnavailableError(code: unknown, message: string): boolean {
+  return (
+    code === 'upstream_unavailable' ||
+    /smart_route_stream_commit_failure|No upstream channels are currently available/i.test(message)
+  );
+}
+
+/** Проверяет, содержит ли переведённый кандидат значимый ответ, мысль или вызов инструмента. */
+function hasSubstantiveCandidateContent(mapped: { content?: { parts?: unknown[] } } | null): boolean {
+  const parts = mapped?.content?.parts;
+  if (!Array.isArray(parts)) return false;
+  return parts.some((rawPart) => {
+    const part = rawPart as { text?: string; thought?: boolean; functionCall?: unknown };
+    if (part.functionCall || part.thought) return true;
+    return typeof part.text === 'string' && part.text.trim().length > 0;
+  });
 }
 
 /** The sole retry owner; the request never switches to another model or provider. */
@@ -153,7 +207,7 @@ export async function runCustomModelRequest(
   const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 600_000, 600_000));
   let failure = new UpstreamError('No configured model is currently available.', 503);
 
-  const writeCandidate = (candidate: unknown) => {
+  const writeStreamPayload = (payload: Record<string, unknown>) => {
     if (signal.aborted || res.destroyed) throw new Error('Cancelled');
     if (!res.headersSent)
       res.writeHead(200, {
@@ -161,8 +215,17 @@ export async function runCustomModelRequest(
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no',
       });
-    res.write(`data: ${JSON.stringify(envelope({ candidates: [candidate] }, cloudEnvelope))}\n\n`);
+    res.write(`data: ${JSON.stringify(envelope(payload, cloudEnvelope))}\n\n`);
   };
+  const writeCandidate = (candidate: unknown, meta?: Record<string, unknown>) => {
+    writeStreamPayload({ candidates: [candidate], ...(meta || {}) });
+  };
+  // Стабильный ключ диалога для сохранения reasoning_content и tool_call_id между ходами.
+  const rawConvId = originalBody.conversationId || originalBody.sessionId;
+  const conversationKey =
+    typeof rawConvId === 'string' && rawConvId.trim()
+      ? `${primary.name}:${rawConvId.trim()}`
+      : primary.name || primary.externalModelName || 'custom-model';
 
   try {
     modelBlock: {
@@ -195,7 +258,7 @@ export async function runCustomModelRequest(
         : 0;
       const attemptsAllowed = retries + Math.max(0, accountCount - 1);
       for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
-        const stateKey = randomUUID();
+        const streamKey = randomUUID();
         const attemptStart = Date.now();
         let request: http.ClientRequest | undefined;
         let accountLease: GoogleAccountLease | undefined;
@@ -231,7 +294,7 @@ export async function runCustomModelRequest(
             const body = trimContext(originalBody, model.contextWindow, outputBudget);
             const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
             payload = applyRequestOptions(
-              registry.translateRequest(model.provider, body, externalName, format, stateKey) as Record<
+              registry.translateRequest(model.provider, body, externalName, format, conversationKey) as Record<
                 string,
                 unknown
               >,
@@ -324,15 +387,19 @@ export async function runCustomModelRequest(
               `[Proxy] Upstream HTTP ${status} for "${model.displayName}" (${url}) [attempt ${attempt + 1}/${attemptsAllowed + 1}], body bytes ${errorBody.length}: ${errorBody}`,
             );
             upstream.destroy();
+            const parsedErr = extractErrorDetails(errorBody);
+            const effectiveStatus = statusFromUpstreamCode(parsedErr.code, status);
+            const paidUnavailable = isPaidChannelUnavailableError(parsedErr.code, parsedErr.message || errorBody);
             const error = new UpstreamError(
               errorBody || `Upstream returned HTTP ${status}.`,
-              status,
-              status === 408 || status === 429 || status >= 500,
+              effectiveStatus,
+              effectiveStatus === 408 || effectiveStatus === 429 || effectiveStatus >= 500,
               retryAfter,
-              status !== 400 && status !== 422,
+              effectiveStatus !== 400 && effectiveStatus !== 404 && effectiveStatus !== 422,
             );
             error.upstreamBody = errorBody;
             error.upstreamStatus = status;
+            if (paidUnavailable) error.clientStatus = 424;
             throw error;
           }
 
@@ -342,12 +409,24 @@ export async function runCustomModelRequest(
             let dataLines: string[] = [];
             let emitted = false;
             let hasVisibleContent = false;
+            let hasSubstantiveOutput = false;
+            const pendingWhitespace: Array<{ candidate: unknown; meta?: Record<string, unknown> }> = [];
             let finalReason = false;
             let terminal = false;
             let receivedChunks = 0;
             let receivedBytes = 0;
             let firstContentAt = 0;
             let firstReasoningAt = 0;
+            let pendingMeta: Record<string, unknown> | null = null;
+            let usageEmitted = false;
+
+            const flushWhitespace = () => {
+              while (pendingWhitespace.length > 0) {
+                const item = pendingWhitespace.shift()!;
+                if (item.meta?.usageMetadata) usageEmitted = true;
+                writeCandidate(item.candidate, item.meta);
+              }
+            };
 
             let streamDurationMs = 0;
             heartbeatTimer = setInterval(() => {
@@ -387,14 +466,17 @@ export async function runCustomModelRequest(
                   errObj.message ||
                   chunk.message ||
                   (typeof chunk.error === 'string' ? chunk.error : 'Upstream reported a stream error.');
-                const code = statusFromUpstreamCode(errObj.code, 502);
+                const errCode = errObj.code ?? errObj.type;
+                const code = statusFromUpstreamCode(errCode, 502);
+                const paidUnavailable = isPaidChannelUnavailableError(errCode, message);
                 log.error(
                   `[Proxy] Upstream stream error for "${model.displayName}": status ${code}, after ${Date.now() - attemptStart}ms, received chunks ${receivedChunks}, bytes ${receivedBytes}, visibleContent ${hasVisibleContent}, terminal ${terminal}`,
                   { error: chunk.error || chunk },
                 );
-                const error = new UpstreamError(message, code, false, 0, false);
+                const error = new UpstreamError(message, code, paidUnavailable, 0, !paidUnavailable);
                 error.upstreamBody = data;
                 error.upstreamStatus = code;
+                if (paidUnavailable) error.clientStatus = 424;
                 throw error;
               }
               if (cloudCode && chunk.response) chunk = chunk.response;
@@ -403,16 +485,25 @@ export async function runCustomModelRequest(
               if (delta?.reasoning_content || delta?.reasoning || chunk.delta?.thinking) {
                 if (!firstReasoningAt) firstReasoningAt = Date.now() - attemptStart;
               }
+              const chunkMeta = extractChunkMetadata(chunk, format);
+              if (chunkMeta.usageMetadata) {
+                pendingMeta = chunkMeta;
+              }
+              const candidateParts = chunk.candidates?.[0]?.content?.parts;
+              const hasVisibleCandidatePart =
+                Array.isArray(candidateParts) &&
+                candidateParts.some(
+                  (p: { text?: string; thought?: boolean; functionCall?: unknown }) =>
+                    (typeof p.text === 'string' && !p.thought && p.text.trim().length > 0) || Boolean(p.functionCall),
+                );
+              // Не помечаем поток как давший видимый вывод, пока не придёт непробельный контент или вызов инструмента.
               if (
-                delta?.content ||
-                delta?.reasoning_content ||
-                delta?.reasoning ||
+                (typeof delta?.content === 'string' && delta.content.trim().length > 0) ||
                 delta?.tool_calls?.length ||
                 chunk.content_block?.type === 'tool_use' ||
-                chunk.delta?.text ||
-                chunk.delta?.thinking ||
+                (typeof chunk.delta?.text === 'string' && chunk.delta.text.trim().length > 0) ||
                 chunk.delta?.partial_json ||
-                chunk.candidates?.[0]?.content?.parts?.length
+                hasVisibleCandidatePart
               )
                 upstreamOutput = true;
               if (
@@ -425,33 +516,53 @@ export async function runCustomModelRequest(
                 (chunk.type === 'message_delta' && chunk.delta?.stop_reason === 'tool_use') ||
                 chunk.choices?.[0]?.finish_reason
               ) {
-                for (const tool of Object.values(activeStreamContexts.get(stateKey)?.toolCalls || {}))
+                for (const tool of Object.values(activeStreamContexts.get(streamKey)?.toolCalls || {}))
                   validateToolArguments(tool.arguments);
               }
               const mapped = registry.translateStreamChunk(
                 model.provider,
                 chunk,
-                stateKey,
+                conversationKey,
                 format,
-                stateKey,
+                streamKey,
                 toolSchemas,
               ) as {
                 content?: { parts?: unknown[] };
                 finishReason?: string;
               } | null;
               if (mapped) {
+                const isTerminalFinish = Boolean(mapped.finishReason && mapped.finishReason !== 'OTHER');
                 if (mapped.content?.parts?.length) {
                   emitted = true;
                   for (const part of mapped.content.parts as Array<{ text?: string; thought?: boolean; functionCall?: unknown }>) {
-                    if ((part.text && !part.thought) || part.functionCall) {
+                    if (
+                      (typeof part.text === 'string' && !part.thought && (part.text.trim().length > 0 || hasSubstantiveOutput)) ||
+                      part.functionCall
+                    ) {
                       hasVisibleContent = true;
                       if (!firstContentAt) firstContentAt = Date.now() - attemptStart;
                     }
                   }
                 }
-                if (mapped.finishReason && mapped.finishReason !== 'OTHER') finalReason = true;
-                // A role-only or empty completion must not commit headers and prevent fallback.
-                if (emitted) writeCandidate(mapped);
+                if (isTerminalFinish) finalReason = true;
+                const emitMeta = Object.keys(chunkMeta).length > 0 ? chunkMeta : undefined;
+                if (!hasSubstantiveOutput && mapped.content?.parts?.length && !hasSubstantiveCandidateContent(mapped) && !isTerminalFinish) {
+                  // Придерживаем чисто пробельные стартовые чанки до первого значимого ответа или завершения потока.
+                  pendingWhitespace.push({ candidate: mapped, meta: emitMeta });
+                } else {
+                  if (hasSubstantiveCandidateContent(mapped) || isTerminalFinish) {
+                    hasSubstantiveOutput = true;
+                    flushWhitespace();
+                  }
+                  // A role-only or empty completion must not commit headers and prevent fallback.
+                  if (emitted && hasSubstantiveOutput) {
+                    if (emitMeta?.usageMetadata) usageEmitted = true;
+                    writeCandidate(mapped, emitMeta);
+                  }
+                }
+              } else if (pendingMeta?.usageMetadata && res.headersSent && terminal) {
+                usageEmitted = true;
+                writeStreamPayload({ candidates: [], ...pendingMeta });
               }
             };
             const drain = () => {
@@ -494,7 +605,12 @@ export async function runCustomModelRequest(
               throw error;
             }
             if (!finalReason) {
-              writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
+              const tailMeta = !usageEmitted && pendingMeta ? pendingMeta : undefined;
+              if (tailMeta?.usageMetadata) usageEmitted = true;
+              writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 }, tailMeta);
+            } else if (!usageEmitted && pendingMeta?.usageMetadata && res.headersSent) {
+              usageEmitted = true;
+              writeStreamPayload({ candidates: [], ...pendingMeta });
             }
           } else {
             let size = 0;
@@ -516,16 +632,15 @@ export async function runCustomModelRequest(
             }
             if (parsed.error) {
               const errObj = typeof parsed.error === 'object' ? parsed.error : {};
-              const code = statusFromUpstreamCode(errObj.code, 502);
-              const error = new UpstreamError(
-                errObj.message || (typeof parsed.error === 'string' ? parsed.error : 'Upstream returned an error response.'),
-                code,
-                false,
-                0,
-                false,
-              );
+              const errCode = errObj.code ?? errObj.type;
+              const code = statusFromUpstreamCode(errCode, 502);
+              const message =
+                errObj.message || (typeof parsed.error === 'string' ? parsed.error : 'Upstream returned an error response.');
+              const paidUnavailable = isPaidChannelUnavailableError(errCode, message);
+              const error = new UpstreamError(message, code, paidUnavailable, 0, !paidUnavailable);
               error.upstreamBody = rawBody;
               error.upstreamStatus = code;
+              if (paidUnavailable) error.clientStatus = 424;
               log.error(
                 `[Proxy] Upstream completion error for "${model.displayName}": status ${code}, after ${Date.now() - attemptStart}ms, body ${rawBody}`,
               );
@@ -542,7 +657,7 @@ export async function runCustomModelRequest(
               for (const tool of parsed.choices[0].message.tool_calls) validateToolArguments(tool.function?.arguments);
             }
             // Some compatible endpoints return a complete JSON response even when stream=true.
-            const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas) as {
+            const mapped = registry.translateResponse(model.provider, parsed, conversationKey, format, toolSchemas) as {
               candidates?: unknown[];
             };
             if (!mapped?.candidates?.length) throw new UpstreamError('Upstream returned no candidates.');
@@ -597,7 +712,7 @@ export async function runCustomModelRequest(
           signal.removeEventListener('abort', abort);
           request?.destroy();
           accountLease?.release();
-          clearRequestState(stateKey);
+          clearStreamState(streamKey);
         }
       }
       if (modelFailed) circuits.fail(circuitKey, model.circuitBreaker);
@@ -614,15 +729,16 @@ export async function runCustomModelRequest(
             upstreamBody: failure.upstreamBody,
           },
         };
-        res.write(`${JSON.stringify(errorPayload)}\n\n`);
+        res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
         res.end();
       } else {
-        res.writeHead(failure.status, { 'Content-Type': 'application/json' });
+        const clientStatus = failure.clientStatus ?? failure.status;
+        res.writeHead(clientStatus, { 'Content-Type': 'application/json' });
         res.write(
           JSON.stringify({
             error: {
               message: failure.message,
-              code: failure.status,
+              code: clientStatus,
               upstreamStatus: failure.upstreamStatus ?? failure.status,
               upstreamBody: failure.upstreamBody,
             },

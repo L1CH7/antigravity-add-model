@@ -1,6 +1,5 @@
 /**
- * Shared translator utility functions.
- * Extracted from proxy.js to avoid duplication across translator modules.
+ * Общие вспомогательные функции для трансляторов протоколов.
  */
 export interface GeminiParameterProperties {
     type?: string;
@@ -54,8 +53,25 @@ export declare function normalizeToolArgs(name: string, args: Record<string, unk
  */
 export declare function fixParamTypes(properties: Record<string, unknown> | undefined): void;
 /**
- * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
+ * Извлекает декларации инструментов из Gemini tools в нормализованном виде
+ * (с копированием схемы и приведением типов параметров к нижнему регистру).
  */
-export declare function translateToolCallToNative(name: string, args: ToolCallArgs, schemas?: ToolSchemas): TranslatedToolCall;
-export declare function formatTranslatedResponse(translatedInfo: TranslatedCallInfo, responseData: unknown): string;
+export declare function extractGeminiToolDeclarations(geminiTools: unknown): Array<{
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+}>;
+/**
+ * Безопасно разбирает аргументы вызова инструмента из JSON-строки или объекта.
+ */
+export declare function parseToolCallArgs(rawArgs: unknown): ToolCallArgs;
+/**
+ * Сохраняет оригинальное имя и параметры вызова инструмента без подмены.
+ * Команды терминала (включая ls, cat, grep и т.д.) передаются в run_command как есть.
+ */
+export declare function translateToolCallToNative(name: string, args: ToolCallArgs, _schemas?: ToolSchemas): TranslatedToolCall;
+/**
+ * Преобразует ответ инструмента в строку для передачи модели без искажения структуры.
+ */
+export declare function formatTranslatedResponse(_translatedInfo: TranslatedCallInfo, responseData: unknown): string;
 //# sourceMappingURL=utils.d.ts.map

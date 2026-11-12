@@ -1,3 +1,7 @@
+/**
+ * OpenAI/Ollama provider translator.
+ * Handles Gemini ↔ OpenAI/Ollama request/response mapping and streaming chunks.
+ */
 import { ToolSchemas } from './utils';
 interface GeminiTool {
     functionDeclarations?: GeminiFunctionDeclaration[];

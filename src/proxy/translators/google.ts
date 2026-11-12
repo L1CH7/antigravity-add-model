@@ -35,6 +35,7 @@ interface GeminiStreamChunk {
   candidates?: GeminiCandidate[];
   usageMetadata?: unknown;
   modelVersion?: string;
+  responseId?: string;
 }
 
 interface GeminiRequestBody {

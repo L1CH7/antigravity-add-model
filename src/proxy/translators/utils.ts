@@ -1,9 +1,7 @@
 /**
- * Shared translator utility functions.
- * Extracted from proxy.js to avoid duplication across translator modules.
+ * Общие вспомогательные функции для трансляторов протоколов.
  */
 
-import * as path from 'path';
 import log from 'electron-log';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -107,6 +105,14 @@ const TOOL_PARAM_NORMALIZATION: Record<string, { primaryKey: string; aliases: st
       'input',
       'uri',
     ],
+  },
+  'view_file.StartLine': {
+    primaryKey: 'StartLine',
+    aliases: ['start_line', 'startLine', 'from_line', 'fromLine', 'line_start', 'lineStart'],
+  },
+  'view_file.EndLine': {
+    primaryKey: 'EndLine',
+    aliases: ['end_line', 'endLine', 'to_line', 'toLine', 'line_end', 'lineEnd'],
   },
   list_dir: {
     primaryKey: 'DirectoryPath',
@@ -247,6 +253,14 @@ const TOOL_PARAM_NORMALIZATION: Record<string, { primaryKey: string; aliases: st
       'input',
     ],
   },
+  'read_file.StartLine': {
+    primaryKey: 'StartLine',
+    aliases: ['start_line', 'startLine', 'from_line', 'fromLine', 'line_start', 'lineStart'],
+  },
+  'read_file.EndLine': {
+    primaryKey: 'EndLine',
+    aliases: ['end_line', 'endLine', 'to_line', 'toLine', 'line_end', 'lineEnd'],
+  },
   search_files: {
     primaryKey: 'SearchPath',
     aliases: [
@@ -384,138 +398,79 @@ export function fixParamTypes(properties: Record<string, unknown> | undefined): 
 }
 
 /**
- * Translates generic shell/terminal commands (run_command) into native Antigravity file tools.
+ * Извлекает декларации инструментов из Gemini tools в нормализованном виде
+ * (с копированием схемы и приведением типов параметров к нижнему регистру).
  */
-export function translateToolCallToNative(name: string, args: ToolCallArgs, schemas?: ToolSchemas): TranslatedToolCall {
-  // With live declarations, preserve the requested tool and its semantics.
-  // Guessing an equivalent file tool can introduce undeclared names/arguments.
-  if (schemas) return { name, args: args as Record<string, unknown> };
-  if (name !== 'run_command' || !args || !args.CommandLine) {
-    return { name, args: args as Record<string, unknown> };
-  }
-
-  const cmd = args.CommandLine.trim();
-  const cwd = args.Cwd || process.cwd();
-
-  // 1. list_dir translation
-  const isListDir = /^(ls|dir)(\s+[\w\-\/\.\*]+)*$/i.test(cmd);
-  if (isListDir) {
-    let dirPath = cwd;
-    const tokens = cmd.split(/\s+/).slice(1);
-    const pathToken = tokens.find((t) => !t.startsWith('-') && !t.startsWith('/'));
-    if (pathToken) {
-      dirPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-    }
-    log.info(`[Proxy] Translating run_command "${cmd}" to list_dir on "${dirPath}"`);
-    return { name: 'list_dir', args: { DirectoryPath: dirPath } };
-  }
-
-  // 2. view_file translation
-  const catMatch = /^(cat|type)\s+(["']?)(.*?)\2$/i.exec(cmd);
-  if (catMatch) {
-    const filePath = catMatch[3].trim();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-    log.info(`[Proxy] Translating run_command "${cmd}" to view_file on "${absPath}"`);
-    return { name: 'view_file', args: { AbsolutePath: absPath } };
-  }
-
-  // 2b. write_file translation (echo redirect)
-  const echoRedirectMatch = /^(echo|printf)\s+(.+?)\s*>\s*(.+)$/i.exec(cmd);
-  if (echoRedirectMatch) {
-    const content = echoRedirectMatch[2].replace(/^["']|["']$/g, '');
-    const filePath = echoRedirectMatch[3].trim();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-    log.info(`[Proxy] Translating run_command "${cmd}" to write_file on "${absPath}"`);
-    return { name: 'write_file', args: { AbsolutePath: absPath, Content: content, Append: cmd.includes('>>') } };
-  }
-
-  // 3. grep_search translation
-  if (cmd.toLowerCase().startsWith('grep') || cmd.toLowerCase().startsWith('findstr')) {
-    let query = '';
-    let searchPath = cwd;
-    const regexQuotes = /"([^"]+)"|'([^']+)'/g;
-    const quotesFound = [...cmd.matchAll(regexQuotes)];
-    if (quotesFound.length > 0) {
-      query = quotesFound[0][1] || quotesFound[0][2];
-    } else {
-      const tokens = cmd.split(/\s+/);
-      query = tokens[tokens.length - 1];
-    }
-    const tokens = cmd.split(/\s+/);
-    const pathToken = tokens.find(
-      (t, idx) =>
-        idx > 0 && !t.startsWith('-') && !t.startsWith('/') && !t.includes('"') && !t.includes("'") && t !== query,
-    );
-    if (pathToken) {
-      searchPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-    }
-    if (query) {
-      log.info(`[Proxy] Translating run_command "${cmd}" to grep_search (Query: "${query}", Path: "${searchPath}")`);
-      return {
-        name: 'grep_search',
-        args: {
-          Query: query,
-          SearchPath: searchPath,
-          CaseInsensitive: cmd.includes('-i') || cmd.toLowerCase().includes('/i'),
-          IsRegex: false,
-          MatchPerLine: true,
-        },
+export function extractGeminiToolDeclarations(
+  geminiTools: unknown,
+): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
+  if (!geminiTools || !Array.isArray(geminiTools)) return [];
+  const extracted: Array<{ name: string; description: string; parameters: Record<string, unknown> }> = [];
+  for (const toolGroup of geminiTools) {
+    if (!toolGroup || typeof toolGroup !== 'object') continue;
+    const decls = (toolGroup as { functionDeclarations?: unknown }).functionDeclarations;
+    if (!Array.isArray(decls)) continue;
+    for (const func of decls) {
+      if (!func || typeof func !== 'object') continue;
+      const fn = func as {
+        name?: string;
+        description?: string;
+        parametersJsonSchema?: unknown;
+        parameters?: unknown;
       };
+      if (!fn.name) continue;
+      const declaration = fn.parametersJsonSchema ?? fn.parameters;
+      const params = declaration
+        ? (JSON.parse(JSON.stringify(declaration)) as Record<string, unknown>)
+        : { type: 'object', properties: {} };
+      if (params.type && typeof params.type === 'string') {
+        params.type = params.type.toLowerCase();
+      }
+      if (params.properties && typeof params.properties === 'object') {
+        fixParamTypes(params.properties as Record<string, unknown>);
+      }
+      extracted.push({
+        name: fn.name,
+        description: fn.description || '',
+        parameters: params,
+      });
     }
   }
-
-  return { name, args: args as Record<string, unknown> };
+  return extracted;
 }
 
-export function formatTranslatedResponse(translatedInfo: TranslatedCallInfo, responseData: unknown): string {
-  const { translatedName, cmd } = translatedInfo;
-  log.info(`[Proxy] Formatting native response back to CLI for translated tool "${translatedName}" (Cmd: "${cmd}")`);
-
-  if (translatedName === 'list_dir') {
-    if (Array.isArray(responseData)) {
-      return (responseData as DirectoryItem[])
-        .map((item) => {
-          const typeIndicator = item.isDir ? '<DIR>' : '     ';
-          const sizeStr = item.isDir ? '' : ` (${item.sizeBytes || 0} bytes)`;
-          return `${typeIndicator}  ${item.name}${sizeStr}`;
-        })
-        .join('\n');
+/**
+ * Безопасно разбирает аргументы вызова инструмента из JSON-строки или объекта.
+ */
+export function parseToolCallArgs(rawArgs: unknown): ToolCallArgs {
+  if (!rawArgs) return {};
+  if (typeof rawArgs === 'string') {
+    try {
+      const parsed = JSON.parse(rawArgs);
+      return parsed && typeof parsed === 'object' ? (parsed as ToolCallArgs) : {};
+    } catch (e) {
+      log.debug('[Proxy] Tool call args parse fallback:', (e as Error).message);
+      return {};
     }
-    if (responseData && typeof responseData === 'object') {
-      const data = responseData as FileListResponse;
-      const items = data.files || data.children || [];
-      if (Array.isArray(items)) {
-        return items.map((item) => `${item.isDir ? '<DIR>' : '     '}  ${item.name}`).join('\n');
-      }
-    }
-    return typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
   }
+  return typeof rawArgs === 'object' ? (rawArgs as ToolCallArgs) : {};
+}
 
-  if (translatedName === 'view_file') {
-    if (responseData && typeof responseData === 'object') {
-      const data = responseData as FileListResponse;
-      return data.content || data.CodeContent || JSON.stringify(responseData);
-    }
-    return typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
-  }
+/**
+ * Сохраняет оригинальное имя и параметры вызова инструмента без подмены.
+ * Команды терминала (включая ls, cat, grep и т.д.) передаются в run_command как есть.
+ */
+export function translateToolCallToNative(
+  name: string,
+  args: ToolCallArgs,
+  _schemas?: ToolSchemas,
+): TranslatedToolCall {
+  return { name, args: (args || {}) as Record<string, unknown> };
+}
 
-  if (translatedName === 'grep_search') {
-    if (Array.isArray(responseData)) {
-      return (responseData as MatchResult[])
-        .map((match) => `${match.Filename}:${match.LineNumber}:${match.LineContent}`)
-        .join('\n');
-    }
-    return typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
-  }
-
-  if (translatedName === 'write_file') {
-    if (responseData && typeof responseData === 'object') {
-      const data = responseData as Record<string, unknown>;
-      if (data.success) return `File written successfully: ${data.path || 'unknown'}`;
-      return `Failed to write file: ${data.error || 'Unknown error'}`;
-    }
-    return typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
-  }
-
-  return typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+/**
+ * Преобразует ответ инструмента в строку для передачи модели без искажения структуры.
+ */
+export function formatTranslatedResponse(_translatedInfo: TranslatedCallInfo, responseData: unknown): string {
+  return typeof responseData === 'string' ? responseData : JSON.stringify(responseData ?? '');
 }

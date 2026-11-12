@@ -150,6 +150,7 @@ interface GeminiUsageMetadata {
 
 // ─── REQUEST: Gemini → Anthropic ──────────────────────────────────────────
 
+// ПРИМЕЧАНИЕ: разбор схем инструментов здесь дублирует логику extractGeminiToolDeclarations из utils.ts.
 function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[] {
   if (!geminiTools || !Array.isArray(geminiTools)) return [];
   const anthropicTools: AnthropicTool[] = [];
@@ -195,6 +196,7 @@ export function mapGeminiToAnthropic(
   let system: string | undefined = undefined;
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
+    // ПРИМЕЧАНИЕ: склейка через '' может объединять фрагменты системного промпта без разделителя (в openai.ts используется '\n\n').
     system = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
   }
 
@@ -208,6 +210,7 @@ export function mapGeminiToAnthropic(
         if (hasFunctionCall && item.role === 'model') {
           const contentBlocks: AnthropicContentBlock[] = [];
           for (const p of item.parts) {
+            // ПРИМЕЧАНИЕ: части с флагом thought: true здесь не фильтруются и попадают в обычный текстовый блок.
             if (p.text) contentBlocks.push({ type: 'text', text: p.text });
             if (p.functionCall) {
               const callId = p.functionCall.id || 'call_' + Math.random().toString(36).slice(2, 10);
@@ -266,6 +269,7 @@ export function mapGeminiToAnthropic(
           if (item.parts) {
             const partsContent: string[] = [];
             for (const p of item.parts) {
+              // ПРИМЕЧАНИЕ: части с thought: true здесь не отделяются от обычного текста ответа.
               if (p.text) {
                 partsContent.push(p.text);
               } else if ((p as any).fileData) {

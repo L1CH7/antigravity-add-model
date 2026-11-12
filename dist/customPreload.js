@@ -1058,6 +1058,68 @@ window.addEventListener('DOMContentLoaded', () => {
         }
         return customModelsCache.models;
     }
+    function injectCustomModelsIntoJsonText(text, customModels) {
+        if (!text || text.length <= 10 || !customModels || customModels.length === 0)
+            return null;
+        try {
+            const parsed = JSON.parse(text);
+            const modelsObj = (parsed.models || parsed.availableModels || parsed.available_models || {});
+            const occupied = new Set();
+            for (const [k, v] of Object.entries(modelsObj)) {
+                if (/MODEL_PLACEHOLDER_M\d+/.test(k))
+                    occupied.add(k);
+                if (v && typeof v === 'object') {
+                    const modelVal = v.model;
+                    if (typeof modelVal === 'string' && /MODEL_PLACEHOLDER_M\d+/.test(modelVal)) {
+                        occupied.add(modelVal);
+                    }
+                }
+            }
+            for (const m of customModels) {
+                const slug = 'custom-' +
+                    (m.externalModelName || m.name || '')
+                        .replace(/^models\//, '')
+                        .replace(/[^a-zA-Z0-9]+/g, '-')
+                        .replace(/^-+|-+$/g, '')
+                        .toLowerCase();
+                // Выдаем ID строго из валидного диапазона протокола M0..M1650 (приоритетно 1000..1650).
+                const startOffset = hashCodeStr((m.displayName || m.name || '').toLowerCase()) % 651;
+                let placeholderId = '';
+                for (let step = 0; step < 651; step++) {
+                    const candidate = `MODEL_PLACEHOLDER_M${1000 + ((startOffset + step) % 651)}`;
+                    if (!occupied.has(candidate)) {
+                        placeholderId = candidate;
+                        break;
+                    }
+                }
+                if (!placeholderId) {
+                    for (let n = 999; n >= 0; n--) {
+                        const candidate = `MODEL_PLACEHOLDER_M${n}`;
+                        if (!occupied.has(candidate)) {
+                            placeholderId = candidate;
+                            break;
+                        }
+                    }
+                }
+                placeholderId = placeholderId || `MODEL_PLACEHOLDER_M${1000 + startOffset}`;
+                occupied.add(placeholderId);
+                modelsObj[slug] = {
+                    displayName: m.displayName || m.name,
+                    recommended: true,
+                    maxTokens: m.contextWindow || 1048576,
+                    maxOutputTokens: m.maxOutputTokens || 4096,
+                    tokenizerType: 'LLAMA_WITH_SPECIAL',
+                    model: placeholderId,
+                    apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+                    modelProvider: 'MODEL_PROVIDER_GOOGLE',
+                };
+            }
+            return JSON.stringify(parsed);
+        }
+        catch {
+            return null;
+        }
+    }
     // Intercept XHR to inject custom models into GetAvailableModels responses
     const origXHROpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url, async, username, password) {
@@ -1081,39 +1143,10 @@ window.addEventListener('DOMContentLoaded', () => {
                     (this.responseType === '' || this.responseType === 'text') &&
                     isJsonResponse(this.getResponseHeader('content-type'))) {
                     const customModels = customModelsCache.models;
-                    if (customModels && customModels.length > 0) {
-                        try {
-                            const responseText = this.responseText;
-                            if (responseText && responseText.length > 10) {
-                                const parsed = JSON.parse(responseText);
-                                const modelsObj = (parsed.models || parsed.availableModels || parsed.available_models || {});
-                                for (const m of customModels) {
-                                    const slug = 'custom-' +
-                                        (m.externalModelName || m.name || '')
-                                            .replace(/^models\//, '')
-                                            .replace(/[^a-zA-Z0-9]+/g, '-')
-                                            .replace(/^-+|-+$/g, '')
-                                            .toLowerCase();
-                                    modelsObj[slug] = {
-                                        displayName: m.displayName || m.name,
-                                        recommended: true,
-                                        maxTokens: m.contextWindow || 1048576,
-                                        maxOutputTokens: m.maxOutputTokens || 4096,
-                                        tokenizerType: 'LLAMA_WITH_SPECIAL',
-                                        model: 'MODEL_PLACEHOLDER_M' +
-                                            (400 + (Math.abs(hashCodeStr(m.displayName || m.name || '')) % 200)),
-                                        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                                        modelProvider: 'MODEL_PROVIDER_GOOGLE',
-                                    };
-                                }
-                                // Override response
-                                Object.defineProperty(this, 'responseText', { value: JSON.stringify(parsed), writable: true });
-                                Object.defineProperty(this, 'response', { value: JSON.stringify(parsed), writable: true });
-                            }
-                        }
-                        catch {
-                            /* ignore parse errors */
-                        }
+                    const updated = customModels ? injectCustomModelsIntoJsonText(this.responseText, customModels) : null;
+                    if (updated !== null) {
+                        Object.defineProperty(this, 'responseText', { value: updated, writable: true });
+                        Object.defineProperty(this, 'response', { value: updated, writable: true });
                     }
                 }
                 if (origOnReady)
@@ -1138,29 +1171,9 @@ window.addEventListener('DOMContentLoaded', () => {
                 try {
                     const cloned = response.clone();
                     const text = await cloned.text();
-                    if (text && text.length > 10) {
-                        const parsed = JSON.parse(text);
-                        const modelsObj = (parsed.models || parsed.availableModels || parsed.available_models || {});
-                        for (const m of customModels) {
-                            const slug = 'custom-' +
-                                (m.externalModelName || m.name || '')
-                                    .replace(/^models\//, '')
-                                    .replace(/[^a-zA-Z0-9]+/g, '-')
-                                    .replace(/^-+|-+$/g, '')
-                                    .toLowerCase();
-                            modelsObj[slug] = {
-                                displayName: m.displayName || m.name,
-                                recommended: true,
-                                maxTokens: m.contextWindow || 1048576,
-                                maxOutputTokens: m.maxOutputTokens || 4096,
-                                tokenizerType: 'LLAMA_WITH_SPECIAL',
-                                model: 'MODEL_PLACEHOLDER_M' +
-                                    (400 + (Math.abs(hashCodeStr(m.displayName || m.name || '')) % 200)),
-                                apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                                modelProvider: 'MODEL_PROVIDER_GOOGLE',
-                            };
-                        }
-                        return new Response(JSON.stringify(parsed), {
+                    const updated = injectCustomModelsIntoJsonText(text, customModels);
+                    if (updated !== null) {
+                        return new Response(updated, {
                             status: response.status,
                             statusText: response.statusText,
                             headers: response.headers,

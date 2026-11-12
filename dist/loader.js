@@ -7,7 +7,7 @@ const proxy_1 = require("./proxy");
 const customModelIpc_1 = require("./customModelIpc");
 let proxyPort = 0;
 // Start the local proxy server as early as possible
-(0, proxy_1.startProxy)()
+const startProxyPromise = (0, proxy_1.startProxy)()
     .then((port) => {
     proxyPort = port;
     console.log(`[Loader] Local proxy started on port ${port}`);
@@ -91,15 +91,23 @@ electron_1.app.whenReady().then(() => {
             }
             // Route model listing through local proxy to inject custom models
             if (details.url.includes('LanguageServerService/GetAvailableModels')) {
-                const port = proxyPort || (0, proxy_1.getProxyPort)() || 50999;
-                if (port > 0) {
+                const redirectWithPort = (port) => {
                     const redirectTarget = `http://127.0.0.1:${port}/GetAvailableModels?ls=${encodeURIComponent(details.url)}`;
                     console.log(`[Loader] Redirecting GetAvailableModels to proxy: ${redirectTarget}`);
                     callback({
                         redirectURL: redirectTarget,
                     });
+                };
+                const readyPort = proxyPort || (0, proxy_1.getProxyPort)();
+                if (readyPort > 0) {
+                    redirectWithPort(readyPort);
                     return;
                 }
+                // Дожидаемся завершения старта прокси при холодном запуске Electron, чтобы не попасть в гонку порта.
+                startProxyPromise.then((startedPort) => {
+                    redirectWithPort(startedPort || (0, proxy_1.getProxyPort)() || 50999);
+                });
+                return;
             }
             callback({});
         });

@@ -89,6 +89,15 @@ describe('mapGeminiToOpenAI', () => {
     expect(result.messages[0]).toEqual({ role: 'system', content: 'You are helpful.' });
   });
 
+  it('joins multi-part systemInstruction with blank lines', () => {
+    const body = {
+      systemInstruction: { parts: [{ text: 'First rule.' }, { text: 'Second rule.' }] },
+      contents: [],
+    };
+    const result = mapGeminiToOpenAI(body, 'gpt-4o');
+    expect(result.messages[0]).toEqual({ role: 'system', content: 'First rule.\n\nSecond rule.' });
+  });
+
   it('should convert user messages correctly', () => {
     const body = {
       contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
@@ -642,5 +651,78 @@ describe('mapOpenAIChunkToGemini', () => {
     expect(result).not.toBeNull();
     const fcParts = result!.content.parts.filter((p) => p.functionCall);
     expect(fcParts.length).toBeGreaterThan(0);
+  });
+
+  it('buffers fragmented full-width DSML tool calls and preserves cleanText', () => {
+    const c1 = mapOpenAIChunkToGemini(
+      {
+        id: 'stream_fw_dsml',
+        choices: [{ delta: { content: 'Checking...\n<｜DSML｜function_calls><｜DSML｜invoke name="run_command">' }, index: 0 }],
+      },
+      'deepseek-v4',
+      'fw-dsml-key',
+    );
+    expect(c1).toBeNull();
+
+    const c2 = mapOpenAIChunkToGemini(
+      {
+        id: 'stream_fw_dsml',
+        choices: [
+          {
+            delta: {
+              content:
+                '<｜DSML｜parameter name="CommandLine" string="true">ls -la</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>',
+            },
+            index: 0,
+          },
+        ],
+      },
+      'deepseek-v4',
+      'fw-dsml-key',
+    );
+    expect(c2?.finishReason).toBe('TOOL_CALL');
+    expect(c2?.content.parts).toEqual([
+      { text: 'Checking...' },
+      { functionCall: { name: 'run_command', args: { CommandLine: 'ls -la' } } },
+    ]);
+  });
+
+  it('preserves delta.content and delta.reasoning_content when both arrive in one chunk', () => {
+    const result = mapOpenAIChunkToGemini(
+      {
+        id: 'stream_both',
+        choices: [{ delta: { reasoning_content: 'step 1', content: 'Answer:' }, index: 0 }],
+      },
+      'deepseek-v4',
+      'both-key',
+    );
+    expect(result?.content.parts).toEqual([
+      { text: 'step 1', thought: true },
+      { text: 'Answer:' },
+    ]);
+  });
+
+  it('retains reasoning_content across tool_calls turns', () => {
+    mapOpenAIChunkToGemini(
+      {
+        choices: [
+          {
+            delta: {
+              reasoning_content: 'Need to inspect file first',
+              tool_calls: [{ index: 0, id: 'call_tc_1', function: { name: 'view_file', arguments: '{"AbsolutePath":"/a.ts"}' } }],
+            },
+          },
+        ],
+      },
+      'deepseek-v4',
+      'tc-reason-stream',
+    );
+    const done = mapOpenAIChunkToGemini(
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      'deepseek-v4',
+      'tc-reason-stream',
+    );
+    expect(done?.finishReason).toBe('TOOL_CALL');
+    expect(shared.modelReasoningContent.get('deepseek-v4')).toBe('Need to inspect file first');
   });
 });

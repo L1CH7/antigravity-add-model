@@ -42,6 +42,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.isNativeGoogleModelName = exports.NATIVE_GOOGLE_MODELS = void 0;
+exports.generateModelPlaceholderId = generateModelPlaceholderId;
+exports.toSlug = toSlug;
+exports.collectOccupiedPlaceholders = collectOccupiedPlaceholders;
+exports.resolveCustomModelKeys = resolveCustomModelKeys;
+exports.mergeFetchAvailableModelsResponse = mergeFetchAvailableModelsResponse;
+exports.mergeListModelsResponse = mergeListModelsResponse;
+exports.findMatchedCustomModel = findMatchedCustomModel;
 exports.startProxy = startProxy;
 exports.stopProxy = stopProxy;
 exports.getProxyPort = getProxyPort;
@@ -67,14 +74,18 @@ Object.defineProperty(exports, "isNativeGoogleModelName", { enumerable: true, ge
 const customRequest_1 = require("./proxy/customRequest");
 const modelStore_1 = require("./modelStore");
 const listen_1 = require("./proxy/listen");
-// Dynamic imports (stays require for Electron-specific modules)
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const cryptoStore = require('./cryptoStore');
+const cryptoStore = __importStar(require("./cryptoStore"));
 // ─── Model Helpers ────────────────────────────────────────────────────────
 function getCustomModelsPath() {
     const homeDir = process.env.HOME || process.env.USERPROFILE || "";
     return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
 }
+// Допустимый диапазон enum exa.codeium_common_pb.Model в language_server и main.js: MODEL_PLACEHOLDER_M0..M1650.
+const VALID_PLACEHOLDER_MIN = 0;
+const VALID_PLACEHOLDER_MAX = 1650;
+// Верхний поддиапазон (M1000..M1650) удален от основных моделей Google; при занятости перебираем весь [0..1650].
+const PREFERRED_PLACEHOLDER_MIN = 1000;
+const PREFERRED_PLACEHOLDER_SPAN = VALID_PLACEHOLDER_MAX - PREFERRED_PLACEHOLDER_MIN + 1;
 function generateModelPlaceholderId(model) {
     const ext = (model.externalModelName || model.name || "custom").toLowerCase();
     const disp = (model.displayName || "model").toLowerCase();
@@ -84,7 +95,7 @@ function generateModelPlaceholderId(model) {
     let h2 = 5381;
     for (let i = 0; i < disp.length; i++)
         h2 = ((h2 << 5) + h2 + disp.charCodeAt(i)) & 0xFFFFFFFF;
-    const num = 10 + (Math.abs((h1 * 7) + h2) % 500);
+    const num = PREFERRED_PLACEHOLDER_MIN + (Math.abs((h1 * 7) + h2) % PREFERRED_PLACEHOLDER_SPAN);
     return `MODEL_PLACEHOLDER_M${num}`;
 }
 function toSlug(model) {
@@ -96,6 +107,106 @@ function toSlug(model) {
             .replace(/[^a-zA-Z0-9]+/g, '-')
             .replace(/^-+|-+$/g, '')
             .toLowerCase());
+}
+const lastOccupiedPlaceholders = new Set();
+const lastAssignedPlaceholderBySlug = new Map();
+// Собирает все MODEL_PLACEHOLDER_M*, уже занятые в ответе сервера Google (модели, устаревшие/уровневые ID).
+function collectOccupiedPlaceholders(payload) {
+    const occupied = new Set();
+    if (!payload)
+        return occupied;
+    const addIfPlaceholder = (val) => {
+        if (typeof val !== 'string')
+            return;
+        const match = /MODEL_PLACEHOLDER_M\d+/.exec(val);
+        if (match)
+            occupied.add(match[0]);
+    };
+    addIfPlaceholder(payload.defaultAgentModelId);
+    for (const key of ['models', 'availableModels', 'available_models', 'deprecatedModelIds', 'tieredModelIds']) {
+        const container = payload[key];
+        if (Array.isArray(container)) {
+            for (const item of container) {
+                if (typeof item === 'string') {
+                    addIfPlaceholder(item);
+                }
+                else if (item && typeof item === 'object') {
+                    const obj = item;
+                    addIfPlaceholder(obj.model);
+                    addIfPlaceholder(obj.name);
+                    addIfPlaceholder(obj.modelName);
+                    addIfPlaceholder(obj.newModelId);
+                }
+            }
+        }
+        else if (container && typeof container === 'object') {
+            for (const [k, v] of Object.entries(container)) {
+                addIfPlaceholder(k);
+                if (typeof v === 'string') {
+                    addIfPlaceholder(v);
+                }
+                else if (v && typeof v === 'object') {
+                    const obj = v;
+                    addIfPlaceholder(obj.model);
+                    addIfPlaceholder(obj.name);
+                    addIfPlaceholder(obj.modelName);
+                    addIfPlaceholder(obj.newModelId);
+                }
+            }
+        }
+    }
+    return occupied;
+}
+function pickFreePlaceholderId(preferredPlaceholderId, usedPlaceholders) {
+    if (!usedPlaceholders.has(preferredPlaceholderId)) {
+        return preferredPlaceholderId;
+    }
+    const baseNum = parseInt(preferredPlaceholderId.replace('MODEL_PLACEHOLDER_M', ''), 10);
+    const startOffset = !isNaN(baseNum) && baseNum >= PREFERRED_PLACEHOLDER_MIN && baseNum <= VALID_PLACEHOLDER_MAX
+        ? baseNum - PREFERRED_PLACEHOLDER_MIN
+        : 0;
+    // Сначала перебираем свободные слоты в верхнем поддиапазоне [1000..1650].
+    for (let step = 1; step < PREFERRED_PLACEHOLDER_SPAN; step++) {
+        const candidateNum = PREFERRED_PLACEHOLDER_MIN + ((startOffset + step) % PREFERRED_PLACEHOLDER_SPAN);
+        const candidate = `MODEL_PLACEHOLDER_M${candidateNum}`;
+        if (!usedPlaceholders.has(candidate)) {
+            return candidate;
+        }
+    }
+    // Запасной перебор по остальным валидным слотам [999..0].
+    for (let candidateNum = PREFERRED_PLACEHOLDER_MIN - 1; candidateNum >= VALID_PLACEHOLDER_MIN; candidateNum--) {
+        const candidate = `MODEL_PLACEHOLDER_M${candidateNum}`;
+        if (!usedPlaceholders.has(candidate)) {
+            return candidate;
+        }
+    }
+    electron_log_1.default.warn('[Proxy] All valid MODEL_PLACEHOLDER_M0..M1650 slots are occupied; reusing candidate.');
+    return preferredPlaceholderId;
+}
+// Гарантирует уникальные слаги и свободные валидные placeholder ID (без коллизий с Google и между кастомными моделями).
+function resolveCustomModelKeys(models, occupiedPlaceholders) {
+    const usedSlugs = new Set();
+    const usedPlaceholders = new Set(occupiedPlaceholders);
+    return models.map((model) => {
+        const placeholderId = pickFreePlaceholderId(generateModelPlaceholderId(model), usedPlaceholders);
+        usedPlaceholders.add(placeholderId);
+        const baseSlug = toSlug(model);
+        let slug = baseSlug;
+        if (usedSlugs.has(slug)) {
+            const prov = (model.provider || 'custom')
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-+|-+$/g, '') || 'custom';
+            slug = `${baseSlug}-${prov}`;
+            let suffix = 2;
+            while (usedSlugs.has(slug)) {
+                slug = `${baseSlug}-${prov}-${suffix++}`;
+            }
+        }
+        usedSlugs.add(slug);
+        model._slug = slug;
+        return { model, slug, placeholderId };
+    });
 }
 function expandCustomModels(models) {
     const result = [];
@@ -569,6 +680,8 @@ function encodeModelEntryForGetModels(name, displayName, mapping) {
     return encodeProtoBuf(fields);
 }
 let lastKnownGetModelsRawBuf = null;
+let lastKnownFetchAvailableModelsJson = null;
+let lastKnownListModelsJson = null;
 function buildSyntheticGetModelsResponse(customModels) {
     const fieldMapping = new Map([
         [1, 'string'],
@@ -576,13 +689,8 @@ function buildSyntheticGetModelsResponse(customModels) {
     ]);
     const parts = [];
     const modelTag = (1 << 3) | 2; // Tag 1, length-delimited (wireType 2)
-    // Always retain native Google models in synthetic response
-    for (const gm of modelUtils_1.NATIVE_GOOGLE_MODELS) {
-        const entry = encodeModelEntryForGetModels(gm.name, gm.displayName, fieldMapping);
-        parts.push(encodeVarint(modelTag), encodeVarint(entry.length), entry);
-    }
-    for (const m of customModels) {
-        const placeholderId = generateModelPlaceholderId(m);
+    // Без фейковых нативных моделей: если кэша от LS/Google нет, рисуем только активные кастомные модели.
+    for (const { model: m, placeholderId } of resolveCustomModelKeys(customModels, lastOccupiedPlaceholders)) {
         const entry = encodeModelEntryForGetModels('models/' + placeholderId, m.displayName, fieldMapping);
         parts.push(encodeVarint(modelTag), encodeVarint(entry.length), entry);
     }
@@ -611,8 +719,7 @@ function injectCustomModelsIntoProto(responseBuf, customModels) {
                     [2, 'string'],
                 ]);
             const newParts = [msgBody];
-            for (const m of customModels) {
-                const placeholderId = generateModelPlaceholderId(m);
+            for (const { model: m, placeholderId } of resolveCustomModelKeys(customModels, lastOccupiedPlaceholders)) {
                 const entry = encodeModelEntryForGetModels('models/' + placeholderId, m.displayName, fieldMapping);
                 const tagBuf = encodeVarint(modelTag);
                 const lenBuf = encodeVarint(entry.length);
@@ -713,38 +820,208 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
     lsReq.write(reqBody);
     lsReq.end();
 }
-function buildNativeAndCustomModelsMap(customModels) {
-    const mapped = {};
-    modelUtils_1.NATIVE_GOOGLE_MODELS.forEach((gm) => {
-        const clean = gm.name.replace(/^models\//, '');
-        const entry = {
-            displayName: gm.displayName,
-            maxTokens: 1048576,
-            maxOutputTokens: 65536,
-            model: clean,
-            apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-            modelProvider: 'MODEL_PROVIDER_GOOGLE',
-        };
-        mapped[clean] = entry;
-        mapped[gm.name] = entry;
+const BASE_MIME_TYPES = {
+    'text/plain': true,
+    'text/markdown': true,
+    'text/html': true,
+    'text/css': true,
+    'text/xml': true,
+    'text/csv': true,
+    'application/json': true,
+    'application/pdf': true,
+    'application/x-javascript': true,
+    'application/x-typescript': true,
+    'application/x-python-code': true,
+    'application/x-ipynb+json': true,
+};
+const IMAGE_MIME_TYPES = {
+    'image/png': true,
+    'image/jpeg': true,
+    'image/webp': true,
+    'image/gif': true,
+    'image/heic': true,
+    'image/heif': true,
+    ...BASE_MIME_TYPES,
+};
+function buildCustomCloudCodeEntry(m, placeholderId) {
+    const cap = (0, modelUtils_1.detectModelCapabilities)(m, true);
+    return {
+        displayName: m.displayName,
+        supportsImages: cap.supportsImages,
+        supportsThinking: cap.isThinking,
+        recommended: true,
+        maxTokens: cap.maxTokens,
+        maxOutputTokens: cap.maxOutputTokens,
+        tokenizerType: 'LLAMA_WITH_SPECIAL',
+        model: placeholderId,
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        modelProvider: 'MODEL_PROVIDER_GOOGLE',
+        supportsVideo: false,
+        supportedMimeTypes: cap.supportsImages ? IMAGE_MIME_TYPES : BASE_MIME_TYPES,
+    };
+}
+function buildCustomV1BetaEntry(m, placeholderId) {
+    const cap = (0, modelUtils_1.detectModelCapabilities)(m, true);
+    return {
+        name: `models/${placeholderId}`,
+        version: '1.0',
+        displayName: m.displayName,
+        description: m.description,
+        inputTokenLimit: cap.maxTokens,
+        outputTokenLimit: cap.maxOutputTokens,
+        supportedGenerationMethods: ['generateContent', 'streamGenerateContent', 'countTokens'],
+        ...(cap.isThinking ? {} : { temperature: 0.7, topP: 0.9, topK: 40 }),
+    };
+}
+function appendCustomEntriesToMap(targetMap, resolved) {
+    const hasOwnKey = (key) => Object.prototype.hasOwnProperty.call(targetMap, key);
+    for (const { model, slug, placeholderId } of resolved) {
+        const entry = buildCustomCloudCodeEntry(model, placeholderId);
+        for (const key of [slug, `models/${slug}`, placeholderId, `models/${placeholderId}`]) {
+            // Никогда не перезаписываем существующие оригинальные модели Google.
+            if (!hasOwnKey(key))
+                targetMap[key] = entry;
+        }
+    }
+}
+function injectSlugsIntoAgentModelSorts(result, customSlugs) {
+    if (customSlugs.length === 0)
+        return;
+    if (Array.isArray(result.agentModelSorts) && result.agentModelSorts.length > 0) {
+        let added = false;
+        for (const sort of result.agentModelSorts) {
+            if (!sort || !Array.isArray(sort.groups))
+                continue;
+            for (const group of sort.groups) {
+                if (group && Array.isArray(group.modelIds)) {
+                    for (const slug of customSlugs) {
+                        if (!group.modelIds.includes(slug))
+                            group.modelIds.push(slug);
+                    }
+                    added = true;
+                }
+            }
+        }
+        if (added)
+            return;
+    }
+    const existing = Array.isArray(result.agentModelSorts) ? result.agentModelSorts : [];
+    result.agentModelSorts = [...existing, { displayName: 'Custom Models', groups: [{ modelIds: customSlugs }] }];
+}
+function mergeFetchAvailableModelsResponse(googleJson, customModels) {
+    const occupied = collectOccupiedPlaceholders(googleJson);
+    if (occupied.size > 0) {
+        lastOccupiedPlaceholders.clear();
+        for (const id of occupied)
+            lastOccupiedPlaceholders.add(id);
+    }
+    const resolved = resolveCustomModelKeys(customModels, occupied);
+    lastAssignedPlaceholderBySlug.clear();
+    for (const { slug, placeholderId } of resolved) {
+        lastAssignedPlaceholderBySlug.set(slug, placeholderId);
+    }
+    const customSlugs = resolved.map((r) => r.slug);
+    const result = googleJson
+        ? JSON.parse(JSON.stringify(googleJson))
+        : {};
+    const serverKey = result.models
+        ? 'models'
+        : result.availableModels
+            ? 'availableModels'
+            : result.available_models
+                ? 'available_models'
+                : null;
+    if (serverKey) {
+        const serverValue = result[serverKey];
+        if (Array.isArray(serverValue)) {
+            const existingNames = new Set(serverValue
+                .filter((item) => Boolean(item && typeof item === 'object'))
+                .map((item) => String(item.name ?? item.model ?? '')));
+            const additions = resolved
+                .filter(({ placeholderId }) => !existingNames.has(`models/${placeholderId}`) && !existingNames.has(placeholderId))
+                .map(({ model, placeholderId }) => buildCustomV1BetaEntry(model, placeholderId));
+            result[serverKey] = [...serverValue, ...additions];
+        }
+        else if (serverValue && typeof serverValue === 'object') {
+            const mergedMap = { ...serverValue };
+            appendCustomEntriesToMap(mergedMap, resolved);
+            result[serverKey] = mergedMap;
+        }
+    }
+    else {
+        const customMap = {};
+        appendCustomEntriesToMap(customMap, resolved);
+        result.models = customMap;
+    }
+    injectSlugsIntoAgentModelSorts(result, customSlugs);
+    return result;
+}
+function mergeListModelsResponse(googleJson, customModels) {
+    const occupied = new Set(lastOccupiedPlaceholders);
+    for (const id of collectOccupiedPlaceholders(googleJson)) {
+        occupied.add(id);
+    }
+    const resolved = resolveCustomModelKeys(customModels, occupied);
+    const result = googleJson
+        ? JSON.parse(JSON.stringify(googleJson))
+        : {};
+    if (Array.isArray(result.models)) {
+        const existingNames = new Set(result.models
+            .filter((item) => Boolean(item && typeof item === 'object'))
+            .map((item) => String(item.name ?? item.model ?? '')));
+        const additions = resolved
+            .filter(({ placeholderId }) => !existingNames.has(`models/${placeholderId}`) && !existingNames.has(placeholderId))
+            .map(({ model, placeholderId }) => buildCustomV1BetaEntry(model, placeholderId));
+        result.models = [...result.models, ...additions];
+    }
+    else if (result.models && typeof result.models === 'object') {
+        const mergedMap = { ...result.models };
+        appendCustomEntriesToMap(mergedMap, resolved);
+        result.models = mergedMap;
+    }
+    else {
+        result.models = resolved.map(({ model, placeholderId }) => buildCustomV1BetaEntry(model, placeholderId));
+    }
+    return result;
+}
+function sendMergedJsonResponse(res, payload) {
+    if (res.headersSent)
+        return;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+}
+function findMatchedCustomModel(customModels, modelName, modelId) {
+    const resolved = resolveCustomModelKeys(customModels);
+    const cleanModelName = (modelName || '').replace(/^models\//, '');
+    const isNativeRequest = Boolean((cleanModelName && (0, modelUtils_1.isNativeGoogleModelName)(cleanModelName)) ||
+        (modelName && (0, modelUtils_1.isNativeGoogleModelName)(modelName)));
+    // Сначала ищем по уникальным кастомным идентификаторам (slug и выданному placeholderId).
+    const byCustomId = resolved.find(({ slug, placeholderId }) => {
+        const assignedPlaceholder = lastAssignedPlaceholderBySlug.get(slug);
+        return (slug === modelName ||
+            slug === cleanModelName ||
+            `models/${slug}` === modelName ||
+            placeholderId === modelName ||
+            placeholderId === cleanModelName ||
+            `models/${placeholderId}` === modelName ||
+            (assignedPlaceholder
+                ? assignedPlaceholder === modelName ||
+                    assignedPlaceholder === cleanModelName ||
+                    `models/${assignedPlaceholder}` === modelName
+                : false) ||
+            (modelId
+                ? placeholderId === modelId || slug === modelId || assignedPlaceholder === modelId
+                : false));
     });
-    customModels.forEach((m) => {
-        const slug = toSlug(m);
-        const placeholderId = generateModelPlaceholderId(m);
-        const entry = {
-            displayName: m.displayName,
-            maxTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
-            maxOutputTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
-            model: placeholderId,
-            apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-            modelProvider: 'MODEL_PROVIDER_GOOGLE',
-        };
-        mapped[slug] = entry;
-        mapped[`models/${slug}`] = entry;
-        mapped[placeholderId] = entry;
-        mapped[`models/${placeholderId}`] = entry;
-    });
-    return mapped;
+    if (byCustomId)
+        return byCustomId.model;
+    // Защита оригинальных моделей Google: запрос по нативному имени никогда не перехватывается кастомным именем.
+    if (isNativeRequest)
+        return undefined;
+    return resolved.find(({ model }) => {
+        const cleanMName = (model.name || '').replace(/^models\//, '');
+        return Boolean((modelName && model.name === modelName) || (cleanModelName && cleanMName === cleanModelName));
+    })?.model;
 }
 // ─── Main Request Handler ─────────────────────────────────────────────────
 function handleRequest(req, res) {
@@ -833,6 +1110,13 @@ function handleRequest(req, res) {
         // 1. Intercept /v1internal:fetchAvailableModels
         if (req.url.includes('/v1internal:fetchAvailableModels')) {
             electron_log_1.default.info('[Proxy] Intercepting fetchAvailableModels request');
+            const sendFetchFallback = (reason) => {
+                if (res.headersSent)
+                    return;
+                const customModels = loadCustomModels();
+                electron_log_1.default.warn(`[Proxy] fetchAvailableModels fallback (${reason}): cached=${Boolean(lastKnownFetchAvailableModelsJson)}, custom=${customModels.length}`);
+                sendMergedJsonResponse(res, mergeFetchAvailableModelsResponse(lastKnownFetchAvailableModelsJson, customModels));
+            };
             const targetUrl = 'https://daily-cloudcode-pa.googleapis.com';
             const parsedUrl = new URL(req.url, targetUrl);
             const fwdHeaders = {
@@ -847,17 +1131,10 @@ function handleRequest(req, res) {
                 headers: fwdHeaders,
             };
             const googleReq = https.request(parsedUrl, fwdOptions, (googleRes) => {
-                // Timeout for fetchAvailableModels forward request (3s).
-                // Недоступность Google не должна подвешивать список моделей: локальный словарь отдаётся сразу.
-                googleReq.setTimeout(3000, () => {
-                    electron_log_1.default.warn('[Proxy] fetchAvailableModels forward request timed out (3s), serving local model map');
+                // Если Google не ответил за 5с — отдаём последний кэш + наши кастомные модели.
+                googleReq.setTimeout(5000, () => {
                     googleReq.destroy();
-                    if (!res.headersSent) {
-                        const customModels = loadCustomModels();
-                        const mappedCustom = buildNativeAndCustomModelsMap(customModels);
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ models: mappedCustom }));
-                    }
+                    sendFetchFallback('timeout');
                 });
                 let googleBody = '';
                 googleRes.on('data', (chunk) => (googleBody += chunk));
@@ -868,72 +1145,22 @@ function handleRequest(req, res) {
                             throw new Error(`Google PA returned status ${googleRes.statusCode}`);
                         }
                         const googleJson = JSON.parse(googleBody);
+                        // Сохраняем чистый ответ Google в кэш до подмешивания кастомных моделей.
+                        lastKnownFetchAvailableModelsJson = JSON.parse(JSON.stringify(googleJson));
                         const customModels = loadCustomModels();
-                        electron_log_1.default.info(`[Proxy] Loaded custom models count: ${customModels.length}`);
-                        // База — всегда полный локальный словарь (нативные модели + все псевдонимы).
-                        // Записи Google кладутся поверх и могут добавить новое, но не стереть локальное.
-                        const baseMap = buildNativeAndCustomModelsMap(customModels);
-                        const serverKey = googleJson.models
-                            ? 'models'
-                            : googleJson.availableModels
-                                ? 'availableModels'
-                                : googleJson.available_models
-                                    ? 'available_models'
-                                    : null;
-                        const result = { ...googleJson };
-                        let serverRecords = 0;
-                        if (serverKey) {
-                            const serverValue = googleJson[serverKey];
-                            if (Array.isArray(serverValue)) {
-                                serverValue.forEach((item) => {
-                                    const rec = item;
-                                    if (!rec || typeof rec !== 'object')
-                                        return;
-                                    const key = String(rec.name ?? rec.model ?? '').replace(/^models\//, '');
-                                    if (!key)
-                                        return;
-                                    baseMap[key] = rec;
-                                    baseMap[`models/${key}`] = rec;
-                                    serverRecords++;
-                                });
-                            }
-                            else if (serverValue && typeof serverValue === 'object') {
-                                Object.entries(serverValue).forEach(([key, value]) => {
-                                    if (!key || !value)
-                                        return;
-                                    baseMap[key] = value;
-                                    serverRecords++;
-                                });
-                            }
-                        }
-                        result.models = baseMap;
-                        if (serverKey && serverKey !== 'models')
-                            delete result[serverKey];
-                        electron_log_1.default.info(`[Proxy] fetchAvailableModels merged: keys=${Object.keys(baseMap).length}, server records=${serverRecords}, custom=${customModels.length}`);
-                        if (!res.headersSent) {
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(result));
-                        }
+                        const result = mergeFetchAvailableModelsResponse(googleJson, customModels);
+                        electron_log_1.default.info(`[Proxy] fetchAvailableModels merged cleanly: custom=${customModels.length}`);
+                        sendMergedJsonResponse(res, result);
                     }
                     catch (err) {
-                        electron_log_1.default.error('[Proxy] Parsing fetchAvailableModels failed, returning fallback models:', err);
-                        if (!res.headersSent) {
-                            const customModels = loadCustomModels();
-                            const mappedCustom = buildNativeAndCustomModelsMap(customModels);
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ models: mappedCustom }));
-                        }
+                        electron_log_1.default.error('[Proxy] Parsing fetchAvailableModels failed:', err);
+                        sendFetchFallback('invalid response');
                     }
                 });
             });
             googleReq.on('error', (err) => {
                 electron_log_1.default.error('[Proxy] Forwarding fetchAvailableModels failed:', err);
-                if (!res.headersSent) {
-                    const customModels = loadCustomModels();
-                    const mappedCustom = buildNativeAndCustomModelsMap(customModels);
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ models: mappedCustom }));
-                }
+                sendFetchFallback('network error');
             });
             if (fullBody && fullBody.length > 0) {
                 googleReq.write(fullBody);
@@ -944,6 +1171,13 @@ function handleRequest(req, res) {
         // 2. Intercept /v1beta/models or /v1/models list request
         if (req.method === 'GET' && (req.url.endsWith('/models') || req.url.includes('/models?'))) {
             electron_log_1.default.info('[Proxy] Intercepting models list request');
+            const sendListFallback = (reason) => {
+                if (res.headersSent)
+                    return;
+                const customModels = loadCustomModels();
+                electron_log_1.default.warn(`[Proxy] models list fallback (${reason}): cached=${Boolean(lastKnownListModelsJson)}, custom=${customModels.length}`);
+                sendMergedJsonResponse(res, mergeListModelsResponse(lastKnownListModelsJson, customModels));
+            };
             const targetUrl = 'https://generativelanguage.googleapis.com';
             const parsedUrl = new URL(req.url, targetUrl);
             const mdlHeaders = {
@@ -954,69 +1188,33 @@ function handleRequest(req, res) {
             delete mdlHeaders['accept-encoding'];
             const mdlOptions = { method: 'GET', headers: mdlHeaders };
             const googleReq = https.request(parsedUrl, mdlOptions, (googleRes) => {
-                // Timeout for models list forward request (3s).
-                // Недоступность Google не должна подвешивать список моделей: локальный словарь отдаётся сразу.
-                googleReq.setTimeout(3000, () => {
-                    electron_log_1.default.warn('[Proxy] Models list forward request timed out (3s), serving local model map');
+                googleReq.setTimeout(5000, () => {
                     googleReq.destroy();
-                    if (!res.headersSent) {
-                        const customModels = loadCustomModels();
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ models: buildNativeAndCustomModelsMap(customModels) }));
-                    }
+                    sendListFallback('timeout');
                 });
                 let googleBody = '';
                 googleRes.on('data', (chunk) => (googleBody += chunk));
                 googleRes.on('end', () => {
                     try {
+                        if (googleRes.statusCode !== 200 || googleBody.length < 2) {
+                            throw new Error(`Google AI Studio returned status ${googleRes.statusCode}`);
+                        }
                         const googleJson = JSON.parse(googleBody);
+                        lastKnownListModelsJson = JSON.parse(JSON.stringify(googleJson));
                         const customModels = loadCustomModels();
-                        const baseMap = buildNativeAndCustomModelsMap(customModels);
-                        const result = { ...googleJson };
-                        let serverRecords = 0;
-                        if (Array.isArray(googleJson.models)) {
-                            googleJson.models.forEach((rec) => {
-                                if (!rec || typeof rec !== 'object')
-                                    return;
-                                const key = String(rec.name ?? rec.model ?? '').replace(/^models\//, '');
-                                if (!key)
-                                    return;
-                                baseMap[key] = rec;
-                                serverRecords++;
-                            });
-                        }
-                        else if (googleJson.models && typeof googleJson.models === 'object') {
-                            Object.entries(googleJson.models).forEach(([key, value]) => {
-                                if (!key || !value)
-                                    return;
-                                baseMap[key] = value;
-                                serverRecords++;
-                            });
-                        }
-                        result.models = baseMap;
-                        electron_log_1.default.info(`[Proxy] models list merged: keys=${Object.keys(baseMap).length}, server records=${serverRecords}`);
-                        if (!res.headersSent) {
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(result));
-                        }
+                        const result = mergeListModelsResponse(googleJson, customModels);
+                        electron_log_1.default.info(`[Proxy] models list merged cleanly: custom=${customModels.length}`);
+                        sendMergedJsonResponse(res, result);
                     }
                     catch (err) {
-                        electron_log_1.default.error('[Proxy] Google list models failed, returning local model map:', err);
-                        if (!res.headersSent) {
-                            const customModels = loadCustomModels();
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ models: buildNativeAndCustomModelsMap(customModels) }));
-                        }
+                        electron_log_1.default.error('[Proxy] Google list models failed:', err);
+                        sendListFallback('invalid response');
                     }
                 });
             });
             googleReq.on('error', (err) => {
-                electron_log_1.default.error('[Proxy] Google models list request error, serving local model map:', err);
-                if (!res.headersSent) {
-                    const customModels = loadCustomModels();
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ models: buildNativeAndCustomModelsMap(customModels) }));
-                }
+                electron_log_1.default.error('[Proxy] Google models list request error:', err);
+                sendListFallback('network error');
             });
             googleReq.end();
             return;
@@ -1031,21 +1229,7 @@ function handleRequest(req, res) {
                 electron_log_1.default.info(`[Proxy] Cloud Code generation request model: ${modelName}, modelId: ${modelId}, url: ${req.url}, bodyKeys: ${Object.keys(reqJson).join(',')}`);
                 if (modelName || modelId) {
                     const customModels = loadCustomModels();
-                    const cleanModelName = (modelName || '').replace(/^models\//, '');
-                    const matchedCustomModel = customModels.find((m) => {
-                        const enumName = generateModelPlaceholderId(m);
-                        const slug = toSlug(m);
-                        const cleanMName = (m.name || '').replace(/^models\//, '');
-                        return (m.name === modelName ||
-                            cleanMName === cleanModelName ||
-                            slug === modelName ||
-                            slug === cleanModelName ||
-                            'models/' + slug === modelName ||
-                            enumName === modelName ||
-                            enumName === cleanModelName ||
-                            'models/' + enumName === modelName ||
-                            enumName === modelId);
-                    });
+                    const matchedCustomModel = findMatchedCustomModel(customModels, modelName, modelId);
                     if (matchedCustomModel) {
                         electron_log_1.default.info(`[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`);
                         const isStream = req.url.includes('streamGenerateContent') || req.url.includes('alt=sse');
@@ -1083,14 +1267,7 @@ function handleRequest(req, res) {
                 return;
             }
             const customModels = loadCustomModels();
-            const matchedCustomModel = customModels.find((m) => {
-                const enumName = generateModelPlaceholderId(m);
-                return (m.name === matchedModelName ||
-                    toSlug(m) === matchedModelName ||
-                    'models/' + toSlug(m) === matchedModelName ||
-                    enumName === matchedModelName ||
-                    'models/' + enumName === matchedModelName);
-            });
+            const matchedCustomModel = findMatchedCustomModel(customModels, matchedModelName);
             if (matchedCustomModel) {
                 try {
                     const geminiBody = JSON.parse(bodyStr);

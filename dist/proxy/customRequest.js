@@ -90,12 +90,34 @@ function asUpstreamError(error) {
     const msg = error instanceof Error ? error.message : String(error);
     return new UpstreamError(`Upstream connection failed: ${msg}`);
 }
-function clearRequestState(key) {
-    shared_1.activeStreamContexts.delete(key);
-    shared_1.modelReasoningContent.delete(key);
-    shared_1.modelToolCallIds.delete(key);
-    for (const timestamps of Object.values(shared_1.stateTimestamps))
-        timestamps.delete(key);
+function clearStreamState(streamKey) {
+    shared_1.activeStreamContexts.delete(streamKey);
+    shared_1.stateTimestamps.streamCtx.delete(streamKey);
+}
+function extractChunkMetadata(chunk, format) {
+    const meta = {};
+    if (format === 'google' && chunk.usageMetadata && typeof chunk.usageMetadata === 'object') {
+        meta.usageMetadata = chunk.usageMetadata;
+    }
+    else {
+        const usage = chunk.usage || chunk.message?.usage;
+        if (usage && typeof usage === 'object') {
+            const promptTokenCount = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+            const candidatesTokenCount = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+            const totalTokenCount = Number(usage.total_tokens ?? promptTokenCount + candidatesTokenCount);
+            meta.usageMetadata = { promptTokenCount, candidatesTokenCount, totalTokenCount };
+        }
+        else if (chunk.usageMetadata && typeof chunk.usageMetadata === 'object') {
+            meta.usageMetadata = chunk.usageMetadata;
+        }
+    }
+    const modelVersion = chunk.modelVersion || chunk.model || chunk.message?.model;
+    if (typeof modelVersion === 'string' && modelVersion)
+        meta.modelVersion = modelVersion;
+    const responseId = chunk.responseId || chunk.id || chunk.message?.id;
+    if (typeof responseId === 'string' && responseId)
+        meta.responseId = responseId;
+    return meta;
 }
 function envelope(value, cloud) {
     return cloud ? { response: value, traceId: '', metadata: {} } : value;
@@ -145,7 +167,7 @@ function waitForDrain(res) {
         res.once('close', closed);
     });
 }
-/** Known upstream error codes mapped to the HTTP status the caller must see. */
+/** Известные коды ошибок апстрима и соответствующие HTTP-статусы. */
 function statusFromUpstreamCode(code, fallback) {
     if (typeof code === 'number' && Number.isFinite(code))
         return code;
@@ -159,6 +181,8 @@ function statusFromUpstreamCode(code, fallback) {
         authentication_error: 401,
         invalid_api_key: 401,
         permission_error: 403,
+        model_not_found: 404,
+        not_found: 404,
         rate_limit: 429,
         rate_limit_error: 429,
         rate_limit_exceeded: 429,
@@ -167,6 +191,36 @@ function statusFromUpstreamCode(code, fallback) {
         api_error: 502,
     };
     return known[code] ?? fallback;
+}
+/** Извлекает код и сообщение ошибки из JSON-тела ответа апстрима. */
+function extractErrorDetails(rawBody) {
+    try {
+        const parsed = JSON.parse(rawBody);
+        return {
+            code: parsed?.error?.code ?? parsed?.error?.type ?? parsed?.code,
+            message: typeof parsed?.error?.message === 'string' ? parsed.error.message : typeof parsed?.message === 'string' ? parsed.message : undefined,
+        };
+    }
+    catch {
+        return {};
+    }
+}
+/** Определяет отказ маршрутизации канала, который IDE не должна повторять 9 раз. */
+function isPaidChannelUnavailableError(code, message) {
+    return (code === 'upstream_unavailable' ||
+        /smart_route_stream_commit_failure|No upstream channels are currently available/i.test(message));
+}
+/** Проверяет, содержит ли переведённый кандидат значимый ответ, мысль или вызов инструмента. */
+function hasSubstantiveCandidateContent(mapped) {
+    const parts = mapped?.content?.parts;
+    if (!Array.isArray(parts))
+        return false;
+    return parts.some((rawPart) => {
+        const part = rawPart;
+        if (part.functionCall || part.thought)
+            return true;
+        return typeof part.text === 'string' && part.text.trim().length > 0;
+    });
 }
 /** The sole retry owner; the request never switches to another model or provider. */
 async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true) {
@@ -186,7 +240,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
     let upstreamOutput = false;
     const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 600000, 600000));
     let failure = new UpstreamError('No configured model is currently available.', 503);
-    const writeCandidate = (candidate) => {
+    const writeStreamPayload = (payload) => {
         if (signal.aborted || res.destroyed)
             throw new Error('Cancelled');
         if (!res.headersSent)
@@ -195,8 +249,16 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                 'Cache-Control': 'no-cache',
                 'X-Accel-Buffering': 'no',
             });
-        res.write(`data: ${JSON.stringify(envelope({ candidates: [candidate] }, cloudEnvelope))}\n\n`);
+        res.write(`data: ${JSON.stringify(envelope(payload, cloudEnvelope))}\n\n`);
     };
+    const writeCandidate = (candidate, meta) => {
+        writeStreamPayload({ candidates: [candidate], ...(meta || {}) });
+    };
+    // Стабильный ключ диалога для сохранения reasoning_content и tool_call_id между ходами.
+    const rawConvId = originalBody.conversationId || originalBody.sessionId;
+    const conversationKey = typeof rawConvId === 'string' && rawConvId.trim()
+        ? `${primary.name}:${rawConvId.trim()}`
+        : primary.name || primary.externalModelName || 'custom-model';
     try {
         modelBlock: {
             const model = primary;
@@ -225,7 +287,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                 : 0;
             const attemptsAllowed = retries + Math.max(0, accountCount - 1);
             for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
-                const stateKey = (0, crypto_1.randomUUID)();
+                const streamKey = (0, crypto_1.randomUUID)();
                 const attemptStart = Date.now();
                 let request;
                 let accountLease;
@@ -255,7 +317,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 (model.contextWindow ? Math.min(4000, Math.max(1, Math.floor(model.contextWindow / 4))) : 0));
                         const body = (0, requestOptions_1.trimContext)(originalBody, model.contextWindow, outputBudget);
                         const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
-                        payload = (0, requestOptions_1.applyRequestOptions)(registry.translateRequest(model.provider, body, externalName, format, stateKey), effectiveModel, format, isStream);
+                        payload = (0, requestOptions_1.applyRequestOptions)(registry.translateRequest(model.provider, body, externalName, format, conversationKey), effectiveModel, format, isStream);
                         const target = cloudCode || model.rawUrl
                             ? model.apiUrl
                             : registry.getProviderUrl(model.apiUrl, externalName, isStream, registry.getTranslator(model.provider, format));
@@ -327,9 +389,14 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         const errorBody = Buffer.concat(errorChunks).toString('utf-8');
                         electron_log_1.default.error(`[Proxy] Upstream HTTP ${status} for "${model.displayName}" (${url}) [attempt ${attempt + 1}/${attemptsAllowed + 1}], body bytes ${errorBody.length}: ${errorBody}`);
                         upstream.destroy();
-                        const error = new UpstreamError(errorBody || `Upstream returned HTTP ${status}.`, status, status === 408 || status === 429 || status >= 500, retryAfter, status !== 400 && status !== 422);
+                        const parsedErr = extractErrorDetails(errorBody);
+                        const effectiveStatus = statusFromUpstreamCode(parsedErr.code, status);
+                        const paidUnavailable = isPaidChannelUnavailableError(parsedErr.code, parsedErr.message || errorBody);
+                        const error = new UpstreamError(errorBody || `Upstream returned HTTP ${status}.`, effectiveStatus, effectiveStatus === 408 || effectiveStatus === 429 || effectiveStatus >= 500, retryAfter, effectiveStatus !== 400 && effectiveStatus !== 404 && effectiveStatus !== 422);
                         error.upstreamBody = errorBody;
                         error.upstreamStatus = status;
+                        if (paidUnavailable)
+                            error.clientStatus = 424;
                         throw error;
                     }
                     if (isStream && String(upstream.headers['content-type']).includes('text/event-stream')) {
@@ -338,12 +405,24 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         let dataLines = [];
                         let emitted = false;
                         let hasVisibleContent = false;
+                        let hasSubstantiveOutput = false;
+                        const pendingWhitespace = [];
                         let finalReason = false;
                         let terminal = false;
                         let receivedChunks = 0;
                         let receivedBytes = 0;
                         let firstContentAt = 0;
                         let firstReasoningAt = 0;
+                        let pendingMeta = null;
+                        let usageEmitted = false;
+                        const flushWhitespace = () => {
+                            while (pendingWhitespace.length > 0) {
+                                const item = pendingWhitespace.shift();
+                                if (item.meta?.usageMetadata)
+                                    usageEmitted = true;
+                                writeCandidate(item.candidate, item.meta);
+                            }
+                        };
                         let streamDurationMs = 0;
                         heartbeatTimer = setInterval(() => {
                             streamDurationMs += 15000;
@@ -384,11 +463,15 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 const message = errObj.message ||
                                     chunk.message ||
                                     (typeof chunk.error === 'string' ? chunk.error : 'Upstream reported a stream error.');
-                                const code = statusFromUpstreamCode(errObj.code, 502);
+                                const errCode = errObj.code ?? errObj.type;
+                                const code = statusFromUpstreamCode(errCode, 502);
+                                const paidUnavailable = isPaidChannelUnavailableError(errCode, message);
                                 electron_log_1.default.error(`[Proxy] Upstream stream error for "${model.displayName}": status ${code}, after ${Date.now() - attemptStart}ms, received chunks ${receivedChunks}, bytes ${receivedBytes}, visibleContent ${hasVisibleContent}, terminal ${terminal}`, { error: chunk.error || chunk });
-                                const error = new UpstreamError(message, code, false, 0, false);
+                                const error = new UpstreamError(message, code, paidUnavailable, 0, !paidUnavailable);
                                 error.upstreamBody = data;
                                 error.upstreamStatus = code;
+                                if (paidUnavailable)
+                                    error.clientStatus = 424;
                                 throw error;
                             }
                             if (cloudCode && chunk.response)
@@ -399,15 +482,20 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 if (!firstReasoningAt)
                                     firstReasoningAt = Date.now() - attemptStart;
                             }
-                            if (delta?.content ||
-                                delta?.reasoning_content ||
-                                delta?.reasoning ||
+                            const chunkMeta = extractChunkMetadata(chunk, format);
+                            if (chunkMeta.usageMetadata) {
+                                pendingMeta = chunkMeta;
+                            }
+                            const candidateParts = chunk.candidates?.[0]?.content?.parts;
+                            const hasVisibleCandidatePart = Array.isArray(candidateParts) &&
+                                candidateParts.some((p) => (typeof p.text === 'string' && !p.thought && p.text.trim().length > 0) || Boolean(p.functionCall));
+                            // Не помечаем поток как давший видимый вывод, пока не придёт непробельный контент или вызов инструмента.
+                            if ((typeof delta?.content === 'string' && delta.content.trim().length > 0) ||
                                 delta?.tool_calls?.length ||
                                 chunk.content_block?.type === 'tool_use' ||
-                                chunk.delta?.text ||
-                                chunk.delta?.thinking ||
+                                (typeof chunk.delta?.text === 'string' && chunk.delta.text.trim().length > 0) ||
                                 chunk.delta?.partial_json ||
-                                chunk.candidates?.[0]?.content?.parts?.length)
+                                hasVisibleCandidatePart)
                                 upstreamOutput = true;
                             if (chunk.type === 'message_stop' ||
                                 chunk.choices?.[0]?.finish_reason ||
@@ -415,26 +503,46 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 terminal = true;
                             if ((chunk.type === 'message_delta' && chunk.delta?.stop_reason === 'tool_use') ||
                                 chunk.choices?.[0]?.finish_reason) {
-                                for (const tool of Object.values(shared_1.activeStreamContexts.get(stateKey)?.toolCalls || {}))
+                                for (const tool of Object.values(shared_1.activeStreamContexts.get(streamKey)?.toolCalls || {}))
                                     validateToolArguments(tool.arguments);
                             }
-                            const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas);
+                            const mapped = registry.translateStreamChunk(model.provider, chunk, conversationKey, format, streamKey, toolSchemas);
                             if (mapped) {
+                                const isTerminalFinish = Boolean(mapped.finishReason && mapped.finishReason !== 'OTHER');
                                 if (mapped.content?.parts?.length) {
                                     emitted = true;
                                     for (const part of mapped.content.parts) {
-                                        if ((part.text && !part.thought) || part.functionCall) {
+                                        if ((typeof part.text === 'string' && !part.thought && (part.text.trim().length > 0 || hasSubstantiveOutput)) ||
+                                            part.functionCall) {
                                             hasVisibleContent = true;
                                             if (!firstContentAt)
                                                 firstContentAt = Date.now() - attemptStart;
                                         }
                                     }
                                 }
-                                if (mapped.finishReason && mapped.finishReason !== 'OTHER')
+                                if (isTerminalFinish)
                                     finalReason = true;
-                                // A role-only or empty completion must not commit headers and prevent fallback.
-                                if (emitted)
-                                    writeCandidate(mapped);
+                                const emitMeta = Object.keys(chunkMeta).length > 0 ? chunkMeta : undefined;
+                                if (!hasSubstantiveOutput && mapped.content?.parts?.length && !hasSubstantiveCandidateContent(mapped) && !isTerminalFinish) {
+                                    // Придерживаем чисто пробельные стартовые чанки до первого значимого ответа или завершения потока.
+                                    pendingWhitespace.push({ candidate: mapped, meta: emitMeta });
+                                }
+                                else {
+                                    if (hasSubstantiveCandidateContent(mapped) || isTerminalFinish) {
+                                        hasSubstantiveOutput = true;
+                                        flushWhitespace();
+                                    }
+                                    // A role-only or empty completion must not commit headers and prevent fallback.
+                                    if (emitted && hasSubstantiveOutput) {
+                                        if (emitMeta?.usageMetadata)
+                                            usageEmitted = true;
+                                        writeCandidate(mapped, emitMeta);
+                                    }
+                                }
+                            }
+                            else if (pendingMeta?.usageMetadata && res.headersSent && terminal) {
+                                usageEmitted = true;
+                                writeStreamPayload({ candidates: [], ...pendingMeta });
                             }
                         };
                         const drain = () => {
@@ -477,7 +585,14 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                             throw error;
                         }
                         if (!finalReason) {
-                            writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
+                            const tailMeta = !usageEmitted && pendingMeta ? pendingMeta : undefined;
+                            if (tailMeta?.usageMetadata)
+                                usageEmitted = true;
+                            writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 }, tailMeta);
+                        }
+                        else if (!usageEmitted && pendingMeta?.usageMetadata && res.headersSent) {
+                            usageEmitted = true;
+                            writeStreamPayload({ candidates: [], ...pendingMeta });
                         }
                     }
                     else {
@@ -502,10 +617,15 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         }
                         if (parsed.error) {
                             const errObj = typeof parsed.error === 'object' ? parsed.error : {};
-                            const code = statusFromUpstreamCode(errObj.code, 502);
-                            const error = new UpstreamError(errObj.message || (typeof parsed.error === 'string' ? parsed.error : 'Upstream returned an error response.'), code, false, 0, false);
+                            const errCode = errObj.code ?? errObj.type;
+                            const code = statusFromUpstreamCode(errCode, 502);
+                            const message = errObj.message || (typeof parsed.error === 'string' ? parsed.error : 'Upstream returned an error response.');
+                            const paidUnavailable = isPaidChannelUnavailableError(errCode, message);
+                            const error = new UpstreamError(message, code, paidUnavailable, 0, !paidUnavailable);
                             error.upstreamBody = rawBody;
                             error.upstreamStatus = code;
+                            if (paidUnavailable)
+                                error.clientStatus = 424;
                             electron_log_1.default.error(`[Proxy] Upstream completion error for "${model.displayName}": status ${code}, after ${Date.now() - attemptStart}ms, body ${rawBody}`);
                             throw error;
                         }
@@ -520,7 +640,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 validateToolArguments(tool.function?.arguments);
                         }
                         // Some compatible endpoints return a complete JSON response even when stream=true.
-                        const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas);
+                        const mapped = registry.translateResponse(model.provider, parsed, conversationKey, format, toolSchemas);
                         if (!mapped?.candidates?.length)
                             throw new UpstreamError('Upstream returned no candidates.');
                         if (isStream) {
@@ -578,7 +698,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     signal.removeEventListener('abort', abort);
                     request?.destroy();
                     accountLease?.release();
-                    clearRequestState(stateKey);
+                    clearStreamState(streamKey);
                 }
             }
             if (modelFailed)
@@ -597,15 +717,16 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         upstreamBody: failure.upstreamBody,
                     },
                 };
-                res.write(`${JSON.stringify(errorPayload)}\n\n`);
+                res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
                 res.end();
             }
             else {
-                res.writeHead(failure.status, { 'Content-Type': 'application/json' });
+                const clientStatus = failure.clientStatus ?? failure.status;
+                res.writeHead(clientStatus, { 'Content-Type': 'application/json' });
                 res.write(JSON.stringify({
                     error: {
                         message: failure.message,
-                        code: failure.status,
+                        code: clientStatus,
                         upstreamStatus: failure.upstreamStatus ?? failure.status,
                         upstreamBody: failure.upstreamBody,
                     },
