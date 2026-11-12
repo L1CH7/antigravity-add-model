@@ -847,9 +847,10 @@ function handleRequest(req, res) {
                 headers: fwdHeaders,
             };
             const googleReq = https.request(parsedUrl, fwdOptions, (googleRes) => {
-                // P0-5: Timeout for fetchAvailableModels forward request (30s)
-                googleReq.setTimeout(30000, () => {
-                    electron_log_1.default.error('[Proxy] fetchAvailableModels forward request timed out');
+                // Timeout for fetchAvailableModels forward request (3s).
+                // Недоступность Google не должна подвешивать список моделей: локальный словарь отдаётся сразу.
+                googleReq.setTimeout(3000, () => {
+                    electron_log_1.default.warn('[Proxy] fetchAvailableModels forward request timed out (3s), serving local model map');
                     googleReq.destroy();
                     if (!res.headersSent) {
                         const customModels = loadCustomModels();
@@ -869,152 +870,49 @@ function handleRequest(req, res) {
                         const googleJson = JSON.parse(googleBody);
                         const customModels = loadCustomModels();
                         electron_log_1.default.info(`[Proxy] Loaded custom models count: ${customModels.length}`);
-                        const mergeModels = (target) => {
-                            if (Array.isArray(target)) {
-                                const mapped = customModels.map((m) => {
-                                    const cap = (0, modelUtils_1.detectModelCapabilities)(m, true);
-                                    return {
-                                        name: 'models/' + generateModelPlaceholderId(m),
-                                        version: '1.0',
-                                        displayName: m.displayName,
-                                        description: m.description,
-                                        inputTokenLimit: cap.maxTokens,
-                                        outputTokenLimit: cap.maxOutputTokens,
-                                        supportedGenerationMethods: ['generateContent', 'countTokens'],
-                                        temperature: cap.isThinking ? undefined : 0.7,
-                                        topP: cap.isThinking ? undefined : 0.9,
-                                        topK: cap.isThinking ? undefined : 40,
-                                    };
+                        // База — всегда полный локальный словарь (нативные модели + все псевдонимы).
+                        // Записи Google кладутся поверх и могут добавить новое, но не стереть локальное.
+                        const baseMap = buildNativeAndCustomModelsMap(customModels);
+                        const serverKey = googleJson.models
+                            ? 'models'
+                            : googleJson.availableModels
+                                ? 'availableModels'
+                                : googleJson.available_models
+                                    ? 'available_models'
+                                    : null;
+                        const result = { ...googleJson };
+                        let serverRecords = 0;
+                        if (serverKey) {
+                            const serverValue = googleJson[serverKey];
+                            if (Array.isArray(serverValue)) {
+                                serverValue.forEach((item) => {
+                                    const rec = item;
+                                    if (!rec || typeof rec !== 'object')
+                                        return;
+                                    const key = String(rec.name ?? rec.model ?? '').replace(/^models\//, '');
+                                    if (!key)
+                                        return;
+                                    baseMap[key] = rec;
+                                    baseMap[`models/${key}`] = rec;
+                                    serverRecords++;
                                 });
-                                return [...mapped, ...target];
                             }
-                            else if (target && typeof target === 'object') {
-                                const result = { ...target };
-                                customModels.forEach((m) => {
-                                    const slug = toSlug(m);
-                                    const cap = (0, modelUtils_1.detectModelCapabilities)(m, true);
-                                    const entry = {
-                                        displayName: m.displayName,
-                                        supportsImages: cap.supportsImages,
-                                        supportsThinking: cap.isThinking,
-                                        recommended: true,
-                                        maxTokens: cap.maxTokens,
-                                        maxOutputTokens: cap.maxOutputTokens,
-                                        tokenizerType: 'LLAMA_WITH_SPECIAL',
-                                        model: generateModelPlaceholderId(m),
-                                        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                                        modelProvider: 'MODEL_PROVIDER_GOOGLE',
-                                    };
-                                    if (cap.supportsImages) {
-                                        entry.supportsVideo = false;
-                                        entry.supportedMimeTypes = {
-                                            'image/png': true,
-                                            'image/jpeg': true,
-                                            'image/webp': true,
-                                            'image/gif': true,
-                                            'image/heic': true,
-                                            'image/heif': true,
-                                            'text/plain': true,
-                                            'text/markdown': true,
-                                            'text/html': true,
-                                            'text/css': true,
-                                            'text/xml': true,
-                                            'text/csv': true,
-                                            'application/json': true,
-                                            'application/pdf': true,
-                                            'application/x-javascript': true,
-                                            'application/x-typescript': true,
-                                            'application/x-python-code': true,
-                                            'application/x-ipynb+json': true,
-                                        };
-                                    }
-                                    else {
-                                        entry.supportsVideo = false;
-                                        entry.supportedMimeTypes = {
-                                            'text/plain': true,
-                                            'text/markdown': true,
-                                            'text/html': true,
-                                            'text/css': true,
-                                            'text/xml': true,
-                                            'text/csv': true,
-                                            'application/json': true,
-                                            'application/pdf': true,
-                                            'application/x-javascript': true,
-                                            'application/x-typescript': true,
-                                            'application/x-python-code': true,
-                                            'application/x-ipynb+json': true,
-                                        };
-                                    }
-                                    const placeholderId = generateModelPlaceholderId(m);
-                                    result[slug] = entry;
-                                    result[`models/${slug}`] = entry;
-                                    result[placeholderId] = entry;
-                                    result[`models/${placeholderId}`] = entry;
-                                    m._slug = slug;
-                                    electron_log_1.default.info(`[Proxy] Custom model "${m.displayName}" => slug: ${slug} => placeholder: ${placeholderId} (registered all aliases)`);
-                                });
-                                return result;
-                            }
-                            return target;
-                        };
-                        let merged = false;
-                        if (googleJson.models) {
-                            googleJson.models = mergeModels(googleJson.models);
-                            merged = true;
-                        }
-                        if (googleJson.availableModels) {
-                            googleJson.availableModels = mergeModels(googleJson.availableModels);
-                            merged = true;
-                        }
-                        if (googleJson.available_models) {
-                            googleJson.available_models = mergeModels(googleJson.available_models);
-                            merged = true;
-                        }
-                        if (!merged) {
-                            const modelsMap = {};
-                            customModels.forEach((m) => {
-                                const slug = toSlug(m);
-                                const placeholderId = generateModelPlaceholderId(m);
-                                const entry = {
-                                    displayName: m.displayName,
-                                    recommended: true,
-                                    maxTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
-                                    maxOutputTokens: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
-                                    tokenizerType: 'LLAMA_WITH_SPECIAL',
-                                    model: placeholderId,
-                                    apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                                    modelProvider: 'MODEL_PROVIDER_GOOGLE',
-                                };
-                                modelsMap[slug] = entry;
-                                modelsMap[`models/${slug}`] = entry;
-                                modelsMap[placeholderId] = entry;
-                                modelsMap[`models/${placeholderId}`] = entry;
-                                m._slug = slug;
-                            });
-                            googleJson.models = modelsMap;
-                        }
-                        // Inject custom model slugs into agentModelSorts
-                        const customSlugs = customModels.map((m) => m._slug).filter(Boolean);
-                        if (customSlugs.length > 0) {
-                            if (googleJson.agentModelSorts && Array.isArray(googleJson.agentModelSorts)) {
-                                googleJson.agentModelSorts.forEach((sort) => {
-                                    if (sort.groups && Array.isArray(sort.groups)) {
-                                        sort.groups.forEach((group) => {
-                                            if (group.modelIds && Array.isArray(group.modelIds)) {
-                                                customSlugs.forEach((slug) => {
-                                                    if (!group.modelIds.includes(slug)) {
-                                                        group.modelIds.push(slug);
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    }
+                            else if (serverValue && typeof serverValue === 'object') {
+                                Object.entries(serverValue).forEach(([key, value]) => {
+                                    if (!key || !value)
+                                        return;
+                                    baseMap[key] = value;
+                                    serverRecords++;
                                 });
                             }
                         }
+                        result.models = baseMap;
+                        if (serverKey && serverKey !== 'models')
+                            delete result[serverKey];
+                        electron_log_1.default.info(`[Proxy] fetchAvailableModels merged: keys=${Object.keys(baseMap).length}, server records=${serverRecords}, custom=${customModels.length}`);
                         if (!res.headersSent) {
                             res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(googleJson));
+                            res.end(JSON.stringify(result));
                         }
                     }
                     catch (err) {
@@ -1056,21 +954,15 @@ function handleRequest(req, res) {
             delete mdlHeaders['accept-encoding'];
             const mdlOptions = { method: 'GET', headers: mdlHeaders };
             const googleReq = https.request(parsedUrl, mdlOptions, (googleRes) => {
-                // P0-5: Timeout for models list forward request (30s)
-                googleReq.setTimeout(30000, () => {
-                    electron_log_1.default.error('[Proxy] Models list forward request timed out');
+                // Timeout for models list forward request (3s).
+                // Недоступность Google не должна подвешивать список моделей: локальный словарь отдаётся сразу.
+                googleReq.setTimeout(3000, () => {
+                    electron_log_1.default.warn('[Proxy] Models list forward request timed out (3s), serving local model map');
                     googleReq.destroy();
                     if (!res.headersSent) {
                         const customModels = loadCustomModels();
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({
-                            models: customModels.map((m) => ({
-                                name: m.name,
-                                displayName: m.displayName,
-                                description: m.description,
-                                supportedGenerationMethods: ['generateContent'],
-                            })),
-                        }));
+                        res.end(JSON.stringify({ models: buildNativeAndCustomModelsMap(customModels) }));
                     }
                 });
                 let googleBody = '';
@@ -1079,75 +971,51 @@ function handleRequest(req, res) {
                     try {
                         const googleJson = JSON.parse(googleBody);
                         const customModels = loadCustomModels();
-                        const mappedCustom = customModels.map((m) => ({
-                            name: 'models/' + generateModelPlaceholderId(m),
-                            version: '1.0',
-                            displayName: m.displayName,
-                            description: m.description,
-                            inputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
-                            outputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
-                            supportedGenerationMethods: ['generateContent', 'countTokens'],
-                            temperature: 0.7,
-                            topP: 0.9,
-                            topK: 40,
-                        }));
-                        if (googleJson.models) {
-                            googleJson.models = [...mappedCustom, ...googleJson.models];
+                        const baseMap = buildNativeAndCustomModelsMap(customModels);
+                        const result = { ...googleJson };
+                        let serverRecords = 0;
+                        if (Array.isArray(googleJson.models)) {
+                            googleJson.models.forEach((rec) => {
+                                if (!rec || typeof rec !== 'object')
+                                    return;
+                                const key = String(rec.name ?? rec.model ?? '').replace(/^models\//, '');
+                                if (!key)
+                                    return;
+                                baseMap[key] = rec;
+                                serverRecords++;
+                            });
                         }
-                        else {
-                            googleJson.models = mappedCustom;
+                        else if (googleJson.models && typeof googleJson.models === 'object') {
+                            Object.entries(googleJson.models).forEach(([key, value]) => {
+                                if (!key || !value)
+                                    return;
+                                baseMap[key] = value;
+                                serverRecords++;
+                            });
                         }
+                        result.models = baseMap;
+                        electron_log_1.default.info(`[Proxy] models list merged: keys=${Object.keys(baseMap).length}, server records=${serverRecords}`);
                         if (!res.headersSent) {
                             res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(googleJson));
+                            res.end(JSON.stringify(result));
                         }
                     }
                     catch (err) {
-                        electron_log_1.default.error('[Proxy] Google list models failed, returning fallback models list:', err);
+                        electron_log_1.default.error('[Proxy] Google list models failed, returning local model map:', err);
                         if (!res.headersSent) {
                             const customModels = loadCustomModels();
-                            const nativeMapped = modelUtils_1.NATIVE_GOOGLE_MODELS.map((gm) => ({
-                                name: gm.name,
-                                version: '1.0',
-                                displayName: gm.displayName,
-                                description: 'Official Google model',
-                                inputTokenLimit: 1048576,
-                                outputTokenLimit: 65536,
-                                supportedGenerationMethods: ['generateContent', 'countTokens'],
-                            }));
-                            const mappedCustom = customModels.map((m) => ({
-                                name: 'models/' + generateModelPlaceholderId(m),
-                                version: '1.0',
-                                displayName: m.displayName,
-                                description: m.description,
-                                inputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxTokens,
-                                outputTokenLimit: (0, modelUtils_1.detectModelCapabilities)(m).maxOutputTokens,
-                                supportedGenerationMethods: ['generateContent', 'countTokens'],
-                            }));
                             res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ models: [...nativeMapped, ...mappedCustom] }));
+                            res.end(JSON.stringify({ models: buildNativeAndCustomModelsMap(customModels) }));
                         }
                     }
                 });
             });
             googleReq.on('error', (err) => {
-                electron_log_1.default.error('[Proxy] Google models list request error:', err);
+                electron_log_1.default.error('[Proxy] Google models list request error, serving local model map:', err);
                 if (!res.headersSent) {
                     const customModels = loadCustomModels();
-                    const nativeMapped = modelUtils_1.NATIVE_GOOGLE_MODELS.map((gm) => ({
-                        name: gm.name,
-                        displayName: gm.displayName,
-                        description: 'Official Google model',
-                        supportedGenerationMethods: ['generateContent'],
-                    }));
-                    const customMapped = customModels.map((m) => ({
-                        name: m.name,
-                        displayName: m.displayName,
-                        description: m.description,
-                        supportedGenerationMethods: ['generateContent'],
-                    }));
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ models: [...nativeMapped, ...customMapped] }));
+                    res.end(JSON.stringify({ models: buildNativeAndCustomModelsMap(customModels) }));
                 }
             });
             googleReq.end();
@@ -1217,7 +1085,6 @@ function handleRequest(req, res) {
             const customModels = loadCustomModels();
             const matchedCustomModel = customModels.find((m) => {
                 const enumName = generateModelPlaceholderId(m);
-                const slug = toSlug(m);
                 return (m.name === matchedModelName ||
                     toSlug(m) === matchedModelName ||
                     'models/' + toSlug(m) === matchedModelName ||
