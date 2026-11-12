@@ -226,6 +226,33 @@ describe('collectToolSchemas', () => {
     expect(collected.size).toBe(2);
   });
 
+  it('reads declarations nested inside the cloud request envelope', () => {
+    // Antigravity отправляет объявления как body.request.tools. Пропуск этого
+    // места оставлял карту пустой и включал слепую трансляцию инструментов.
+    const schema = { type: 'object', properties: { CommandLine: { type: 'string' } } };
+    const body = {
+      project: 'demo',
+      request: {
+        tools: [{ functionDeclarations: [{ name: 'run_command', parameters: schema }] }],
+      },
+    };
+    const collected = collectToolSchemas(body);
+    expect(collected.size).toBe(1);
+    expect(collected.get('run_command')).toEqual(schema);
+  });
+
+  it('prefers the outer declarations when both levels are present', () => {
+    const outer = { type: 'object', properties: { outer: { type: 'string' } } };
+    const inner = { type: 'object', properties: { inner: { type: 'string' } } };
+    const body = {
+      tools: [{ functionDeclarations: [{ name: 'view_file', parameters: outer }] }],
+      request: {
+        tools: [{ functionDeclarations: [{ name: 'view_file', parameters: inner }] }],
+      },
+    };
+    expect(collectToolSchemas(body).get('view_file')).toEqual(outer);
+  });
+
   it('avoids guessing between conflicting duplicate declarations', () => {
     const tools = [
       {

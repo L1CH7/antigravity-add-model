@@ -60,8 +60,20 @@ export type ToolSchemas = ReadonlyMap<string, unknown>;
 export function collectToolSchemas(body: unknown): ToolSchemas {
   const schemas = new Map<string, unknown>();
   if (!body || typeof body !== 'object') return schemas;
-  const tools = (body as { tools?: unknown }).tools;
+
+  // Antigravity кладёт объявления внутрь вложенного request; верхний уровень
+  // используется другими вызывающими и сохраняется для совместимости.
+  const outer = body as { tools?: unknown; request?: { tools?: unknown } };
+  const candidates = [outer.tools, outer.request?.tools];
+  let tools: unknown;
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate) && candidate.length > 0) {
+      tools = candidate;
+      break;
+    }
+  }
   if (!Array.isArray(tools)) return schemas;
+
   for (const group of tools) {
     if (!group || !Array.isArray(group.functionDeclarations)) continue;
     for (const declaration of group.functionDeclarations) {

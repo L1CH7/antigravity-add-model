@@ -51,7 +51,17 @@ function collectToolSchemas(body) {
     const schemas = new Map();
     if (!body || typeof body !== 'object')
         return schemas;
-    const tools = body.tools;
+    // Antigravity кладёт объявления внутрь вложенного request; верхний уровень
+    // используется другими вызывающими и сохраняется для совместимости.
+    const outer = body;
+    const candidates = [outer.tools, outer.request?.tools];
+    let tools;
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate) && candidate.length > 0) {
+            tools = candidate;
+            break;
+        }
+    }
     if (!Array.isArray(tools))
         return schemas;
     for (const group of tools) {

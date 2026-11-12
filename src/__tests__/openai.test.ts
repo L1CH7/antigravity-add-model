@@ -102,7 +102,18 @@ describe('mapGeminiToOpenAI', () => {
       contents: [{ role: 'model', parts: [{ text: 'Hi there!' }] }],
     };
     const result = mapGeminiToOpenAI(body, 'gpt-4o');
-    expect(result.messages[0]).toEqual({ role: 'assistant', content: 'Hi there!', reasoning_content: '' });
+    expect(result.messages[0]).toEqual({ role: 'assistant', content: 'Hi there!' });
+  });
+
+  it('should omit empty reasoning_content to avoid upstream 400', () => {
+    // Бэкенды, не знающие поля reasoning_content, отвергают запрос целиком
+    // (HTTP 400 invalid_request). Пустая строка не должна уходить в тело.
+    const body = {
+      contents: [{ role: 'model', parts: [{ text: 'Hi there!' }] }],
+    };
+    const result = mapGeminiToOpenAI(body, 'gpt-6.1-sol');
+    expect(result.messages[0]).not.toHaveProperty('reasoning_content');
+    expect(JSON.stringify(result.messages)).not.toContain('"reasoning_content":""');
   });
 
   it('should handle functionCall parts as tool_calls', () => {

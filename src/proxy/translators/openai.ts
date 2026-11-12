@@ -340,7 +340,9 @@ export function mapGeminiToOpenAI(
   // Keep feedback after all consecutive tool results, including split parallel responses.
   flushToolResponseTexts();
 
-  // Inject reasoning_content into assistant messages missing it
+  // Inject reasoning_content into assistant messages missing it.
+  // Поле не пишется, когда значения нет: неизвестное бэкенду пустое поле
+  // приводит к HTTP 400 invalid_request (проверено на GPT-6.1 Sol 12.11.2026).
   let lastAssistantIdx = -1;
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].role === 'assistant') lastAssistantIdx = i;
@@ -348,7 +350,11 @@ export function mapGeminiToOpenAI(
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].role === 'assistant' && !(messages[i] as OpenAIMessage).reasoning_content) {
       const preservedReasoning = modelReasoningContent.get(stateKey) || '';
-      messages[i].reasoning_content = i === lastAssistantIdx && preservedReasoning ? preservedReasoning : '';
+      if (i === lastAssistantIdx && preservedReasoning) {
+        messages[i].reasoning_content = preservedReasoning;
+      } else {
+        delete (messages[i] as OpenAIMessage).reasoning_content;
+      }
     }
   }
 
