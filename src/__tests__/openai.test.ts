@@ -80,6 +80,44 @@ describe('mapGeminiToOpenAI', () => {
     expect(parametersJsonSchema).toEqual(original);
   });
 
+  it('normalizes stringified integer constraints from Protobuf schemas like send_message and ask_question', () => {
+    const result = mapGeminiToOpenAI(
+      {
+        contents: [],
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: 'send_message',
+                parametersJsonSchema: {
+                  type: 'OBJECT',
+                  $defs: { targetId: { type: 'STRING', minLength: '1' } },
+                  properties: {
+                    Recipient: { $ref: '#/$defs/targetId', minLength: '1' },
+                    Message: { type: 'STRING', minLength: '1' },
+                    Attachments: { type: 'ARRAY', minItems: '1', maxItems: '3', items: { type: 'STRING', minLength: '1' } },
+                  },
+                  required: ['Recipient', 'Message'],
+                },
+              },
+            ],
+          },
+        ],
+      },
+      'external-model',
+    );
+    expect(result.tools![0].function.parameters).toEqual({
+      type: 'object',
+      $defs: { targetId: { type: 'string', minLength: 1 } },
+      properties: {
+        Recipient: { $ref: '#/$defs/targetId', minLength: 1 },
+        Message: { type: 'string', minLength: 1 },
+        Attachments: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string', minLength: 1 } },
+      },
+      required: ['Recipient', 'Message'],
+    });
+  });
+
   it('should convert systemInstruction to system message', () => {
     const body = {
       systemInstruction: { parts: [{ text: 'You are helpful.' }] },

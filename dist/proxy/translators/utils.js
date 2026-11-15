@@ -8,6 +8,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.collectToolSchemas = collectToolSchemas;
 exports.normalizeToolArgs = normalizeToolArgs;
+exports.normalizeJsonSchemaNode = normalizeJsonSchemaNode;
 exports.fixParamTypes = fixParamTypes;
 exports.extractGeminiToolDeclarations = extractGeminiToolDeclarations;
 exports.parseToolCallArgs = parseToolCallArgs;
@@ -321,6 +322,92 @@ function normalizeToolArgs(name, args, schemas) {
     return normalized;
 }
 // ─── Utility Functions ────────────────────────────────────────────────────
+const INTEGER_SCHEMA_KEYS = new Set([
+    'minLength',
+    'maxLength',
+    'minItems',
+    'maxItems',
+    'minProperties',
+    'maxProperties',
+    'minContains',
+    'maxContains',
+]);
+const NUMBER_SCHEMA_KEYS = new Set([
+    'minimum',
+    'maximum',
+    'exclusiveMinimum',
+    'exclusiveMaximum',
+    'multipleOf',
+]);
+/**
+ * Рекурсивно нормализует узел JSON Schema: переводит типы Gemini в нижний регистр
+ * и преобразует числовые ограничения из строк Protobuf (например "1" в minLength) в числа.
+ */
+function normalizeJsonSchemaNode(schema, visited = new Set()) {
+    if (!schema || typeof schema !== 'object' || visited.has(schema))
+        return;
+    visited.add(schema);
+    if (typeof schema.type === 'string') {
+        schema.type = schema.type.toLowerCase();
+    }
+    else if (Array.isArray(schema.type)) {
+        schema.type = schema.type.map((item) => (typeof item === 'string' ? item.toLowerCase() : item));
+    }
+    for (const key of INTEGER_SCHEMA_KEYS) {
+        const raw = schema[key];
+        if (typeof raw === 'string') {
+            const trimmed = raw.trim();
+            if (/^-?\d+$/.test(trimmed))
+                schema[key] = Number.parseInt(trimmed, 10);
+        }
+    }
+    for (const key of NUMBER_SCHEMA_KEYS) {
+        const raw = schema[key];
+        if (typeof raw === 'string') {
+            const trimmed = raw.trim();
+            if (/^-?\d+(?:\.\d+)?$/.test(trimmed))
+                schema[key] = Number(trimmed);
+        }
+    }
+    const visitMap = (container) => {
+        if (!container || typeof container !== 'object' || Array.isArray(container))
+            return;
+        for (const value of Object.values(container)) {
+            if (value && typeof value === 'object' && !Array.isArray(value)) {
+                normalizeJsonSchemaNode(value, visited);
+            }
+        }
+    };
+    visitMap(schema.properties);
+    visitMap(schema.$defs);
+    visitMap(schema.definitions);
+    if (Array.isArray(schema.items)) {
+        for (const item of schema.items) {
+            if (item && typeof item === 'object' && !Array.isArray(item)) {
+                normalizeJsonSchemaNode(item, visited);
+            }
+        }
+    }
+    else if (schema.items && typeof schema.items === 'object') {
+        normalizeJsonSchemaNode(schema.items, visited);
+    }
+    if (schema.additionalProperties && typeof schema.additionalProperties === 'object' && !Array.isArray(schema.additionalProperties)) {
+        normalizeJsonSchemaNode(schema.additionalProperties, visited);
+    }
+    if (schema.not && typeof schema.not === 'object' && !Array.isArray(schema.not)) {
+        normalizeJsonSchemaNode(schema.not, visited);
+    }
+    for (const key of ['anyOf', 'oneOf', 'allOf', 'prefixItems']) {
+        const branch = schema[key];
+        if (!Array.isArray(branch))
+            continue;
+        for (const item of branch) {
+            if (item && typeof item === 'object' && !Array.isArray(item)) {
+                normalizeJsonSchemaNode(item, visited);
+            }
+        }
+    }
+}
 /**
  * Recursively converts Gemini parameter types (UPPERCASE) to lowercase format.
  * Gemini uses uppercase (STRING, NUMBER); OpenAI/Anthropic need lowercase.
@@ -330,29 +417,14 @@ function fixParamTypes(properties) {
         return;
     for (const key of Object.keys(properties)) {
         const val = properties[key];
-        if (val && typeof val === 'object') {
-            const obj = val;
-            if (typeof obj.type === 'string') {
-                obj.type = obj.type.toLowerCase();
-            }
-            if (obj.properties && typeof obj.properties === 'object') {
-                fixParamTypes(obj.properties);
-            }
-            if (obj.items && typeof obj.items === 'object') {
-                const items = obj.items;
-                if (typeof items.type === 'string') {
-                    items.type = items.type.toLowerCase();
-                }
-                if (items.properties && typeof items.properties === 'object') {
-                    fixParamTypes(items.properties);
-                }
-            }
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+            normalizeJsonSchemaNode(val);
         }
     }
 }
 /**
  * Извлекает декларации инструментов из Gemini tools в нормализованном виде
- * (с копированием схемы и приведением типов параметров к нижнему регистру).
+ * (с копированием схемы и нормализацией типов и числовых ограничений).
  */
 function extractGeminiToolDeclarations(geminiTools) {
     if (!geminiTools || !Array.isArray(geminiTools))
@@ -374,12 +446,7 @@ function extractGeminiToolDeclarations(geminiTools) {
             const params = declaration
                 ? JSON.parse(JSON.stringify(declaration))
                 : { type: 'object', properties: {} };
-            if (params.type && typeof params.type === 'string') {
-                params.type = params.type.toLowerCase();
-            }
-            if (params.properties && typeof params.properties === 'object') {
-                fixParamTypes(params.properties);
-            }
+            normalizeJsonSchemaNode(params);
             extracted.push({
                 name: fn.name,
                 description: fn.description || '',

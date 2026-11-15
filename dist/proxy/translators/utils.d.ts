@@ -48,13 +48,18 @@ export declare function collectToolSchemas(body: unknown): ToolSchemas;
  */
 export declare function normalizeToolArgs(name: string, args: Record<string, unknown> | null | undefined, schemas?: ToolSchemas): Record<string, unknown>;
 /**
+ * Рекурсивно нормализует узел JSON Schema: переводит типы Gemini в нижний регистр
+ * и преобразует числовые ограничения из строк Protobuf (например "1" в minLength) в числа.
+ */
+export declare function normalizeJsonSchemaNode(schema: Record<string, unknown>, visited?: Set<object>): void;
+/**
  * Recursively converts Gemini parameter types (UPPERCASE) to lowercase format.
  * Gemini uses uppercase (STRING, NUMBER); OpenAI/Anthropic need lowercase.
  */
 export declare function fixParamTypes(properties: Record<string, unknown> | undefined): void;
 /**
  * Извлекает декларации инструментов из Gemini tools в нормализованном виде
- * (с копированием схемы и приведением типов параметров к нижнему регистру).
+ * (с копированием схемы и нормализацией типов и числовых ограничений).
  */
 export declare function extractGeminiToolDeclarations(geminiTools: unknown): Array<{
     name: string;

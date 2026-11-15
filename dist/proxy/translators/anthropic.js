@@ -50,33 +50,12 @@ const utils_1 = require("./utils");
 const shared_1 = require("../shared");
 const modelUtils_1 = require("../modelUtils");
 // ─── REQUEST: Gemini → Anthropic ──────────────────────────────────────────
-// ПРИМЕЧАНИЕ: разбор схем инструментов здесь дублирует логику extractGeminiToolDeclarations из utils.ts.
 function mapGeminiToolsToAnthropic(geminiTools) {
-    if (!geminiTools || !Array.isArray(geminiTools))
-        return [];
-    const anthropicTools = [];
-    for (const toolGroup of geminiTools) {
-        if (toolGroup.functionDeclarations && Array.isArray(toolGroup.functionDeclarations)) {
-            for (const func of toolGroup.functionDeclarations) {
-                const declaration = func.parametersJsonSchema ?? func.parameters;
-                const params = declaration
-                    ? JSON.parse(JSON.stringify(declaration))
-                    : { type: 'OBJECT', properties: {} };
-                if (params.type && typeof params.type === 'string') {
-                    params.type = params.type.toLowerCase();
-                }
-                if (params.properties) {
-                    (0, utils_1.fixParamTypes)(params.properties);
-                }
-                anthropicTools.push({
-                    name: func.name,
-                    description: func.description || '',
-                    input_schema: params,
-                });
-            }
-        }
-    }
-    return anthropicTools;
+    return (0, utils_1.extractGeminiToolDeclarations)(geminiTools).map((decl) => ({
+        name: decl.name,
+        description: decl.description,
+        input_schema: decl.parameters,
+    }));
 }
 function mapGeminiToAnthropic(geminiBody, modelName, stateKey = modelName) {
     const messages = [];

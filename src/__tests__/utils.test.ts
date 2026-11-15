@@ -62,6 +62,32 @@ describe('fixParamTypes', () => {
   it('should handle empty object', () => {
     expect(() => fixParamTypes({})).not.toThrow();
   });
+
+  it('coerces Protobuf stringified integer and numeric JSON Schema keywords recursively', () => {
+    const props: Record<string, unknown> = {
+      Recipient: { type: 'STRING', minLength: '1', maxLength: '128' },
+      Questions: {
+        type: 'ARRAY',
+        minItems: '1',
+        maxItems: '3',
+        items: {
+          type: 'OBJECT',
+          minProperties: '1',
+          properties: {
+            timeoutMs: { type: 'INTEGER', minimum: '0', maximum: '30000' },
+          },
+        },
+      },
+    };
+    fixParamTypes(props);
+    expect(props.Recipient).toEqual({ type: 'string', minLength: 1, maxLength: 128 });
+    const questions = props.Questions as Record<string, unknown>;
+    expect(questions.minItems).toBe(1);
+    expect(questions.maxItems).toBe(3);
+    const items = questions.items as { minProperties: number; properties: { timeoutMs: Record<string, unknown> } };
+    expect(items.minProperties).toBe(1);
+    expect(items.properties.timeoutMs).toEqual({ type: 'integer', minimum: 0, maximum: 30000 });
+  });
 });
 
 // ─── normalizeToolArgs ─────────────────────────────────────────────────────
