@@ -77,7 +77,13 @@ const listen_1 = require("./proxy/listen");
 const cryptoStore = __importStar(require("./cryptoStore"));
 // ─── Model Helpers ────────────────────────────────────────────────────────
 function getCustomModelsPath() {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+    let homeDir;
+    try {
+        homeDir = (typeof electron_1.app?.getPath === 'function' ? electron_1.app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
+    }
+    catch {
+        homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    }
     return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
 }
 // Допустимый диапазон enum exa.codeium_common_pb.Model в language_server и main.js: MODEL_PLACEHOLDER_M0..M1650.
@@ -321,6 +327,9 @@ function loadCustomModels() {
         }
         const decrypted = cryptoStore.decryptModels(models);
         for (const model of decrypted) {
+            if (typeof model.name === 'string' && !model.name.startsWith('models/') && !model.name.includes('/')) {
+                model.name = `models/${model.name}`;
+            }
             if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(model.apiKey || '')) {
                 model.enabled = false;
                 electron_log_1.default.warn('[Proxy] Skipping a model whose API key could not be decrypted');

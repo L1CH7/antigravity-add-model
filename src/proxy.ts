@@ -101,7 +101,12 @@ import * as cryptoStore from './cryptoStore';
 // ─── Model Helpers ────────────────────────────────────────────────────────
 
 function getCustomModelsPath(): string {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  let homeDir: string;
+  try {
+    homeDir = (typeof app?.getPath === 'function' ? app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
+  } catch {
+    homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  }
   return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
 }
 
@@ -371,6 +376,9 @@ function loadCustomModels(): CustomModel[] {
 
     const decrypted = cryptoStore.decryptModels(models as unknown as Parameters<typeof cryptoStore.decryptModels>[0]) as unknown as CustomModel[];
     for (const model of decrypted) {
+      if (typeof model.name === 'string' && !model.name.startsWith('models/') && !model.name.includes('/')) {
+        model.name = `models/${model.name}`;
+      }
       if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(model.apiKey || '')) {
         model.enabled = false;
         log.warn('[Proxy] Skipping a model whose API key could not be decrypted');

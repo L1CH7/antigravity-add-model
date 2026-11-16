@@ -76,6 +76,9 @@ export function normalizeModelConfig(payload: unknown): ModelEntry[] {
     delete model.useRawBaseUrl;
     delete model.supportsImages;
     model.externalModelName ||= typeof model.name === 'string' ? model.name.replace(/^models\//, '') : '';
+    if (typeof model.name === 'string' && !model.name.startsWith('models/') && !model.name.includes('/')) {
+      model.name = `models/${model.name}`;
+    }
     return model as unknown as ModelEntry;
   });
 }

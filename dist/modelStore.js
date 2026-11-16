@@ -110,6 +110,9 @@ function normalizeModelConfig(payload) {
         delete model.useRawBaseUrl;
         delete model.supportsImages;
         model.externalModelName || (model.externalModelName = typeof model.name === 'string' ? model.name.replace(/^models\//, '') : '');
+        if (typeof model.name === 'string' && !model.name.startsWith('models/') && !model.name.includes('/')) {
+            model.name = `models/${model.name}`;
+        }
         return model;
     });
 }
