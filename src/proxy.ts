@@ -101,7 +101,12 @@ import * as cryptoStore from './cryptoStore';
 // ─── Model Helpers ────────────────────────────────────────────────────────
 
 function getCustomModelsPath(): string {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  let homeDir: string;
+  try {
+    homeDir = (typeof app?.getPath === 'function' ? app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
+  } catch {
+    homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  }
   return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
 }
 

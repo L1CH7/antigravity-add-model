@@ -77,7 +77,13 @@ const listen_1 = require("./proxy/listen");
 const cryptoStore = __importStar(require("./cryptoStore"));
 // ─── Model Helpers ────────────────────────────────────────────────────────
 function getCustomModelsPath() {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+    let homeDir;
+    try {
+        homeDir = (typeof electron_1.app?.getPath === 'function' ? electron_1.app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
+    }
+    catch {
+        homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    }
     return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
 }
 // Допустимый диапазон enum exa.codeium_common_pb.Model в language_server и main.js: MODEL_PLACEHOLDER_M0..M1650.
