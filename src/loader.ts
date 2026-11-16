@@ -92,6 +92,37 @@ const originalSpawn = childProcess.spawn;
   return originalSpawn.apply(this, [command, args, options] as any);
 };
 
+
+// ─── Intercept child_process.execFile to bypass WSL completely on Windows ───
+
+const originalExecFile = childProcess.execFile;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(childProcess as any).execFile = function (file: string, ...args: any[]) {
+  if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+    const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+    if (callback) {
+      process.nextTick(() => callback(null, Buffer.alloc(0), Buffer.alloc(0)));
+      return new childProcess.ChildProcess();
+    }
+  }
+  return originalExecFile.apply(this, [file, ...args]);
+};
+
+const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+if (originalExecFile && (originalExecFile as any)[promisifyCustom]) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (childProcess as any).execFile[promisifyCustom] = function (file: string, ...args: any[]) {
+    if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+      return Promise.resolve({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+    }
+    return (originalExecFile as any)[promisifyCustom].apply(this, [file, ...args]);
+  };
+}
+
+
+
+
 // ─── Setup IPC & WebRequest Interception ──────────────────────────────────────
 
 // Register custom model storage & connection test IPC handlers

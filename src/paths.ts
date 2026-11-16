@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import path from 'path';
 import os from 'os';
+import * as fs from 'fs';
 import { LS_LOG_FILE_NAME } from './constants';
 
 export function getAppDataDirName(): string {
@@ -40,6 +41,31 @@ export function getWindowStatePath(): string {
  */
 export function getActivePortFilePath(): string {
   return path.join(app.getPath('userData'), 'DevToolsActivePort');
+}
+
+/**
+ * Best-effort POSIX hardening of `DevToolsActivePort`, which holds the CDP
+ * WebSocket secret: restricts `userDataDir` to `0o700` and `activePortFile` to
+ * `0o600`, each only if it exists, is owned by the current user, and is looser.
+ * Never throws.
+ */
+export function tightenActivePortPermissions(userDataDir: string, activePortFile: string): void {
+  if (process.platform === 'win32') {
+    return;
+  }
+  for (const [target, mode] of [
+    [userDataDir, 0o700],
+    [activePortFile, 0o600],
+  ] as const) {
+    try {
+      const st = fs.statSync(target);
+      if (st.uid === (process.getuid ? process.getuid() : undefined) && (st.mode & 0o777 & ~mode)) {
+        fs.chmodSync(target, st.mode & mode);
+      }
+    } catch {
+      // Missing path or foreign filesystem: leave as is.
+    }
+  }
 }
 
 export function getLsLogPath(): string {

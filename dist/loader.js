@@ -76,6 +76,29 @@ childProcess.spawn = function (command, args, options) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return originalSpawn.apply(this, [command, args, options]);
 };
+// ─── Intercept child_process.execFile to bypass WSL completely on Windows ───
+const originalExecFile = childProcess.execFile;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+childProcess.execFile = function (file, ...args) {
+    if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+        const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+        if (callback) {
+            process.nextTick(() => callback(null, Buffer.alloc(0), Buffer.alloc(0)));
+            return new childProcess.ChildProcess();
+        }
+    }
+    return originalExecFile.apply(this, [file, ...args]);
+};
+const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+if (originalExecFile && originalExecFile[promisifyCustom]) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    childProcess.execFile[promisifyCustom] = function (file, ...args) {
+        if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+            return Promise.resolve({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+        }
+        return originalExecFile[promisifyCustom].apply(this, [file, ...args]);
+    };
+}
 // ─── Setup IPC & WebRequest Interception ──────────────────────────────────────
 // Register custom model storage & connection test IPC handlers
 (0, customModelIpc_1.setupCustomModelIpc)(electron_1.ipcMain);

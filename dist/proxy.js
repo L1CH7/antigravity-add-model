@@ -321,6 +321,9 @@ function loadCustomModels() {
         }
         const decrypted = cryptoStore.decryptModels(models);
         for (const model of decrypted) {
+            if (typeof model.name === 'string' && !model.name.startsWith('models/') && !model.name.includes('/')) {
+                model.name = `models/${model.name}`;
+            }
             if (/^(DECRYPTION_FAILED|enc:|fallback:|local-gcm:)/.test(model.apiKey || '')) {
                 model.enabled = false;
                 electron_log_1.default.warn('[Proxy] Skipping a model whose API key could not be decrypted');
