@@ -76,28 +76,45 @@ childProcess.spawn = function (command, args, options) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return originalSpawn.apply(this, [command, args, options]);
 };
-// ─── Intercept child_process.execFile to bypass WSL completely on Windows ───
-const originalExecFile = childProcess.execFile;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-childProcess.execFile = function (file, ...args) {
-    if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
-        const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
-        if (callback) {
-            process.nextTick(() => callback(null, Buffer.alloc(0), Buffer.alloc(0)));
-            return new childProcess.ChildProcess();
-        }
-    }
-    return originalExecFile.apply(this, [file, ...args]);
-};
-const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
-if (originalExecFile && originalExecFile[promisifyCustom]) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    childProcess.execFile[promisifyCustom] = function (file, ...args) {
-        if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
-            return Promise.resolve({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
-        }
-        return originalExecFile[promisifyCustom].apply(this, [file, ...args]);
+// ─── Intercept child_process.execFile to bypass WSL probing on Windows ───────
+if (typeof process !== 'undefined' && process.platform === 'win32' && typeof childProcess.execFile === 'function') {
+    const isWslDisabled = () => {
+        if (typeof process === 'undefined')
+            return false;
+        const env = process.env || {};
+        const argv = Array.isArray(process.argv) ? process.argv : [];
+        return (env.ANTIGRAVITY_DISABLE_WSL === '1' ||
+            env.AG_DISABLE_WSL === '1' ||
+            argv.includes('--no-wsl') ||
+            argv.some((arg) => typeof arg === 'string' && arg.startsWith('--wsl-distro=')));
     };
+    const originalExecFile = childProcess.execFile;
+    const getEmptyOutput = (options) => options && options.encoding === 'buffer' ? Buffer.alloc(0) : '';
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    childProcess.execFile = function (file, ...args) {
+        if (isWslDisabled() && typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+            const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+            const options = args.find((a) => a && typeof a === 'object' && !Array.isArray(a));
+            const empty = getEmptyOutput(options);
+            if (callback) {
+                process.nextTick(() => callback(null, empty, empty));
+                return new childProcess.ChildProcess();
+            }
+        }
+        return originalExecFile.apply(this, [file, ...args]);
+    };
+    const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+    if (originalExecFile[promisifyCustom]) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        childProcess.execFile[promisifyCustom] = function (file, ...args) {
+            if (isWslDisabled() && typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+                const options = args.find((a) => a && typeof a === 'object' && !Array.isArray(a));
+                const empty = getEmptyOutput(options);
+                return Promise.resolve({ stdout: empty, stderr: empty });
+            }
+            return originalExecFile[promisifyCustom].apply(this, [file, ...args]);
+        };
+    }
 }
 // ─── Setup IPC & WebRequest Interception ──────────────────────────────────────
 // Register custom model storage & connection test IPC handlers

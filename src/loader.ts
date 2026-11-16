@@ -1,3 +1,4 @@
+import type { ExecFileOptions } from 'child_process';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const childProcess = require('child_process');
 import { app, ipcMain, session } from 'electron';
@@ -92,36 +93,54 @@ const originalSpawn = childProcess.spawn;
   return originalSpawn.apply(this, [command, args, options] as any);
 };
 
+// ─── Intercept child_process.execFile to bypass WSL probing on Windows ───────
 
-// ─── Intercept child_process.execFile to bypass WSL completely on Windows ───
-
-const originalExecFile = childProcess.execFile;
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(childProcess as any).execFile = function (file: string, ...args: any[]) {
-  if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
-    const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
-    if (callback) {
-      process.nextTick(() => callback(null, Buffer.alloc(0), Buffer.alloc(0)));
-      return new childProcess.ChildProcess();
-    }
-  }
-  return originalExecFile.apply(this, [file, ...args]);
-};
-
-const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
-if (originalExecFile && (originalExecFile as any)[promisifyCustom]) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (childProcess as any).execFile[promisifyCustom] = function (file: string, ...args: any[]) {
-    if (typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
-      return Promise.resolve({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
-    }
-    return (originalExecFile as any)[promisifyCustom].apply(this, [file, ...args]);
+if (typeof process !== 'undefined' && process.platform === 'win32' && typeof childProcess.execFile === 'function') {
+  const isWslDisabled = () => {
+    if (typeof process === 'undefined') return false;
+    const env = process.env || {};
+    const argv = Array.isArray(process.argv) ? process.argv : [];
+    return (
+      env.ANTIGRAVITY_DISABLE_WSL === '1' ||
+      env.AG_DISABLE_WSL === '1' ||
+      argv.includes('--no-wsl') ||
+      argv.some((arg) => typeof arg === 'string' && arg.startsWith('--wsl-distro='))
+    );
   };
+
+  const originalExecFile = childProcess.execFile;
+
+  const getEmptyOutput = (options?: ExecFileOptions | null) =>
+    options && options.encoding === 'buffer' ? Buffer.alloc(0) : '';
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (childProcess as any).execFile = function (file: string, ...args: any[]) {
+    if (isWslDisabled() && typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+      const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+      const options = args.find((a) => a && typeof a === 'object' && !Array.isArray(a)) as ExecFileOptions | undefined;
+      const empty = getEmptyOutput(options);
+
+      if (callback) {
+        process.nextTick(() => callback(null, empty, empty));
+        return new childProcess.ChildProcess();
+      }
+    }
+    return originalExecFile.apply(this, [file, ...args]);
+  };
+
+  const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+  if ((originalExecFile as any)[promisifyCustom]) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (childProcess as any).execFile[promisifyCustom] = function (file: string, ...args: any[]) {
+      if (isWslDisabled() && typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+        const options = args.find((a) => a && typeof a === 'object' && !Array.isArray(a)) as ExecFileOptions | undefined;
+        const empty = getEmptyOutput(options);
+        return Promise.resolve({ stdout: empty, stderr: empty });
+      }
+      return (originalExecFile as any)[promisifyCustom].apply(this, [file, ...args]);
+    };
+  }
 }
-
-
-
 
 // ─── Setup IPC & WebRequest Interception ──────────────────────────────────────
 
