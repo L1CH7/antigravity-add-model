@@ -827,6 +827,28 @@ describe('provider and configuration contracts', () => {
     expect(() => trimContext(request, 10, 5)).toThrow(/latest turn/);
   });
 
+  it('does not inflate context budget with raw base64 bytes of binary PDF or image attachments', () => {
+    const largePdfBase64 = 'A'.repeat(2_400_000);
+    const largeImageBase64 = 'B'.repeat(2_400_000);
+    const request = {
+      systemInstruction: { parts: [{ text: 'system' }] },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'analyze attachments' },
+            { inlineData: { mimeType: 'application/pdf', data: largePdfBase64 } },
+            { inlineData: { mimeType: 'image/png', data: largeImageBase64 } },
+          ],
+        },
+      ],
+    };
+
+    const result = trimContext(request, 1_050_000, 350_000);
+    expect(result.contents).toHaveLength(1);
+    expect((result.contents![0].parts![1] as { inlineData: { data: string } }).inlineData.data).toBe(largePdfBase64);
+  });
+
   it('allows only one circuit probe after cooldown and honors numeric or HTTP-date Retry-After', () => {
     let now = 100;
     const circuit = new CircuitBreaker(() => now);

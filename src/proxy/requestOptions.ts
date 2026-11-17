@@ -8,6 +8,73 @@ export interface GeminiBody {
   [key: string]: unknown;
 }
 
+const INLINE_TEXTUAL_MIMES = new Set([
+  'application/json',
+  'application/xml',
+  'application/javascript',
+  'application/x-javascript',
+  'application/x-typescript',
+  'application/x-python-code',
+  'application/x-ipynb+json',
+  'application/yaml',
+  'application/x-yaml',
+]);
+
+function estimateInlineDataBytes(mimeType: string | undefined, base64Len: number): number {
+  const mime = (mimeType || '').split(';')[0].trim().toLowerCase();
+  if (mime.startsWith('text/') || INLINE_TEXTUAL_MIMES.has(mime)) {
+    return Math.ceil(base64Len * 0.75);
+  }
+  if (mime.startsWith('image/')) {
+    return 4_500;
+  }
+  if (mime.startsWith('audio/')) {
+    return Math.max(1_500, Math.ceil(base64Len / 48));
+  }
+  if (mime.startsWith('video/')) {
+    return Math.max(6_000, Math.ceil(base64Len / 48));
+  }
+  return Math.max(3_000, Math.ceil(base64Len / 24));
+}
+
+function stripAndEstimateParts(
+  parts: Record<string, unknown>[],
+  binaryByteBudget: { bytes: number },
+): Record<string, unknown>[] {
+  return parts.map((part) => {
+    const inline = (part.inlineData || part.inline_data) as
+      | { mimeType?: string; mime_type?: string; data?: string }
+      | undefined;
+    if (inline && typeof inline.data === 'string') {
+      binaryByteBudget.bytes += estimateInlineDataBytes(inline.mimeType || inline.mime_type, inline.data.length);
+      const clone: Record<string, unknown> = { ...part };
+      if (part.inlineData) clone.inlineData = { ...(part.inlineData as Record<string, unknown>), data: '' };
+      if (part.inline_data) clone.inline_data = { ...(part.inline_data as Record<string, unknown>), data: '' };
+      return clone;
+    }
+    const fnResp = part.functionResponse as { parts?: Record<string, unknown>[] } | undefined;
+    if (fnResp && Array.isArray(fnResp.parts)) {
+      return { ...part, functionResponse: { ...fnResp, parts: stripAndEstimateParts(fnResp.parts, binaryByteBudget) } };
+    }
+    return part;
+  });
+}
+
+function estimateContentBytes(content: NonNullable<GeminiBody['contents']>[number]): number {
+  const parts = content.parts as Record<string, unknown>[] | undefined;
+  const hasInline = parts?.some((p) => {
+    if (p.inlineData || p.inline_data) return true;
+    const fnParts = (p.functionResponse as { parts?: Record<string, unknown>[] } | undefined)?.parts;
+    return Array.isArray(fnParts) && fnParts.some((fp) => Boolean(fp.inlineData || fp.inline_data));
+  });
+  if (!hasInline || !parts) {
+    return Buffer.byteLength(JSON.stringify(content), 'utf8');
+  }
+  const binaryByteBudget = { bytes: 0 };
+  const stripped = { ...content, parts: stripAndEstimateParts(parts, binaryByteBudget) };
+  return Buffer.byteLength(JSON.stringify(stripped), 'utf8') + binaryByteBudget.bytes;
+}
+
 /** Conservative estimate, not a tokenizer. Drop whole oldest turns, never half a tool exchange. */
 export function trimContext(body: GeminiBody, contextWindow?: number, maxOutputTokens = 0): GeminiBody {
   if (!contextWindow) return body;
@@ -25,12 +92,12 @@ export function trimContext(body: GeminiBody, contextWindow?: number, maxOutputT
     return { ...body, contents: [] };
   }
 
-  // Побайтовый подсчёт за O(N) без повторной сериализации всего диалога на каждом шаге отсечения.
+  // Побайтовый подсчёт за O(N) без повторной сериализации всего диалога и без завышения base64 бинарных вложений.
   const baseBytes = Buffer.byteLength(JSON.stringify({ ...body, contents: [] }), 'utf8');
   const groupContentBytes = groups.map((group) => {
     let bytes = 0;
     for (const item of group) {
-      bytes += Buffer.byteLength(JSON.stringify(item), 'utf8');
+      bytes += estimateContentBytes(item);
     }
     return { bytes, items: group.length };
   });
