@@ -81,7 +81,6 @@ import {
   modelToolCallIds,
   modelReasoningContent,
   activeStreamContexts,
-  translatedToolCalls,
   stateTimestamps,
   startCleanupInterval,
   stopCleanupInterval,
@@ -94,22 +93,12 @@ export { NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtil
 // Custom request transport and model storage
 import { runCustomModelRequest, getProxyMetrics, stopCustomRequests } from './proxy/customRequest';
 import { fetchGoogleBuffer, forwardToGoogle, stopGoogleForwarder } from './proxy/googleForwarder';
-import { readModelConfig, writeJsonAtomic } from './modelStore';
+import { readModelConfig, writeJsonAtomic, getCustomModelsPath } from './modelStore';
 import { getRequiredProxyPort, listenProxy } from './proxy/listen';
 
 import * as cryptoStore from './cryptoStore';
 
 // ─── Model Helpers ────────────────────────────────────────────────────────
-
-function getCustomModelsPath(): string {
-  let homeDir: string;
-  try {
-    homeDir = (typeof app?.getPath === 'function' ? app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
-  } catch {
-    homeDir = process.env.HOME || process.env.USERPROFILE || '';
-  }
-  return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
-}
 
 // Допустимый диапазон enum exa.codeium_common_pb.Model в language_server и main.js: MODEL_PLACEHOLDER_M0..M1650.
 const VALID_PLACEHOLDER_MIN = 0;
@@ -301,7 +290,7 @@ function buildFileStatKey(filePath: string): string | null {
 }
 
 function loadCustomModels(): CustomModel[] {
-  const filePath = getCustomModelsPath();
+  const filePath = getCustomModelsPath(app);
   const initialStatKey = buildFileStatKey(filePath);
   if (initialStatKey && customModelsCache && customModelsCache.filePath === filePath && customModelsCache.statKey === initialStatKey) {
     return customModelsCache.models.map((m) => ({ ...m }));
@@ -498,33 +487,88 @@ function proxyToGoogle(req: http.IncomingMessage, res: http.ServerResponse, reqB
 
 // ─── File Data Resolver ────────────────────────────────────────────────────
 
-async function resolveFileData(body: GeminiRequestBody, reqHeaders: Record<string, string | string[] | undefined>): Promise<void> {
-  const contents = body.contents;
-  if (!contents) return;
-  const authHeader = (reqHeaders['authorization'] || reqHeaders['Authorization'] || '') as string;
-  for (const item of contents) {
-    if (!item.parts) continue;
-    for (let i = 0; i < item.parts.length; i++) {
-      const p = item.parts[i] as Record<string, unknown>;
-      const fd = p.fileData as { mimeType?: string; fileUri?: string } | undefined;
-      if (!fd?.fileUri) continue;
-      try {
-        const uri = fd.fileUri; let fileContent = '';
-        if (uri.startsWith('file://')) {
-          const fp = uri.replace('file://', '').replace(/\//g, path.sep);
-          if (fs.existsSync(fp)) fileContent = fs.readFileSync(fp, 'utf-8');
-        } else if (authHeader && uri.startsWith('https://')) {
-          fileContent = await downloadFileContent(uri, authHeader);
-        }
-        if (fileContent) {
-          (item.parts[i] as Record<string, unknown>) = { text: '[File content]:\n\n' + fileContent };
-        }
-      } catch (e) { log.warn('[Proxy] File resolve failed:', (e as Error).message); }
-    }
+const FILE_IMAGE_EXT_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+};
+
+function resolveFileImageMime(declaredMime: string | undefined, uri: string): string | undefined {
+  const clean = (declaredMime || '').split(';')[0].trim().toLowerCase();
+  if (clean.startsWith('image/')) return clean;
+  try {
+    const ext = path.extname(new URL(uri).pathname).toLowerCase();
+    return FILE_IMAGE_EXT_MIME[ext];
+  } catch {
+    return undefined;
   }
 }
 
-function downloadFileContent(url: string, authHeader: string): Promise<string> {
+function fileUriToLocalPath(uri: string): string {
+  const parsed = new URL(uri);
+  let fp = decodeURIComponent(parsed.pathname);
+  if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(fp)) {
+    fp = fp.slice(1);
+  }
+  return path.normalize(fp);
+}
+
+export async function resolveFileData(body: GeminiRequestBody, reqHeaders: Record<string, string | string[] | undefined>): Promise<void> {
+  const contents = body.contents;
+  if (!contents) return;
+  const authHeader = (reqHeaders['authorization'] || reqHeaders['Authorization'] || '') as string;
+  const tasks: Promise<void>[] = [];
+
+  for (const item of contents) {
+    if (!item.parts) continue;
+    for (let i = 0; i < item.parts.length; i++) {
+      const partIdx = i;
+      const p = item.parts[partIdx] as Record<string, unknown>;
+      const fd = (p.fileData || p.file_data) as { mimeType?: string; mime_type?: string; fileUri?: string; file_uri?: string } | undefined;
+      const uri = fd?.fileUri || fd?.file_uri;
+      if (!uri) continue;
+      const declaredMime = fd?.mimeType || fd?.mime_type;
+
+      tasks.push(
+        (async () => {
+          try {
+            let fileBuf: Buffer | null = null;
+            if (uri.startsWith('file://')) {
+              const fp = fileUriToLocalPath(uri);
+              fileBuf = await fs.promises.readFile(fp);
+            } else if (authHeader && uri.startsWith('https://')) {
+              fileBuf = await downloadFileBuffer(uri, authHeader);
+            }
+            if (!fileBuf || fileBuf.length === 0) return;
+
+            const imageMime = resolveFileImageMime(declaredMime, uri);
+            if (imageMime) {
+              (item.parts![partIdx] as Record<string, unknown>) = {
+                inlineData: { mimeType: imageMime, data: fileBuf.toString('base64') },
+              };
+            } else {
+              (item.parts![partIdx] as Record<string, unknown>) = {
+                text: '[File content]:\n\n' + fileBuf.toString('utf-8'),
+              };
+            }
+          } catch (e) {
+            log.warn('[Proxy] File resolve failed:', (e as Error).message);
+          }
+        })(),
+      );
+    }
+  }
+
+  if (tasks.length > 0) {
+    await Promise.all(tasks);
+  }
+}
+
+function downloadFileBuffer(url: string, authHeader: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     (u.protocol === 'https:' ? https : http).request({
@@ -532,7 +576,9 @@ function downloadFileContent(url: string, authHeader: string): Promise<string> {
       method: 'GET', headers: { 'Authorization': authHeader }, timeout: 30000,
     }, (res) => {
       if (res.statusCode !== 200) { reject(new Error('HTTP ' + res.statusCode)); return; }
-      let d = ''; res.on('data', (c: Buffer) => d += c.toString()); res.on('end', () => resolve(d));
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
     }).on('error', reject).end();
   });
 }
@@ -551,7 +597,6 @@ function handleCustomModelRequest(
     model,
     body as import('./proxy/requestOptions').GeminiBody,
     isStream,
-    [],
     cloudEnvelope,
   );
 }
@@ -1208,7 +1253,6 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         state: {
           activeStreamContexts: activeStreamContexts.size,
           modelToolCallIds: modelToolCallIds.size,
-          translatedToolCalls: translatedToolCalls.size,
           modelReasoningContent: modelReasoningContent.size,
         },
         timestamp: new Date().toISOString(),

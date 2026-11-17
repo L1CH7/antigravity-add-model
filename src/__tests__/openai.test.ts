@@ -296,13 +296,43 @@ describe('mapGeminiToOpenAI', () => {
             { inlineData: { mimeType: 'image/png', data: 'QUJDRA==' } },
           ],
         },
+        {
+          role: 'user',
+          parts: [
+            { inline_data: { mime_type: 'image/webp', data: 'V0VCUA==' } },
+          ],
+        },
       ],
     };
-    const result = mapGeminiToOpenAI(body, 'gpt-4o');
+    const result = mapGeminiToOpenAI(body as any, 'gpt-6.1-sol');
     expect(result.messages[0].content).toEqual([
       { type: 'text', text: 'Inspect screenshot' },
       { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJDRA==' } },
     ]);
+    expect(result.messages[1].content).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/webp;base64,V0VCUA==' } },
+    ]);
+  });
+
+  it('should preserve images attached alongside functionResponse as multimodal user message', () => {
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { functionResponse: { id: 'call_shot', name: 'take_screenshot', response: { ok: true } } },
+            { inlineData: { mimeType: 'image/png', data: 'U0hPVA==' } },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToOpenAI(body as any, 'gpt-6.1-sol');
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toEqual({ role: 'tool', content: '{"ok":true}', tool_call_id: 'call_shot' });
+    expect(result.messages[1]).toEqual({
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,U0hPVA==' } }],
+    });
   });
 
   it('should convert Gemini tools to OpenAI format', () => {

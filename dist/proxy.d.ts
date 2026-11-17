@@ -39,6 +39,33 @@ export interface CustomModel {
     googlePool?: import('./googleAccounts').GooglePoolOptions;
     encryptedGoogleAccounts?: boolean;
 }
+interface GeminiRequestBody {
+    model?: string;
+    modelId?: string;
+    model_id?: string;
+    sessionId?: string;
+    conversationId?: string;
+    request?: GeminiRequestBody;
+    systemInstruction?: {
+        parts: {
+            text?: string;
+        }[];
+    };
+    contents?: {
+        parts?: {
+            text?: string;
+            functionCall?: unknown;
+            functionResponse?: unknown;
+            thought?: boolean;
+        }[];
+        role?: string;
+    }[];
+    tools?: unknown[];
+    generationConfig?: {
+        temperature?: number;
+        maxOutputTokens?: number;
+    };
+}
 export { NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtils';
 export declare function generateModelPlaceholderId(model: CustomModel): string;
 export declare function toSlug(model: CustomModel): string;
@@ -49,6 +76,7 @@ interface ResolvedCustomModel {
 }
 export declare function collectOccupiedPlaceholders(payload: Record<string, unknown> | null | undefined): Set<string>;
 export declare function resolveCustomModelKeys(models: CustomModel[], occupiedPlaceholders?: ReadonlySet<string>): ResolvedCustomModel[];
+export declare function resolveFileData(body: GeminiRequestBody, reqHeaders: Record<string, string | string[] | undefined>): Promise<void>;
 export declare function mergeFetchAvailableModelsResponse(googleJson: Record<string, unknown> | null, customModels: CustomModel[]): Record<string, unknown>;
 export declare function mergeListModelsResponse(googleJson: Record<string, unknown> | null, customModels: CustomModel[]): Record<string, unknown>;
 export declare function findMatchedCustomModel(customModels: CustomModel[], modelName?: string, modelId?: string): CustomModel | undefined;

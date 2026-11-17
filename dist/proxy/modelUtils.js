@@ -1,48 +1,28 @@
 "use strict";
 /**
- * Centralized model capability detection.
- * Replaces ~9 duplicate regex blocks across proxy.js.
+ * Глобальные дефолты и чтение возможностей модели строго из конфигурации,
+ * без эвристик и угадывания по имени модели.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.NATIVE_GOOGLE_MODELS = void 0;
+exports.NATIVE_GOOGLE_MODELS = exports.DEFAULT_MAX_OUTPUT_TOKENS = exports.DEFAULT_CONTEXT_WINDOW = void 0;
 exports.detectModelCapabilities = detectModelCapabilities;
 exports.detectModelCapabilitiesByName = detectModelCapabilitiesByName;
 exports.isNativeGoogleModelName = isNativeGoogleModelName;
-// ─── Detection ────────────────────────────────────────────────────────────
-const THINKING_PATTERN = /thinking|reasoning|reasoner|o1|o3|r1|opus-4|sonnet-4|claude-4|3-7|4-7|3\.7|4\.7/i;
-const DEEPSEEK_PATTERN = /deepseek/i;
-const CLAUDE_PATTERN = /claude|opus|sonnet/i;
+exports.DEFAULT_CONTEXT_WINDOW = 1048576;
+exports.DEFAULT_MAX_OUTPUT_TOKENS = 65536;
+// ─── Capabilities ─────────────────────────────────────────────────────────
 const CLAUDE_THINKING_PATTERN = /opus-4|sonnet-4|claude-4|claude-3-5|claude-3-7/i;
 const THINKING_MODEL_PATTERN = /opus-4|sonnet-4|claude-4/i;
-const IMAGE_SUPPORT_PATTERN = /gpt-4o|gpt-4-turbo|claude|gemini|vision|llava|qwenvl|pixtral|yi-vision|cogvlm|kimi|moonshot/i;
-const NO_IMAGE_PATTERN = /deepseek(?!.*vision)|llama(?!.*vision)|mixtral(?!.*vision)|mistral(?!.*pixtral)|codestral|qwen(?!.*vl)/i;
 /**
- * Detects model capabilities from a custom model config object.
+ * Возвращает возможности модели из её конфигурации с глобальными дефолтами.
  */
-function detectModelCapabilities(m, includeDisplayName = true) {
-    const nameLower = (m.name || '').toLowerCase();
-    const extLower = (m.externalModelName || '').toLowerCase();
-    const displayLower = includeDisplayName ? (m.displayName || '').toLowerCase() : '';
-    const isThinking = m.supportsThinking ?? (m.provider === 'anthropic' ||
-        m.provider === 'openai' ||
-        m.provider === 'openrouter' ||
-        THINKING_PATTERN.test(nameLower) ||
-        THINKING_PATTERN.test(extLower) ||
-        (includeDisplayName && THINKING_PATTERN.test(displayLower)));
-    const isDeepSeek = DEEPSEEK_PATTERN.test(nameLower) ||
-        DEEPSEEK_PATTERN.test(extLower) ||
-        (includeDisplayName && DEEPSEEK_PATTERN.test(displayLower));
-    const isClaude = m.provider === 'anthropic' || CLAUDE_PATTERN.test(nameLower) || CLAUDE_PATTERN.test(extLower);
-    const maxTokens = m.contextWindow ?? (isClaude ? 262144 : 1048576);
-    const maxOutputTokens = m.maxOutputTokens ?? 65536;
-    // Image support: Claude, GPT-4o, Gemini always support images. DeepSeek, Ollama text models don't.
-    const allNames = nameLower + ' ' + extLower + ' ' + displayLower;
-    const supportsImages = m.supportsVision ?? (m.provider === 'anthropic' ||
-        m.provider === 'google' ||
-        (m.provider === 'openai' && IMAGE_SUPPORT_PATTERN.test(allNames)) ||
-        (m.provider === 'openrouter' && IMAGE_SUPPORT_PATTERN.test(allNames)) ||
-        (IMAGE_SUPPORT_PATTERN.test(allNames) && !NO_IMAGE_PATTERN.test(allNames)));
-    return { isThinking, isDeepSeek, isClaude, maxTokens, maxOutputTokens, supportsImages };
+function detectModelCapabilities(m, _includeDisplayName = true) {
+    const hasReasoning = Boolean(m.reasoningEffort || (Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0));
+    const isThinking = m.supportsThinking ?? hasReasoning;
+    const maxTokens = m.contextWindow ?? exports.DEFAULT_CONTEXT_WINDOW;
+    const maxOutputTokens = m.maxOutputTokens ?? exports.DEFAULT_MAX_OUTPUT_TOKENS;
+    const supportsImages = m.supportsVision ?? true;
+    return { isThinking, maxTokens, maxOutputTokens, supportsImages };
 }
 /**
  * Simplified detection for Gemini↔Anthropic translation (checks modelName string only).

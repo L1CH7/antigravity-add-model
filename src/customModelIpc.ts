@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as http from 'http';
 import * as https from 'https';
 import { encryptString, decryptString } from './cryptoStore';
+import { getCustomModelsPath } from './modelStore';
 
 export interface CustomModelFileEntry {
   name: string;
@@ -32,16 +33,6 @@ export interface ConnectionTestResult {
   error?: string;
 }
 
-function getCustomModelsPath(): string {
-  let homeDir: string;
-  try {
-    homeDir = (typeof app?.getPath === 'function' ? app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
-  } catch {
-    homeDir = process.env.HOME || process.env.USERPROFILE || '';
-  }
-  return path.join(homeDir, '.gemini', 'antigravity', 'custom_models.json');
-}
-
 /**
  * Registers custom model storage and connectivity IPC handlers.
  * Safe to call in any Electron main process environment without overwriting native handlers.
@@ -49,7 +40,7 @@ function getCustomModelsPath(): string {
 export function setupCustomModelIpc(ipc: typeof ipcMain = ipcMain): void {
   // Read custom models with masked API keys
   ipc.handle('storage:get-custom-models', async () => {
-    const filePath = getCustomModelsPath();
+    const filePath = getCustomModelsPath(app);
     try {
       const content = await fs.readFile(filePath, 'utf-8');
       const parsed = JSON.parse(content) as { models?: CustomModelFileEntry[] };
@@ -77,7 +68,7 @@ export function setupCustomModelIpc(ipc: typeof ipcMain = ipcMain): void {
 
   // Save or update a custom model with encrypted API key
   ipc.handle('storage:save-custom-model', async (_event, newModel: CustomModelFileEntry & { apiKey?: string }) => {
-    const filePath = getCustomModelsPath();
+    const filePath = getCustomModelsPath(app);
     try {
       let models: CustomModelFileEntry[] = [];
       try {
@@ -121,7 +112,7 @@ export function setupCustomModelIpc(ipc: typeof ipcMain = ipcMain): void {
 
   // Delete a custom model
   ipc.handle('storage:delete-custom-model', async (_event, modelName: string) => {
-    const filePath = getCustomModelsPath();
+    const filePath = getCustomModelsPath(app);
     try {
       let models: CustomModelFileEntry[] = [];
       try {

@@ -9,6 +9,6 @@ export interface ProviderPreset {
 }
 export declare const PROVIDERS: readonly ProviderPreset[];
 export declare function getProvider(id: string): ProviderPreset | undefined;
-/** Defaults for old files without apiFormat must not silently change protocol. */
+/** Берёт формат протокола из явного apiFormat модели или таблицы PROVIDERS без legacy-подмен. */
 export declare function resolveApiFormat(provider: string, override?: ApiFormat): ApiFormat;
 //# sourceMappingURL=providers.d.ts.map

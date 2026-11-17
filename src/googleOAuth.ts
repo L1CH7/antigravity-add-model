@@ -1,4 +1,10 @@
-/** Explicit Google desktop OAuth login. No bundled client credentials or automatic login. */
+/**
+ * UNUSED IN CURRENT PIPELINE: Локальный OAuth-логин для пула `google-cloudcode` не используется
+ * при штатной авторизации Antigravity и работе через `:8045`.
+ * Модуль оставлен для совместимости тестов — не трогать без явного запроса.
+ *
+ * Explicit Google desktop OAuth login. No bundled client credentials or automatic login.
+ */
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';

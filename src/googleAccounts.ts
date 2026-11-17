@@ -1,4 +1,10 @@
-/** Google Cloud Code account pools. OAuth applications and credentials are supplied by the user. */
+/**
+ * UNUSED IN CURRENT PIPELINE: Пул аккаунтов `google-cloudcode` и локальный OAuth refresh
+ * не используются при штатной авторизации Antigravity и работе через `:8045`.
+ * Модуль оставлен для совместимости тестов — не трогать без явного запроса.
+ *
+ * Google Cloud Code account pools. OAuth applications and credentials are supplied by the user.
+ */
 import * as http from 'http';
 import * as https from 'https';
 import { createHash } from 'crypto';

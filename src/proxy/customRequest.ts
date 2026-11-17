@@ -8,6 +8,7 @@ import { acquireGoogleAccount, GoogleAccountError, GoogleAccountLease } from '..
 import * as registry from './registry';
 import { CircuitBreaker } from './circuitBreaker';
 import { applyRequestOptions, GeminiBody, parseRetryAfter, trimContext } from './requestOptions';
+import { DEFAULT_MAX_OUTPUT_TOKENS } from './modelUtils';
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
 import { collectToolSchemas } from './translators/utils';
 import log from 'electron-log';
@@ -211,7 +212,6 @@ export async function runCustomModelRequest(
   primary: CustomModel,
   originalBody: GeminiBody,
   isStream: boolean,
-  allModels: CustomModel[],
   cloudEnvelope = true,
 ): Promise<void> {
   const toolSchemas = collectToolSchemas(originalBody);
@@ -298,7 +298,7 @@ export async function runCustomModelRequest(
           (requestedMaxOutput > 0
             ? requestedMaxOutput
             : model.contextWindow
-              ? Math.min(65_536, Math.max(1, Math.floor(model.contextWindow / 4)))
+              ? Math.min(DEFAULT_MAX_OUTPUT_TOKENS, Math.max(1, Math.floor(model.contextWindow / 4)))
               : 0);
         const body = trimContext(originalBody, model.contextWindow, outputBudget);
         basePayload = applyRequestOptions(

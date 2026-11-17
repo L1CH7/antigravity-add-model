@@ -73,7 +73,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'Solve riddle' }] }] },
         true,
-        [configured],
         false,
       );
     });
@@ -119,7 +118,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'Solve riddle' }] }] },
         true,
-        [configured],
         false,
       );
     });
@@ -158,7 +156,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
         true,
-        [configured],
         false,
       );
     });
@@ -206,7 +203,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] },
         true,
-        [configured],
         false,
       );
     });
@@ -248,7 +244,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] },
         true,
-        [configured],
         false,
       );
     });
@@ -285,7 +280,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] },
         true,
-        [configured],
         false,
       );
     });
@@ -314,7 +308,6 @@ describe('stream resilience and Go SDK compatibility', () => {
         configured,
         { contents: [{ role: 'user', parts: [{ text: 'spaces' }] }] },
         true,
-        [configured],
         false,
       );
     });

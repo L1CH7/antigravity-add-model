@@ -1,4 +1,8 @@
 /**
+ * UNUSED IN CURRENT PIPELINE: Модуль оставлен только для совместимости тестов форка.
+ * В рабочем стеке (`Antigravity-Manager :8045` + OpenAI-compatible ключи) формат
+ * `anthropic` не используется — не оптимизировать и не изменять без явного запроса.
+ *
  * Anthropic provider translator.
  * Handles Gemini ↔ Anthropic request/response mapping and streaming SSE events.
  */

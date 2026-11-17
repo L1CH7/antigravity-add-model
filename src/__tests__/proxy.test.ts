@@ -389,3 +389,59 @@ describe('schemaValidator with reasoningEfforts and max', () => {
     expect(res.valid).toBe(false);
   });
 });
+
+describe('image capability advertising and end-to-end fileData image delivery', () => {
+  it('advertises image support and image/png mime type for arbitrary OpenAI models like gpt-6.1-sol', () => {
+    const m = {
+      name: 'models/gpt-6.1-sol',
+      displayName: 'GPT-6.1 Sol',
+      description: '',
+      provider: 'openai',
+      apiKey: 'test-key',
+      apiUrl: 'https://example.com/v1/chat/completions',
+      externalModelName: 'gpt-6.1-sol',
+      supportsThinking: true,
+    };
+    const merged = mergeFetchAvailableModelsResponse({ availableModels: {} }, [m]) as any;
+    const entry = merged.availableModels['custom-gpt-6-1-sol'];
+    expect(entry.supportsImages).toBe(true);
+    expect(entry.supportedMimeTypes['image/png']).toBe(true);
+  });
+
+  it('converts local file:// PNG attachments into base64 inlineData and OpenAI image_url parts', async () => {
+    const fs = await import('fs');
+    const os = await import('os');
+    const { pathToFileURL } = await import('url');
+    const { resolveFileData } = await import('../proxy');
+    const { mapGeminiToOpenAI } = await import('../proxy/translators/openai');
+
+    const tmpFile = path.join(os.tmpdir(), `agy-img-test-${Date.now()}.png`);
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    fs.writeFileSync(tmpFile, pngBytes);
+    try {
+      const geminiBody: any = {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'Read table from screenshot' },
+              { fileData: { mimeType: 'image/png', fileUri: pathToFileURL(tmpFile).toString() } },
+            ],
+          },
+        ],
+      };
+      await resolveFileData(geminiBody, {});
+      expect(geminiBody.contents[0].parts[1]).toEqual({
+        inlineData: { mimeType: 'image/png', data: pngBytes.toString('base64') },
+      });
+
+      const openAiReq = mapGeminiToOpenAI(geminiBody, 'gpt-6.1-sol');
+      expect(openAiReq.messages[0].content).toEqual([
+        { type: 'text', text: 'Read table from screenshot' },
+        { type: 'image_url', image_url: { url: `data:image/png;base64,${pngBytes.toString('base64')}` } },
+      ]);
+    } finally {
+      fs.unlinkSync(tmpFile);
+    }
+  });
+});

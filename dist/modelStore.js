@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ModelStore = void 0;
 exports.normalizeModelConfig = normalizeModelConfig;
+exports.getCustomModelsPath = getCustomModelsPath;
 exports.readModelConfig = readModelConfig;
 exports.writeJsonAtomic = writeJsonAtomic;
 exports.isMaskedSecret = isMaskedSecret;
@@ -115,6 +116,17 @@ function normalizeModelConfig(payload) {
         }
         return model;
     });
+}
+function getCustomModelsPath(electronApp) {
+    let homeDir = '';
+    try {
+        homeDir = (typeof electronApp?.getPath === 'function' ? electronApp.getPath('home') : '') || '';
+    }
+    catch {
+        homeDir = '';
+    }
+    homeDir = homeDir || process.env.HOME || process.env.USERPROFILE || '';
+    return path.join(homeDir, '.gemini', 'antigravity', 'custom_models.json');
 }
 function readModelConfig(filename) {
     try {

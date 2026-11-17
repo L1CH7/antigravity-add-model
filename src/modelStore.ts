@@ -83,6 +83,17 @@ export function normalizeModelConfig(payload: unknown): ModelEntry[] {
   });
 }
 
+export function getCustomModelsPath(electronApp?: { getPath?: (name: string) => string } | null): string {
+  let homeDir = '';
+  try {
+    homeDir = (typeof electronApp?.getPath === 'function' ? electronApp.getPath('home') : '') || '';
+  } catch {
+    homeDir = '';
+  }
+  homeDir = homeDir || process.env.HOME || process.env.USERPROFILE || '';
+  return path.join(homeDir, '.gemini', 'antigravity', 'custom_models.json');
+}
+
 export function readModelConfig(filename: string): ModelEntry[] {
   try {
     return normalizeModelConfig(JSON.parse(fs.readFileSync(filename, 'utf8')));

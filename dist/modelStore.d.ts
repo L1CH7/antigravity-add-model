@@ -16,6 +16,9 @@ export interface SecretCodec {
 }
 /** Accept flat legacy files and provider-group exports without losing model overrides. */
 export declare function normalizeModelConfig(payload: unknown): ModelEntry[];
+export declare function getCustomModelsPath(electronApp?: {
+    getPath?: (name: string) => string;
+} | null): string;
 export declare function readModelConfig(filename: string): ModelEntry[];
 export declare function writeJsonAtomic(filename: string, value: unknown): void;
 export declare function isMaskedSecret(value: unknown): boolean;

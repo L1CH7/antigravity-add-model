@@ -59,7 +59,6 @@ async function proxy(models: CustomModel[], stream = false, cloud = false): Prom
       models[0],
       { contents: [{ role: 'user', parts: [{ text: req.url || 'hello' }] }] },
       stream,
-      models,
       cloud,
     );
   });
@@ -175,7 +174,7 @@ describe('real upstream HTTP routing', () => {
       const configured = model(upstream, { provider });
       const url = await serve(async (req, res) => {
         const input = await body(req);
-        void runCustomModelRequest(res, configured, input, stream, [configured], false);
+        void runCustomModelRequest(res, configured, input, stream, false);
       });
       const tools = [
         {
@@ -256,7 +255,7 @@ describe('real upstream HTTP routing', () => {
         ],
       };
       const url = await serve(
-        (_req, res) => void runCustomModelRequest(res, configured, request, stream, [configured], false),
+        (_req, res) => void runCustomModelRequest(res, configured, request, stream, false),
       );
       const response = await fetch(url);
       expect(response.status).toBe(200);
@@ -280,7 +279,7 @@ describe('real upstream HTTP routing', () => {
       const configured = model(upstream, { provider });
       const url = await serve(async (req, res) => {
         const request = await body(req);
-        void runCustomModelRequest(res, configured, request, true, [configured], false);
+        void runCustomModelRequest(res, configured, request, true, false);
       });
       const results = await Promise.all(
         ['first', 'second'].map(async (token) => {
@@ -540,7 +539,6 @@ describe('real upstream HTTP routing', () => {
         selected,
         { ...payload, contents: [{ role: 'user', parts: [{ text: 'next turn' }] }] },
         false,
-        [selected],
         false,
       );
     });
@@ -747,11 +745,11 @@ describe('provider and configuration contracts', () => {
       getProviderUrl('http://localhost/v1/chat/completions', 'test', false, getTranslator('custom', 'anthropic')),
     ).toBe('http://localhost/v1/messages');
   });
-  it('preserves old wire formats while new presets select the advertised format explicitly', () => {
+  it('uses provider preset apiFormat directly unless explicitly overridden', () => {
     for (const provider of ['deepseek', 'kimi', 'fireworks', 'lmstudio', 'llamacpp']) {
-      expect(resolveApiFormat(provider)).toBe('anthropic');
       expect(getProvider(provider)!.apiFormat).toBe('openai');
-      expect(resolveApiFormat(provider, 'openai')).toBe('openai');
+      expect(resolveApiFormat(provider)).toBe('openai');
+      expect(resolveApiFormat(provider, 'anthropic')).toBe('anthropic');
     }
     for (const preset of PROVIDERS)
       expect(
@@ -855,7 +853,7 @@ describe('provider and configuration contracts', () => {
     delete configured.maxOutputTokens;
     const url = await serve(async (req, res) => {
       const request = await body(req);
-      void runCustomModelRequest(res, configured, request, false, [], false);
+      void runCustomModelRequest(res, configured, request, false, false);
     });
     const res = await fetch(url, {
       method: 'POST',

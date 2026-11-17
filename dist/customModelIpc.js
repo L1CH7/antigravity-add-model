@@ -40,16 +40,7 @@ const path = __importStar(require("path"));
 const http = __importStar(require("http"));
 const https = __importStar(require("https"));
 const cryptoStore_1 = require("./cryptoStore");
-function getCustomModelsPath() {
-    let homeDir;
-    try {
-        homeDir = (typeof electron_1.app?.getPath === 'function' ? electron_1.app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
-    }
-    catch {
-        homeDir = process.env.HOME || process.env.USERPROFILE || '';
-    }
-    return path.join(homeDir, '.gemini', 'antigravity', 'custom_models.json');
-}
+const modelStore_1 = require("./modelStore");
 /**
  * Registers custom model storage and connectivity IPC handlers.
  * Safe to call in any Electron main process environment without overwriting native handlers.
@@ -57,7 +48,7 @@ function getCustomModelsPath() {
 function setupCustomModelIpc(ipc = electron_1.ipcMain) {
     // Read custom models with masked API keys
     ipc.handle('storage:get-custom-models', async () => {
-        const filePath = getCustomModelsPath();
+        const filePath = (0, modelStore_1.getCustomModelsPath)(electron_1.app);
         try {
             const content = await fs.readFile(filePath, 'utf-8');
             const parsed = JSON.parse(content);
@@ -85,7 +76,7 @@ function setupCustomModelIpc(ipc = electron_1.ipcMain) {
     });
     // Save or update a custom model with encrypted API key
     ipc.handle('storage:save-custom-model', async (_event, newModel) => {
-        const filePath = getCustomModelsPath();
+        const filePath = (0, modelStore_1.getCustomModelsPath)(electron_1.app);
         try {
             let models = [];
             try {
@@ -127,7 +118,7 @@ function setupCustomModelIpc(ipc = electron_1.ipcMain) {
     });
     // Delete a custom model
     ipc.handle('storage:delete-custom-model', async (_event, modelName) => {
-        const filePath = getCustomModelsPath();
+        const filePath = (0, modelStore_1.getCustomModelsPath)(electron_1.app);
         try {
             let models = [];
             try {

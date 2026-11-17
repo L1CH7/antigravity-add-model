@@ -68,9 +68,7 @@ export function getProvider(id: string): ProviderPreset | undefined {
   return PROVIDERS.find((provider) => provider.id === id);
 }
 
-/** Defaults for old files without apiFormat must not silently change protocol. */
+/** Берёт формат протокола из явного apiFormat модели или таблицы PROVIDERS без legacy-подмен. */
 export function resolveApiFormat(provider: string, override?: ApiFormat): ApiFormat {
-  if (override) return override;
-  if (['deepseek', 'kimi', 'fireworks', 'lmstudio', 'llamacpp'].includes(provider)) return 'anthropic';
-  return getProvider(provider)?.apiFormat || 'openai';
+  return override || getProvider(provider)?.apiFormat || 'openai';
 }

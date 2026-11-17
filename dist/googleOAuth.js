@@ -35,7 +35,13 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.GOOGLE_TOKEN_URL = exports.GOOGLE_AUTHORIZATION_URL = void 0;
 exports.loginGoogleAccount = loginGoogleAccount;
-/** Explicit Google desktop OAuth login. No bundled client credentials or automatic login. */
+/**
+ * UNUSED IN CURRENT PIPELINE: Локальный OAuth-логин для пула `google-cloudcode` не используется
+ * при штатной авторизации Antigravity и работе через `:8045`.
+ * Модуль оставлен для совместимости тестов — не трогать без явного запроса.
+ *
+ * Explicit Google desktop OAuth login. No bundled client credentials or automatic login.
+ */
 const http = __importStar(require("node:http"));
 const https = __importStar(require("node:https"));
 const node_crypto_1 = require("node:crypto");

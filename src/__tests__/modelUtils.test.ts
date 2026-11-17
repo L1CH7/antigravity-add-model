@@ -1,117 +1,61 @@
 import { describe, it, expect } from 'vitest';
-import { detectModelCapabilities, detectModelCapabilitiesByName } from '../proxy/modelUtils';
+import {
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  detectModelCapabilities,
+  detectModelCapabilitiesByName,
+} from '../proxy/modelUtils';
 
 describe('detectModelCapabilities', () => {
-  it('detects thinking for anthropic provider', () => {
-    const result = detectModelCapabilities({ name: 'claude-3-5-sonnet', provider: 'anthropic' });
-    expect(result.isThinking).toBe(true);
-    expect(result.isClaude).toBe(true);
-    expect(result.maxTokens).toBe(262_144);
-    expect(result.maxOutputTokens).toBe(65_536);
-  });
-
-  it('detects thinking for openai provider', () => {
-    const result = detectModelCapabilities({ name: 'gpt-4o', provider: 'openai' });
-    expect(result.isThinking).toBe(true);
-    expect(result.isClaude).toBe(false);
-  });
-
-  it('detects thinking for openrouter provider', () => {
-    const result = detectModelCapabilities({ name: 'openai/gpt-4o', provider: 'openrouter' });
-    expect(result.isThinking).toBe(true);
-    expect(result.isClaude).toBe(false);
-    expect(result.maxTokens).toBe(1_048_576);
-  });
-
-  it('detects thinking by name pattern', () => {
-    const result = detectModelCapabilities({
-      name: 'deepseek-r1',
-      provider: 'ollama',
-      externalModelName: 'deepseek-r1',
-    });
-    expect(result.isThinking).toBe(true);
-    expect(result.isDeepSeek).toBe(true);
-    expect(result.maxOutputTokens).toBe(65_536);
-  });
-
-  it('detects o1/o3 style reasoning models', () => {
-    const result = detectModelCapabilities({ name: 'o1-preview', provider: 'openai' });
-    expect(result.isThinking).toBe(true);
-  });
-
-  it('detects opus-4 / sonnet-4 as thinking', () => {
-    const result = detectModelCapabilities({ name: 'claude-sonnet-4', provider: 'anthropic' });
-    expect(result.isThinking).toBe(true);
-  });
-
-  it('detects non-thinking ollama model', () => {
-    const result = detectModelCapabilities({ name: 'llama3', provider: 'ollama' });
-    expect(result.isThinking).toBe(false);
-    expect(result.isDeepSeek).toBe(false);
-    expect(result.isClaude).toBe(false);
-    expect(result.maxTokens).toBe(1_048_576);
-    expect(result.maxOutputTokens).toBe(65_536);
-  });
-
-  it('honors explicit thinking capabilities over provider and alias heuristics', () => {
-    for (const provider of ['google', 'anthropic', 'openai', 'openrouter']) {
-      expect(
-        detectModelCapabilities({
-          name: 'models/reasoning-alias',
-          provider,
-          supportsThinking: false,
-        }).isThinking,
-      ).toBe(false);
+  it('uses global defaults when model config does not specify limits or flags', () => {
+    for (const model of [
+      { name: 'claude-3-5-sonnet', provider: 'anthropic' },
+      { name: 'deepseek-r1', provider: 'openai', externalModelName: 'deepseek-r1' },
+      { name: 'gpt-6.1-sol', provider: 'openai', externalModelName: 'gpt-6.1-sol' },
+      { name: 'llama3', provider: 'ollama' },
+    ]) {
+      const result = detectModelCapabilities(model);
+      expect(result.maxTokens).toBe(DEFAULT_CONTEXT_WINDOW);
+      expect(result.maxOutputTokens).toBe(DEFAULT_MAX_OUTPUT_TOKENS);
+      expect(result.supportsImages).toBe(true);
+      expect(result.isThinking).toBe(false);
     }
-    expect(
-      detectModelCapabilities({
-        name: 'models/plain-alias',
-        provider: 'google',
-        supportsThinking: true,
-      }).isThinking,
-    ).toBe(true);
   });
 
-  it('detects anthropic models as claude regardless of name', () => {
-    const result = detectModelCapabilities({ name: 'some-unknown-model', provider: 'anthropic' });
-    expect(result.isClaude).toBe(true);
-  });
-
-  it('detects claude by name pattern', () => {
-    const result = detectModelCapabilities({ name: 'claude-haiku', provider: 'custom' });
-    expect(result.isClaude).toBe(true);
-  });
-
-  it('detects deepseek by name', () => {
-    const result = detectModelCapabilities({ name: 'deepseek-v3', provider: 'custom' });
-    expect(result.isDeepSeek).toBe(true);
-    expect(result.maxOutputTokens).toBe(65_536);
-  });
-
-  it('uses displayName for detection when includeDisplayName=true', () => {
-    const result = detectModelCapabilities(
-      { name: 'models/my-model', provider: 'ollama', displayName: 'DeepSeek R1 - Reasoning' },
-      true,
-    );
-    expect(result.isDeepSeek).toBe(true);
+  it('infers thinking from explicit reasoningEfforts config without name guessing', () => {
+    const result = detectModelCapabilities({
+      name: 'models/custom-sol',
+      provider: 'openai',
+      reasoningEfforts: ['high', 'max'],
+    });
     expect(result.isThinking).toBe(true);
   });
 
-  it('skips displayName when includeDisplayName=false', () => {
-    const result = detectModelCapabilities(
-      { name: 'models/my-model', provider: 'ollama', displayName: 'DeepSeek R1 - Reasoning' },
-      false,
-    );
-    expect(result.isDeepSeek).toBe(false);
+  it('honors explicit limits and capability overrides from model config', () => {
+    const result = detectModelCapabilities({
+      name: 'models/custom-model',
+      provider: 'openai',
+      contextWindow: 512_000,
+      maxOutputTokens: 128_000,
+      supportsVision: false,
+      supportsThinking: true,
+    });
+    expect(result.maxTokens).toBe(512_000);
+    expect(result.maxOutputTokens).toBe(128_000);
+    expect(result.supportsImages).toBe(false);
+    expect(result.isThinking).toBe(true);
   });
 
-  it('detects by externalModelName', () => {
-    const result = detectModelCapabilities({
-      name: 'custom-model',
-      provider: 'openrouter',
-      externalModelName: 'anthropic/claude-3.5-sonnet',
-    });
-    expect(result.isClaude).toBe(true);
+  it('keeps supportsVision: true when supportsThinking is disabled', () => {
+    for (const provider of ['google', 'openai', 'openrouter']) {
+      const cap = detectModelCapabilities({
+        name: 'models/reasoning-alias',
+        provider,
+        supportsThinking: false,
+      });
+      expect(cap.isThinking).toBe(false);
+      expect(cap.supportsImages).toBe(true);
+    }
   });
 });
 

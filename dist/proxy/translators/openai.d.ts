@@ -34,12 +34,20 @@ interface GeminiPart {
     functionCall?: GeminiFunctionCall;
     functionResponse?: GeminiFunctionResponse;
     fileData?: {
-        mimeType: string;
-        fileUri: string;
+        mimeType?: string;
+        fileUri?: string;
+    };
+    file_data?: {
+        mime_type?: string;
+        file_uri?: string;
     };
     inlineData?: {
-        mimeType: string;
-        data: string;
+        mimeType?: string;
+        data?: string;
+    };
+    inline_data?: {
+        mime_type?: string;
+        data?: string;
     };
 }
 interface GeminiFunctionCall {

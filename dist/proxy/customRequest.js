@@ -48,6 +48,7 @@ const googleAccounts_1 = require("../googleAccounts");
 const registry = __importStar(require("./registry"));
 const circuitBreaker_1 = require("./circuitBreaker");
 const requestOptions_1 = require("./requestOptions");
+const modelUtils_1 = require("./modelUtils");
 const shared_1 = require("./shared");
 const utils_1 = require("./translators/utils");
 const electron_log_1 = __importDefault(require("electron-log"));
@@ -238,7 +239,7 @@ function hasSubstantiveCandidateContent(mapped) {
     });
 }
 /** The sole retry owner; the request never switches to another model or provider. */
-async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true) {
+async function runCustomModelRequest(res, primary, originalBody, isStream, cloudEnvelope = true) {
     const toolSchemas = (0, utils_1.collectToolSchemas)(originalBody);
     const controller = new AbortController();
     const { signal } = controller;
@@ -317,7 +318,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     (requestedMaxOutput > 0
                         ? requestedMaxOutput
                         : model.contextWindow
-                            ? Math.min(65536, Math.max(1, Math.floor(model.contextWindow / 4)))
+                            ? Math.min(modelUtils_1.DEFAULT_MAX_OUTPUT_TOKENS, Math.max(1, Math.floor(model.contextWindow / 4)))
                             : 0);
                 const body = (0, requestOptions_1.trimContext)(originalBody, model.contextWindow, outputBudget);
                 basePayload = (0, requestOptions_1.applyRequestOptions)(registry.translateRequest(model.provider, body, externalName, format, conversationKey), model, format, isStream);

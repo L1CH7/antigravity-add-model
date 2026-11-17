@@ -45,12 +45,8 @@ exports.PROVIDERS = [
 function getProvider(id) {
     return exports.PROVIDERS.find((provider) => provider.id === id);
 }
-/** Defaults for old files without apiFormat must not silently change protocol. */
+/** Берёт формат протокола из явного apiFormat модели или таблицы PROVIDERS без legacy-подмен. */
 function resolveApiFormat(provider, override) {
-    if (override)
-        return override;
-    if (['deepseek', 'kimi', 'fireworks', 'lmstudio', 'llamacpp'].includes(provider))
-        return 'anthropic';
-    return getProvider(provider)?.apiFormat || 'openai';
+    return override || getProvider(provider)?.apiFormat || 'openai';
 }
 //# sourceMappingURL=providers.js.map

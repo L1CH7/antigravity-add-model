@@ -3,7 +3,6 @@
  * Handles Gemini ↔ OpenAI/Ollama request/response mapping and streaming chunks.
  */
 
-import * as path from 'path';
 import log from 'electron-log';
 import {
   extractGeminiToolDeclarations,
@@ -56,8 +55,10 @@ interface GeminiPart {
   thought?: boolean;
   functionCall?: GeminiFunctionCall;
   functionResponse?: GeminiFunctionResponse;
-  fileData?: { mimeType: string; fileUri: string };
-  inlineData?: { mimeType: string; data: string };
+  fileData?: { mimeType?: string; fileUri?: string };
+  file_data?: { mime_type?: string; file_uri?: string };
+  inlineData?: { mimeType?: string; data?: string };
+  inline_data?: { mime_type?: string; data?: string };
 }
 
 interface GeminiFunctionCall {
@@ -225,6 +226,59 @@ function saveModelReasoning(stateKey: string, reasoning: string): void {
   touchStateTimestamp(stateTimestamps.reasoning, stateKey);
 }
 
+function extractInlineImageUrl(part: GeminiPart): string | null {
+  const inline = part.inlineData || part.inline_data;
+  if (!inline) return null;
+  const mime = ('mimeType' in inline ? inline.mimeType : undefined) || ('mime_type' in inline ? inline.mime_type : undefined) || '';
+  const data = inline.data || '';
+  if (!mime.toLowerCase().startsWith('image/') || !data) return null;
+  return data.startsWith('data:') ? data : `data:${mime};base64,${data}`;
+}
+
+function buildOpenAIUserContent(parts: GeminiPart[]): string | OpenAIContentPart[] {
+  const textChunks: string[] = [];
+  const multiParts: OpenAIContentPart[] = [];
+  let hasImages = false;
+  const flushTextToMulti = () => {
+    if (textChunks.length > 0) {
+      multiParts.push({ type: 'text', text: textChunks.join('\n') });
+      textChunks.length = 0;
+    }
+  };
+
+  for (const p of parts) {
+    if (p.text && !p.thought) {
+      textChunks.push(p.text);
+      continue;
+    }
+    const imageUrl = extractInlineImageUrl(p);
+    if (imageUrl) {
+      hasImages = true;
+      flushTextToMulti();
+      multiParts.push({ type: 'image_url', image_url: { url: imageUrl } });
+      continue;
+    }
+    const inline = p.inlineData || p.inline_data;
+    if (inline) {
+      const mime = ('mimeType' in inline ? inline.mimeType : undefined) || ('mime_type' in inline ? inline.mime_type : undefined) || 'application/octet-stream';
+      textChunks.push(`[Inline data: ${mime}, length: ${(inline.data || '').length} chars]`);
+      continue;
+    }
+    const fd = p.fileData || p.file_data;
+    if (fd) {
+      const uri = ('fileUri' in fd ? fd.fileUri : undefined) || ('file_uri' in fd ? fd.file_uri : undefined) || '';
+      const mime = ('mimeType' in fd ? fd.mimeType : undefined) || ('mime_type' in fd ? fd.mime_type : undefined) || '';
+      if (uri) textChunks.push(`[File reference: ${uri} (${mime})]`);
+    }
+  }
+
+  if (hasImages) {
+    flushTextToMulti();
+    return multiParts;
+  }
+  return textChunks.join('\n');
+}
+
 export function mapGeminiToOpenAI(
   geminiBody: GeminiRequestBody,
   modelName: string,
@@ -232,11 +286,14 @@ export function mapGeminiToOpenAI(
 ): OpenAIRequestBody {
   const messages: OpenAIMessage[] = [];
   const historyCallIds = new Map<string, string[]>();
-  const pendingToolResponseTexts: string[] = [];
-  const flushToolResponseTexts = () => {
-    if (!pendingToolResponseTexts.length) return;
-    messages.push({ role: 'user', content: pendingToolResponseTexts.join('\n') });
-    pendingToolResponseTexts.length = 0;
+  const pendingToolResponseParts: GeminiPart[] = [];
+  const flushToolResponseExtras = () => {
+    if (!pendingToolResponseParts.length) return;
+    const content = buildOpenAIUserContent(pendingToolResponseParts);
+    pendingToolResponseParts.length = 0;
+    if (typeof content === 'string' ? content : content.length > 0) {
+      messages.push({ role: 'user', content });
+    }
   };
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
@@ -254,7 +311,7 @@ export function mapGeminiToOpenAI(
       if (item.parts) {
         const hasFunctionCall = item.parts.some((p) => p.functionCall);
         const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
-        if (!hasFunctionResponse) flushToolResponseTexts();
+        if (!hasFunctionResponse) flushToolResponseExtras();
 
         if (hasFunctionCall && item.role === 'model') {
           const toolCalls: OpenAIToolCall[] = [];
@@ -284,7 +341,6 @@ export function mapGeminiToOpenAI(
           messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
         } else if (hasFunctionResponse) {
           for (const p of item.parts) {
-            if (p.text && !p.thought) pendingToolResponseTexts.push(p.text);
             if (p.functionResponse) {
               const funcName = p.functionResponse.name || '';
               const modelTCIds = modelToolCallIds.get(stateKey) || {};
@@ -297,6 +353,8 @@ export function mapGeminiToOpenAI(
               const responseData = p.functionResponse.response;
               const contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
               messages.push({ role: 'tool', content: contentStr, tool_call_id: toolCallId });
+            } else if (!p.thought && (p.text || p.inlineData || p.inline_data || p.fileData || p.file_data)) {
+              pendingToolResponseParts.push(p);
             }
           }
         } else {
@@ -309,57 +367,7 @@ export function mapGeminiToOpenAI(
             content = regularParts.map((p) => p.text || '').join('');
             reasoning_content = thoughtParts.map((p) => p.text || '').join('');
           } else {
-            const parts = item.parts || [];
-            const textChunks: string[] = [];
-            const multiParts: OpenAIContentPart[] = [];
-            let hasImages = false;
-            const flushTextToMulti = () => {
-              if (textChunks.length > 0) {
-                multiParts.push({ type: 'text', text: textChunks.join('\n') });
-                textChunks.length = 0;
-              }
-            };
-            for (const p of parts) {
-              if (p.text) {
-                textChunks.push(p.text);
-              } else if (p.fileData) {
-                const fd = p.fileData as { mimeType: string; fileUri: string };
-                // Try to read local files directly
-                try {
-                  const url = new URL(fd.fileUri);
-                  if (url.protocol === 'file:') {
-                    const fs = require('fs');
-                    const fileContent = fs.readFileSync(
-                      url.pathname.replace(/^\//, '').replace(/\//g, path.sep),
-                      'utf-8',
-                    );
-                    textChunks.push(`[File content from ${fd.fileUri}]:\n${fileContent}`);
-                  } else {
-                    textChunks.push(`[File reference: ${fd.fileUri} (${fd.mimeType})]`);
-                  }
-                } catch {
-                  textChunks.push(`[File reference: ${fd.fileUri} (${fd.mimeType})]`);
-                }
-              } else if (p.inlineData) {
-                const id = p.inlineData as { mimeType: string; data: string };
-                if (id.mimeType && id.mimeType.startsWith('image/') && id.data) {
-                  hasImages = true;
-                  flushTextToMulti();
-                  multiParts.push({
-                    type: 'image_url',
-                    image_url: { url: `data:${id.mimeType};base64,${id.data}` },
-                  });
-                } else {
-                  textChunks.push(`[Inline data: ${id.mimeType}, length: ${(id.data || '').length} chars]`);
-                }
-              }
-            }
-            if (hasImages) {
-              flushTextToMulti();
-              content = multiParts;
-            } else {
-              content = textChunks.join('\n');
-            }
+            content = buildOpenAIUserContent(item.parts || []);
           }
           const msg: OpenAIMessage = { role, content };
           if (reasoning_content) msg.reasoning_content = reasoning_content;
@@ -368,8 +376,8 @@ export function mapGeminiToOpenAI(
       }
     }
   }
-  // Keep feedback after all consecutive tool results, including split parallel responses.
-  flushToolResponseTexts();
+  // Keep feedback and non-text parts (such as images) after all consecutive tool results.
+  flushToolResponseExtras();
 
   // Inject reasoning_content into assistant messages missing it.
   // Поле не пишется, когда значения нет: неизвестное бэкенду пустое поле

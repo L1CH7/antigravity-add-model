@@ -19,5 +19,5 @@ export declare function getProxyMetrics(): {
 };
 export declare function stopCustomRequests(): void;
 /** The sole retry owner; the request never switches to another model or provider. */
-export declare function runCustomModelRequest(res: http.ServerResponse, primary: CustomModel, originalBody: GeminiBody, isStream: boolean, allModels: CustomModel[], cloudEnvelope?: boolean): Promise<void>;
+export declare function runCustomModelRequest(res: http.ServerResponse, primary: CustomModel, originalBody: GeminiBody, isStream: boolean, cloudEnvelope?: boolean): Promise<void>;
 //# sourceMappingURL=customRequest.d.ts.map

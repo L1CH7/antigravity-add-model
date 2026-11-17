@@ -60,7 +60,6 @@ describe('Antigravity Manager upstream error propagation', () => {
         model,
         { contents: [{ role: 'user', parts: [{ text: 'test query' }] }] },
         false,
-        [model],
         false,
       );
     });
@@ -112,7 +111,6 @@ describe('Antigravity Manager upstream error propagation', () => {
         primary,
         { contents: [{ role: 'user', parts: [{ text: 'test query' }] }] },
         false,
-        [primary, secondary],
         false,
       );
     });

@@ -41,7 +41,13 @@ exports.fetchGoogleModels = fetchGoogleModels;
 exports.acquireGoogleAccount = acquireGoogleAccount;
 exports.getGooglePoolStatus = getGooglePoolStatus;
 exports.resetGoogleAccountState = resetGoogleAccountState;
-/** Google Cloud Code account pools. OAuth applications and credentials are supplied by the user. */
+/**
+ * UNUSED IN CURRENT PIPELINE: Пул аккаунтов `google-cloudcode` и локальный OAuth refresh
+ * не используются при штатной авторизации Antigravity и работе через `:8045`.
+ * Модуль оставлен для совместимости тестов — не трогать без явного запроса.
+ *
+ * Google Cloud Code account pools. OAuth applications and credentials are supplied by the user.
+ */
 const http = __importStar(require("http"));
 const https = __importStar(require("https"));
 const crypto_1 = require("crypto");

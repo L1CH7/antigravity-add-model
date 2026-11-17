@@ -46,6 +46,7 @@ exports.generateModelPlaceholderId = generateModelPlaceholderId;
 exports.toSlug = toSlug;
 exports.collectOccupiedPlaceholders = collectOccupiedPlaceholders;
 exports.resolveCustomModelKeys = resolveCustomModelKeys;
+exports.resolveFileData = resolveFileData;
 exports.mergeFetchAvailableModelsResponse = mergeFetchAvailableModelsResponse;
 exports.mergeListModelsResponse = mergeListModelsResponse;
 exports.findMatchedCustomModel = findMatchedCustomModel;
@@ -77,16 +78,6 @@ const modelStore_1 = require("./modelStore");
 const listen_1 = require("./proxy/listen");
 const cryptoStore = __importStar(require("./cryptoStore"));
 // ─── Model Helpers ────────────────────────────────────────────────────────
-function getCustomModelsPath() {
-    let homeDir;
-    try {
-        homeDir = (typeof electron_1.app?.getPath === 'function' ? electron_1.app.getPath('home') : '') || process.env.HOME || process.env.USERPROFILE || '';
-    }
-    catch {
-        homeDir = process.env.HOME || process.env.USERPROFILE || '';
-    }
-    return path.join(homeDir, ".gemini", "antigravity", "custom_models.json");
-}
 // Допустимый диапазон enum exa.codeium_common_pb.Model в language_server и main.js: MODEL_PLACEHOLDER_M0..M1650.
 const VALID_PLACEHOLDER_MIN = 0;
 const VALID_PLACEHOLDER_MAX = 1650;
@@ -253,7 +244,7 @@ function buildFileStatKey(filePath) {
     }
 }
 function loadCustomModels() {
-    const filePath = getCustomModelsPath();
+    const filePath = (0, modelStore_1.getCustomModelsPath)(electron_1.app);
     const initialStatKey = buildFileStatKey(filePath);
     if (initialStatKey && customModelsCache && customModelsCache.filePath === filePath && customModelsCache.statKey === initialStatKey) {
         return customModelsCache.models.map((m) => ({ ...m }));
@@ -442,41 +433,87 @@ function proxyToGoogle(req, res, reqBody) {
     });
 }
 // ─── File Data Resolver ────────────────────────────────────────────────────
+const FILE_IMAGE_EXT_MIME = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.heic': 'image/heic',
+    '.heif': 'image/heif',
+};
+function resolveFileImageMime(declaredMime, uri) {
+    const clean = (declaredMime || '').split(';')[0].trim().toLowerCase();
+    if (clean.startsWith('image/'))
+        return clean;
+    try {
+        const ext = path.extname(new URL(uri).pathname).toLowerCase();
+        return FILE_IMAGE_EXT_MIME[ext];
+    }
+    catch {
+        return undefined;
+    }
+}
+function fileUriToLocalPath(uri) {
+    const parsed = new URL(uri);
+    let fp = decodeURIComponent(parsed.pathname);
+    if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(fp)) {
+        fp = fp.slice(1);
+    }
+    return path.normalize(fp);
+}
 async function resolveFileData(body, reqHeaders) {
     const contents = body.contents;
     if (!contents)
         return;
     const authHeader = (reqHeaders['authorization'] || reqHeaders['Authorization'] || '');
+    const tasks = [];
     for (const item of contents) {
         if (!item.parts)
             continue;
         for (let i = 0; i < item.parts.length; i++) {
-            const p = item.parts[i];
-            const fd = p.fileData;
-            if (!fd?.fileUri)
+            const partIdx = i;
+            const p = item.parts[partIdx];
+            const fd = (p.fileData || p.file_data);
+            const uri = fd?.fileUri || fd?.file_uri;
+            if (!uri)
                 continue;
-            try {
-                const uri = fd.fileUri;
-                let fileContent = '';
-                if (uri.startsWith('file://')) {
-                    const fp = uri.replace('file://', '').replace(/\//g, path.sep);
-                    if (fs.existsSync(fp))
-                        fileContent = fs.readFileSync(fp, 'utf-8');
+            const declaredMime = fd?.mimeType || fd?.mime_type;
+            tasks.push((async () => {
+                try {
+                    let fileBuf = null;
+                    if (uri.startsWith('file://')) {
+                        const fp = fileUriToLocalPath(uri);
+                        fileBuf = await fs.promises.readFile(fp);
+                    }
+                    else if (authHeader && uri.startsWith('https://')) {
+                        fileBuf = await downloadFileBuffer(uri, authHeader);
+                    }
+                    if (!fileBuf || fileBuf.length === 0)
+                        return;
+                    const imageMime = resolveFileImageMime(declaredMime, uri);
+                    if (imageMime) {
+                        item.parts[partIdx] = {
+                            inlineData: { mimeType: imageMime, data: fileBuf.toString('base64') },
+                        };
+                    }
+                    else {
+                        item.parts[partIdx] = {
+                            text: '[File content]:\n\n' + fileBuf.toString('utf-8'),
+                        };
+                    }
                 }
-                else if (authHeader && uri.startsWith('https://')) {
-                    fileContent = await downloadFileContent(uri, authHeader);
+                catch (e) {
+                    electron_log_1.default.warn('[Proxy] File resolve failed:', e.message);
                 }
-                if (fileContent) {
-                    item.parts[i] = { text: '[File content]:\n\n' + fileContent };
-                }
-            }
-            catch (e) {
-                electron_log_1.default.warn('[Proxy] File resolve failed:', e.message);
-            }
+            })());
         }
     }
+    if (tasks.length > 0) {
+        await Promise.all(tasks);
+    }
 }
-function downloadFileContent(url, authHeader) {
+function downloadFileBuffer(url, authHeader) {
     return new Promise((resolve, reject) => {
         const u = new URL(url);
         (u.protocol === 'https:' ? https : http).request({
@@ -487,15 +524,15 @@ function downloadFileContent(url, authHeader) {
                 reject(new Error('HTTP ' + res.statusCode));
                 return;
             }
-            let d = '';
-            res.on('data', (c) => d += c.toString());
-            res.on('end', () => resolve(d));
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
         }).on('error', reject).end();
     });
 }
 // ─── Custom Model Request Handler ─────────────────────────────────────────
 function handleCustomModelRequest(res, model, body, isStream, cloudEnvelope = true) {
-    void (0, customRequest_1.runCustomModelRequest)(res, model, body, isStream, [], cloudEnvelope);
+    void (0, customRequest_1.runCustomModelRequest)(res, model, body, isStream, cloudEnvelope);
 }
 function readVarint(buf, offset) {
     let result = 0;
@@ -1061,7 +1098,6 @@ function handleRequest(req, res) {
             state: {
                 activeStreamContexts: shared_1.activeStreamContexts.size,
                 modelToolCallIds: shared_1.modelToolCallIds.size,
-                translatedToolCalls: shared_1.translatedToolCalls.size,
                 modelReasoningContent: shared_1.modelReasoningContent.size,
             },
             timestamp: new Date().toISOString(),
