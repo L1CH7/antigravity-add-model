@@ -298,11 +298,21 @@ function parseDSMLToolCalls(text) {
         return null;
     }
 }
+function buildOpenAIUsageMetadata(usage) {
+    const cachedTokens = Number(usage?.prompt_tokens_details?.cached_tokens || 0);
+    return {
+        promptTokenCount: usage?.prompt_tokens || 0,
+        candidatesTokenCount: usage?.completion_tokens || 0,
+        totalTokenCount: usage?.total_tokens || 0,
+        ...(cachedTokens > 0 ? { cachedContentTokenCount: cachedTokens } : {}),
+    };
+}
 function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
     const choice = openAiRes.choices?.[0];
     const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
     if (reasoning)
         saveModelReasoning(modelName, reasoning);
+    const usageMetadata = buildOpenAIUsageMetadata(openAiRes.usage);
     if (choice?.message?.tool_calls && choice.message.tool_calls.length > 0) {
         const parts = choice.message.tool_calls.map((tc) => buildGeminiToolCallPart(tc.function.name, tc.function.arguments, tc.id, modelName, toolSchemas));
         if (choice.message.content)
@@ -311,11 +321,7 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
             parts.unshift({ text: reasoning, thought: true });
         return {
             candidates: [{ content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 }],
-            usageMetadata: {
-                promptTokenCount: openAiRes.usage?.prompt_tokens || 0,
-                candidatesTokenCount: openAiRes.usage?.completion_tokens || 0,
-                totalTokenCount: openAiRes.usage?.total_tokens || 0,
-            },
+            usageMetadata,
         };
     }
     const text = choice?.message?.content || '';
@@ -328,11 +334,7 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
             parts.unshift({ text: reasoning, thought: true });
         return {
             candidates: [{ content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 }],
-            usageMetadata: {
-                promptTokenCount: openAiRes.usage?.prompt_tokens || 0,
-                candidatesTokenCount: openAiRes.usage?.completion_tokens || 0,
-                totalTokenCount: openAiRes.usage?.total_tokens || 0,
-            },
+            usageMetadata,
         };
     }
     const parts = [];
@@ -343,11 +345,7 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
     const finishReason = choice?.finish_reason === 'stop' ? 'STOP' : 'OTHER';
     return {
         candidates: [{ content: { parts, role: 'model' }, finishReason, index: 0 }],
-        usageMetadata: {
-            promptTokenCount: openAiRes.usage?.prompt_tokens || 0,
-            candidatesTokenCount: openAiRes.usage?.completion_tokens || 0,
-            totalTokenCount: openAiRes.usage?.total_tokens || 0,
-        },
+        usageMetadata,
     };
 }
 // ─── STREAM CHUNK: OpenAI → Gemini ────────────────────────────────────────

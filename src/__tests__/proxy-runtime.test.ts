@@ -787,7 +787,11 @@ describe('provider and configuration contracts', () => {
       max_completion_tokens: 8192,
       reasoning_effort: 'high',
       stream: true,
+      stream_options: { include_usage: true },
     });
+    expect(
+      applyRequestOptions({}, { ...base, extraBody: { stream_options: null } }, 'openai', true).stream_options,
+    ).toBeUndefined();
     expect(applyRequestOptions({ max_tokens: 4000, temperature: 0.5 }, base, 'anthropic', false)).toEqual({
       max_tokens: 8192,
       stream: false,

@@ -120,6 +120,9 @@ interface OpenAIResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -166,6 +169,7 @@ interface GeminiUsageMetadata {
   promptTokenCount: number;
   candidatesTokenCount: number;
   totalTokenCount: number;
+  cachedContentTokenCount?: number;
 }
 
 interface DSMLParsedResult {
@@ -475,6 +479,16 @@ function parseDSMLToolCalls(text: string): DSMLParsedResult | null {
   }
 }
 
+function buildOpenAIUsageMetadata(usage?: OpenAIResponse['usage']): GeminiUsageMetadata {
+  const cachedTokens = Number(usage?.prompt_tokens_details?.cached_tokens || 0);
+  return {
+    promptTokenCount: usage?.prompt_tokens || 0,
+    candidatesTokenCount: usage?.completion_tokens || 0,
+    totalTokenCount: usage?.total_tokens || 0,
+    ...(cachedTokens > 0 ? { cachedContentTokenCount: cachedTokens } : {}),
+  };
+}
+
 export function mapOpenAIToGemini(
   openAiRes: OpenAIResponse,
   modelName: string,
@@ -483,6 +497,7 @@ export function mapOpenAIToGemini(
   const choice = openAiRes.choices?.[0];
   const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
   if (reasoning) saveModelReasoning(modelName, reasoning);
+  const usageMetadata = buildOpenAIUsageMetadata(openAiRes.usage);
 
   if (choice?.message?.tool_calls && choice.message.tool_calls.length > 0) {
     const parts: GeminiPart[] = choice.message.tool_calls.map((tc) =>
@@ -492,11 +507,7 @@ export function mapOpenAIToGemini(
     if (reasoning) parts.unshift({ text: reasoning, thought: true });
     return {
       candidates: [{ content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 }],
-      usageMetadata: {
-        promptTokenCount: openAiRes.usage?.prompt_tokens || 0,
-        candidatesTokenCount: openAiRes.usage?.completion_tokens || 0,
-        totalTokenCount: openAiRes.usage?.total_tokens || 0,
-      },
+      usageMetadata,
     };
   }
 
@@ -510,11 +521,7 @@ export function mapOpenAIToGemini(
     if (reasoning) parts.unshift({ text: reasoning, thought: true });
     return {
       candidates: [{ content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 }],
-      usageMetadata: {
-        promptTokenCount: openAiRes.usage?.prompt_tokens || 0,
-        candidatesTokenCount: openAiRes.usage?.completion_tokens || 0,
-        totalTokenCount: openAiRes.usage?.total_tokens || 0,
-      },
+      usageMetadata,
     };
   }
 
@@ -524,11 +531,7 @@ export function mapOpenAIToGemini(
   const finishReason = choice?.finish_reason === 'stop' ? 'STOP' : 'OTHER';
   return {
     candidates: [{ content: { parts, role: 'model' }, finishReason, index: 0 }],
-    usageMetadata: {
-      promptTokenCount: openAiRes.usage?.prompt_tokens || 0,
-      candidatesTokenCount: openAiRes.usage?.completion_tokens || 0,
-      totalTokenCount: openAiRes.usage?.total_tokens || 0,
-    },
+    usageMetadata,
   };
 }
 

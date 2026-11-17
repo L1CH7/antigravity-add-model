@@ -120,7 +120,13 @@ function extractChunkMetadata(chunk, format) {
             const promptTokenCount = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
             const candidatesTokenCount = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
             const totalTokenCount = Number(usage.total_tokens ?? promptTokenCount + candidatesTokenCount);
-            meta.usageMetadata = { promptTokenCount, candidatesTokenCount, totalTokenCount };
+            const cachedTokens = Number(usage.prompt_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens ?? 0);
+            meta.usageMetadata = {
+                promptTokenCount,
+                candidatesTokenCount,
+                totalTokenCount,
+                ...(cachedTokens > 0 ? { cachedContentTokenCount: cachedTokens } : {}),
+            };
         }
         else if (chunk.usageMetadata && typeof chunk.usageMetadata === 'object') {
             meta.usageMetadata = chunk.usageMetadata;

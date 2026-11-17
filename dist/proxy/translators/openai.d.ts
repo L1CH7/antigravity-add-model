@@ -110,6 +110,9 @@ interface OpenAIResponse {
         prompt_tokens: number;
         completion_tokens: number;
         total_tokens: number;
+        prompt_tokens_details?: {
+            cached_tokens?: number;
+        };
     };
 }
 interface OpenAIChoice {
@@ -151,6 +154,7 @@ interface GeminiUsageMetadata {
     promptTokenCount: number;
     candidatesTokenCount: number;
     totalTokenCount: number;
+    cachedContentTokenCount?: number;
 }
 declare function mapGeminiToolsToOpenAI(geminiTools: GeminiTool[]): OpenAITool[];
 export declare function usesMaxCompletionTokens(modelName: string): boolean;

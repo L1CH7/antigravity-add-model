@@ -80,6 +80,14 @@ function applyRequestOptions(payload, model, format, stream) {
         }
         if (format === 'openai' && model.reasoningEffort !== undefined)
             result.reasoning_effort = model.reasoningEffort;
+        if (format === 'openai') {
+            if (stream && result.stream_options === undefined) {
+                result.stream_options = { include_usage: true };
+            }
+            else if (result.stream_options === null) {
+                delete result.stream_options;
+            }
+        }
         if (format === 'anthropic' && model.thinkingBudget !== undefined) {
             if (model.thinkingBudget === 0)
                 result.thinking = { type: 'disabled' };
