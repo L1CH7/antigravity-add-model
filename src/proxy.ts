@@ -93,6 +93,7 @@ export { NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtil
 
 // Custom request transport and model storage
 import { runCustomModelRequest, getProxyMetrics, stopCustomRequests } from './proxy/customRequest';
+import { fetchGoogleBuffer, forwardToGoogle, stopGoogleForwarder } from './proxy/googleForwarder';
 import { readModelConfig, writeJsonAtomic } from './modelStore';
 import { getRequiredProxyPort, listenProxy } from './proxy/listen';
 
@@ -439,122 +440,39 @@ function loadCustomModels(): CustomModel[] {
 // ─── Google Proxy ─────────────────────────────────────────────────────────
 
 function proxyToGoogle(req: http.IncomingMessage, res: http.ServerResponse, reqBody: Buffer): void {
+  const reqUrl = req.url || '/';
   const isAiStudio =
-    req.url!.includes('generativelanguage.googleapis.com') ||
+    reqUrl.includes('generativelanguage.googleapis.com') ||
     (typeof req.headers.host === 'string' && req.headers.host.includes('generativelanguage'));
   const isCloudCodeUrl = !isAiStudio;
   const targetHost = isAiStudio ? 'generativelanguage.googleapis.com' : 'daily-cloudcode-pa.googleapis.com';
-  const targetUrl = `https://${targetHost}`;
-  const parsedUrl = new URL(req.url!, targetUrl);
-
-  const headers: Record<string, string | string[] | undefined> = {
-    ...(req.headers as Record<string, string | string[] | undefined>),
-  };
-  headers['host'] = targetHost;
-  delete headers['connection'];
-  delete headers['keep-alive'];
-
-  const isGeneration = req.url!.includes('generateContent') || req.url!.includes('streamGenerateContent');
+  const isGeneration = reqUrl.includes('generateContent') || reqUrl.includes('streamGenerateContent');
   const shouldBufferAndModify = isCloudCodeUrl && !isGeneration;
+  const proxyHost = req.headers.host || 'localhost';
 
-  if (shouldBufferAndModify) {
-    delete headers['accept-encoding'];
-  }
-
-  const options: https.RequestOptions = {
-    method: req.method,
-    headers: headers as Record<string, string>,
-  };
-
-  const proxyReq = https.request(parsedUrl, options, (proxyRes) => {
-    // For generation requests (streaming & thinking models), allow up to 15 minutes
-    // and refresh timeout on every data chunk. For metadata requests, use 60s.
-    const timeoutMs = isGeneration ? 900_000 : 60_000;
-    proxyReq.setTimeout(timeoutMs, () => {
-      log.error(`[Proxy] Google proxy ${isGeneration ? 'generation' : 'metadata'} request timed out after ${timeoutMs / 1000}s`);
-      proxyReq.destroy();
-      if (!res.headersSent) {
-        res.writeHead(504, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Google API request timed out' } }));
-      }
-    });
-
-    if (shouldBufferAndModify) {
-      const responseChunks: Buffer[] = [];
-      proxyRes.on('data', (chunk) => {
-        proxyReq.setTimeout(timeoutMs);
-        responseChunks.push(chunk);
-      });
-      proxyRes.on('end', () => {
-        const fullResBody = Buffer.concat(responseChunks);
-        let text: string;
-        const encoding = proxyRes.headers['content-encoding'];
-        if (encoding === 'gzip') {
-          try {
-            const zlib = require('zlib');
-            text = zlib.gunzipSync(fullResBody).toString('utf-8');
-          } catch (e) {
-            log.error('[Proxy] gunzipSync failed:', e);
-            text = fullResBody.toString('utf-8');
+  forwardToGoogle({
+    req,
+    res,
+    reqBody,
+    targetHost,
+    isGeneration,
+    shouldBufferAndModify,
+    transformBody: shouldBufferAndModify
+      ? (text) => {
+          let rewritten = text
+            .replace(/https:(\/\/)daily-cloudcode-pa\.googleapis\.com/g, `http:$1${proxyHost}`)
+            .replace(/https:(\/\/)cloudcode-pa\.googleapis\.com/g, `http:$1${proxyHost}`)
+            .replace(/https:(\/\/)generativelanguage\.googleapis\.com/g, `http:$1${proxyHost}`);
+          // Disable failing V2 WebChannel remote control which triggers aborted connections in language_server
+          if (reqUrl.includes('listExperiments')) {
+            rewritten = rewritten
+              .replace(/"RemoteControlEnabled":\s*true/g, '"RemoteControlEnabled":false')
+              .replace(/"remote_control_enabled":\s*true/g, '"remote_control_enabled":false');
           }
-        } else {
-          text = fullResBody.toString('utf-8');
+          return rewritten;
         }
-
-        log.info(
-          `[Proxy] Response for ${req.url} (status: ${proxyRes.statusCode}, encoding: ${encoding}, length: ${text.length})`,
-        );
-        // P0-3: Response body content is NOT logged to disk. Only metadata.
-
-        const proxyHost = req.headers.host || 'localhost';
-        text = text.replace(/https:(\/\/)daily-cloudcode-pa\.googleapis\.com/g, `http:$1${proxyHost}`);
-        text = text.replace(/https:(\/\/)cloudcode-pa\.googleapis\.com/g, `http:$1${proxyHost}`);
-        text = text.replace(/https:(\/\/)generativelanguage\.googleapis\.com/g, `http:$1${proxyHost}`);
-
-        // Disable failing V2 WebChannel remote control which triggers aborted connections in language_server
-        if (req.url && req.url.includes('listExperiments')) {
-          text = text.replace(/"RemoteControlEnabled":\s*true/g, '"RemoteControlEnabled":false');
-          text = text.replace(/"remote_control_enabled":\s*true/g, '"remote_control_enabled":false');
-        }
-
-        const modifiedHeaders: Record<string, string | string[] | undefined> = { ...proxyRes.headers };
-        delete modifiedHeaders['content-encoding'];
-
-        const modifiedBuffer = Buffer.from(text, 'utf-8');
-        modifiedHeaders['content-length'] = String(modifiedBuffer.length);
-
-        if (!res.headersSent) {
-          res.writeHead(proxyRes.statusCode || 200, modifiedHeaders as Record<string, string>);
-          res.end(modifiedBuffer);
-        } else {
-          res.end();
-        }
-      });
-    } else {
-      if (!res.headersSent) {
-        res.writeHead(proxyRes.statusCode || 200, proxyRes.headers as Record<string, string>);
-      }
-      proxyRes.on('data', () => {
-        proxyReq.setTimeout(timeoutMs);
-      });
-      proxyRes.pipe(res);
-    }
+      : undefined,
   });
-
-  proxyReq.on('error', (err) => {
-    log.error('[Proxy] Google Forwarding Error:', err);
-    if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: 'Proxy forwarding failed: ' + err.message } }));
-    } else {
-      res.end();
-    }
-  });
-
-  if (reqBody) {
-    proxyReq.write(reqBody);
-  }
-  proxyReq.end();
 }
 
 // ─── File Data Resolver ────────────────────────────────────────────────────
@@ -1116,6 +1034,80 @@ export function mergeListModelsResponse(
   return result;
 }
 
+function dispatchCustomModelRequest(
+  res: http.ServerResponse,
+  model: CustomModel,
+  body: GeminiRequestBody,
+  reqHeaders: Record<string, string | string[] | undefined>,
+  isStream: boolean,
+  cloudEnvelope: boolean,
+): void {
+  void resolveFileData(body, reqHeaders)
+    .catch((err) => {
+      log.error('[Proxy] Failed to resolve fileData before custom model dispatch:', err);
+    })
+    .then(() => {
+      if (res.destroyed || res.writableEnded) return;
+      handleCustomModelRequest(res, model, body, isStream, cloudEnvelope);
+    });
+}
+
+function handleModelsListProxy(options: {
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  reqBody: Buffer;
+  targetHost: string;
+  label: string;
+  minBodyLength: number;
+  statusErrorPrefix: string;
+  getCached: () => Record<string, unknown> | null;
+  setCached: (json: Record<string, unknown>) => void;
+  merge: (googleJson: Record<string, unknown> | null, customModels: CustomModel[]) => Record<string, unknown>;
+}): void {
+  const { req, res, reqBody, targetHost, label, minBodyLength, statusErrorPrefix, getCached, setCached, merge } = options;
+
+  const sendFallback = (reason: string) => {
+    if (res.headersSent) return;
+    const customModels = loadCustomModels();
+    const cached = getCached();
+    log.warn(`[Proxy] ${label} fallback (${reason}): cached=${Boolean(cached)}, custom=${customModels.length}`);
+    sendMergedJsonResponse(res, merge(cached, customModels));
+  };
+
+  void fetchGoogleBuffer({
+    targetHost,
+    path: req.url || '/',
+    method: req.method || 'GET',
+    headers: req.headers as Record<string, string | string[] | undefined>,
+    reqBody,
+    timeoutMs: 5_000,
+  }).then(
+    ({ statusCode, body }) => {
+      try {
+        const googleBody = body.toString('utf-8');
+        if (label === 'fetchAvailableModels') {
+          log.info(`[Proxy] fetchAvailableModels response status: ${statusCode}, body length: ${googleBody.length}`);
+        }
+        if (statusCode !== 200 || googleBody.length < minBodyLength) {
+          throw new Error(`${statusErrorPrefix} ${statusCode}`);
+        }
+        const googleJson = JSON.parse(googleBody) as Record<string, unknown>;
+        setCached(JSON.parse(JSON.stringify(googleJson)) as Record<string, unknown>);
+        const customModels = loadCustomModels();
+        const result = merge(googleJson, customModels);
+        log.info(`[Proxy] ${label} merged cleanly: custom=${customModels.length}`);
+        sendMergedJsonResponse(res, result);
+      } catch (err) {
+        log.error(`[Proxy] Parsing ${label} failed:`, err);
+        sendFallback('invalid response');
+      }
+    },
+    (err) => {
+      log.error(`[Proxy] Forwarding ${label} failed:`, err);
+      sendFallback(err instanceof Error && err.message.includes('timed out') ? 'timeout' : 'network error');
+    },
+  );
+}
 function sendMergedJsonResponse(res: http.ServerResponse, payload: Record<string, unknown>): void {
   if (res.headersSent) return;
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1262,132 +1254,40 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     // 1. Intercept /v1internal:fetchAvailableModels
     if (req.url!.includes('/v1internal:fetchAvailableModels')) {
       log.info('[Proxy] Intercepting fetchAvailableModels request');
-
-      const sendFetchFallback = (reason: string) => {
-        if (res.headersSent) return;
-        const customModels = loadCustomModels();
-        log.warn(
-          `[Proxy] fetchAvailableModels fallback (${reason}): cached=${Boolean(lastKnownFetchAvailableModelsJson)}, custom=${customModels.length}`,
-        );
-        sendMergedJsonResponse(res, mergeFetchAvailableModelsResponse(lastKnownFetchAvailableModelsJson, customModels));
-      };
-
-      const targetUrl = 'https://daily-cloudcode-pa.googleapis.com';
-      const parsedUrl = new URL(req.url!, targetUrl);
-      const fwdHeaders: Record<string, string | string[] | undefined> = {
-        ...(req.headers as Record<string, string | string[] | undefined>),
-      };
-      fwdHeaders['host'] = 'daily-cloudcode-pa.googleapis.com';
-      delete fwdHeaders['connection'];
-      delete fwdHeaders['keep-alive'];
-      delete fwdHeaders['accept-encoding'];
-
-      const fwdOptions: https.RequestOptions = {
-        method: req.method,
-        headers: fwdHeaders as Record<string, string>,
-      };
-
-      const googleReq = https.request(parsedUrl, fwdOptions, (googleRes) => {
-        // Если Google не ответил за 5с — отдаём последний кэш + наши кастомные модели.
-        googleReq.setTimeout(5_000, () => {
-          googleReq.destroy();
-          sendFetchFallback('timeout');
-        });
-
-        let googleBody = '';
-        googleRes.on('data', (chunk) => (googleBody += chunk));
-        googleRes.on('end', () => {
-          try {
-            log.info(
-              `[Proxy] fetchAvailableModels response status: ${googleRes.statusCode}, body length: ${googleBody.length}`,
-            );
-            if (googleRes.statusCode !== 200 || googleBody.length < 5) {
-              throw new Error(`Google PA returned status ${googleRes.statusCode}`);
-            }
-
-            const googleJson = JSON.parse(googleBody) as Record<string, unknown>;
-            // Сохраняем чистый ответ Google в кэш до подмешивания кастомных моделей.
-            lastKnownFetchAvailableModelsJson = JSON.parse(JSON.stringify(googleJson)) as Record<string, unknown>;
-            const customModels = loadCustomModels();
-            const result = mergeFetchAvailableModelsResponse(googleJson, customModels);
-
-            log.info(`[Proxy] fetchAvailableModels merged cleanly: custom=${customModels.length}`);
-            sendMergedJsonResponse(res, result);
-          } catch (err) {
-            log.error('[Proxy] Parsing fetchAvailableModels failed:', err);
-            sendFetchFallback('invalid response');
-          }
-        });
+      handleModelsListProxy({
+        req,
+        res,
+        reqBody: fullBody,
+        targetHost: 'daily-cloudcode-pa.googleapis.com',
+        label: 'fetchAvailableModels',
+        minBodyLength: 5,
+        statusErrorPrefix: 'Google PA returned status',
+        getCached: () => lastKnownFetchAvailableModelsJson,
+        setCached: (json) => {
+          lastKnownFetchAvailableModelsJson = json;
+        },
+        merge: mergeFetchAvailableModelsResponse,
       });
-
-      googleReq.on('error', (err) => {
-        log.error('[Proxy] Forwarding fetchAvailableModels failed:', err);
-        sendFetchFallback('network error');
-      });
-
-      if (fullBody && fullBody.length > 0) {
-        googleReq.write(fullBody);
-      }
-      googleReq.end();
       return;
     }
 
     // 2. Intercept /v1beta/models or /v1/models list request
     if (req.method === 'GET' && (req.url!.endsWith('/models') || req.url!.includes('/models?'))) {
       log.info('[Proxy] Intercepting models list request');
-
-      const sendListFallback = (reason: string) => {
-        if (res.headersSent) return;
-        const customModels = loadCustomModels();
-        log.warn(
-          `[Proxy] models list fallback (${reason}): cached=${Boolean(lastKnownListModelsJson)}, custom=${customModels.length}`,
-        );
-        sendMergedJsonResponse(res, mergeListModelsResponse(lastKnownListModelsJson, customModels));
-      };
-
-      const targetUrl = 'https://generativelanguage.googleapis.com';
-      const parsedUrl = new URL(req.url!, targetUrl);
-      const mdlHeaders: Record<string, string | string[] | undefined> = {
-        ...(req.headers as Record<string, string | string[] | undefined>),
-      };
-      mdlHeaders['host'] = 'generativelanguage.googleapis.com';
-      delete mdlHeaders['connection'];
-      delete mdlHeaders['accept-encoding'];
-
-      const mdlOptions: https.RequestOptions = { method: 'GET', headers: mdlHeaders as Record<string, string> };
-
-      const googleReq = https.request(parsedUrl, mdlOptions, (googleRes) => {
-        googleReq.setTimeout(5_000, () => {
-          googleReq.destroy();
-          sendListFallback('timeout');
-        });
-
-        let googleBody = '';
-        googleRes.on('data', (chunk) => (googleBody += chunk));
-        googleRes.on('end', () => {
-          try {
-            if (googleRes.statusCode !== 200 || googleBody.length < 2) {
-              throw new Error(`Google AI Studio returned status ${googleRes.statusCode}`);
-            }
-            const googleJson = JSON.parse(googleBody) as Record<string, unknown>;
-            lastKnownListModelsJson = JSON.parse(JSON.stringify(googleJson)) as Record<string, unknown>;
-            const customModels = loadCustomModels();
-            const result = mergeListModelsResponse(googleJson, customModels);
-
-            log.info(`[Proxy] models list merged cleanly: custom=${customModels.length}`);
-            sendMergedJsonResponse(res, result);
-          } catch (err) {
-            log.error('[Proxy] Google list models failed:', err);
-            sendListFallback('invalid response');
-          }
-        });
+      handleModelsListProxy({
+        req,
+        res,
+        reqBody: fullBody,
+        targetHost: 'generativelanguage.googleapis.com',
+        label: 'models list',
+        minBodyLength: 2,
+        statusErrorPrefix: 'Google AI Studio returned status',
+        getCached: () => lastKnownListModelsJson,
+        setCached: (json) => {
+          lastKnownListModelsJson = json;
+        },
+        merge: mergeListModelsResponse,
       });
-
-      googleReq.on('error', (err) => {
-        log.error('[Proxy] Google models list request error:', err);
-        sendListFallback('network error');
-      });
-      googleReq.end();
       return;
     }
 
@@ -1418,9 +1318,14 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             // No provider fallback: the request is served by the selected model only.
 
             // Resolve fileData URIs then route to translator
-            resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-              handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream, true);
-            });
+            dispatchCustomModelRequest(
+              res,
+              matchedCustomModel,
+              actualGeminiBody,
+              req.headers as Record<string, string | string[] | undefined>,
+              isStream,
+              true,
+            );
             return;
           }
         }
@@ -1450,9 +1355,14 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       if (matchedCustomModel) {
         try {
           const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
-          resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, false);
-          });
+          dispatchCustomModelRequest(
+            res,
+            matchedCustomModel,
+            geminiBody,
+            req.headers as Record<string, string | string[] | undefined>,
+            isStandardStream,
+            false,
+          );
           return;
         } catch (e) {
           log.error('[Proxy] JSON parse error in request body:', e);
@@ -1511,6 +1421,7 @@ export function stopProxy(): Promise<void> {
     }
     stopCleanupInterval();
     stopCustomRequests();
+    stopGoogleForwarder();
     if (server) {
       const closingServer = server;
       await new Promise<void>((resolve) => closingServer.close(() => resolve()));

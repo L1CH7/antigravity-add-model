@@ -243,12 +243,15 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
     const writeStreamPayload = (payload) => {
         if (signal.aborted || res.destroyed)
             throw new Error('Cancelled');
-        if (!res.headersSent)
+        if (!res.headersSent) {
+            res.socket?.setNoDelay(true);
             res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'X-Accel-Buffering': 'no',
             });
+            res.flushHeaders?.();
+        }
         res.write(`data: ${JSON.stringify(envelope(payload, cloudEnvelope))}\n\n`);
     };
     const writeCandidate = (candidate, meta) => {
@@ -368,8 +371,16 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                             rejectUnauthorized: !model.allowUnauthorized,
                             agent: url.protocol === 'https:' ? keepAliveHttpsAgent : keepAliveHttpAgent,
                         }, resolve);
+                        request.once('socket', (socket) => {
+                            socket.setKeepAlive(true, 5000);
+                        });
                         request.once('error', (err) => {
-                            electron_log_1.default.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
+                            if (signal.aborted && err.message === 'Cancelled') {
+                                electron_log_1.default.info(`[Proxy] Request cancelled by client for "${model.displayName}" (${url.toString()})`);
+                            }
+                            else {
+                                electron_log_1.default.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
+                            }
                             reject(err);
                         });
                         request.setTimeout(model.idleTimeout ?? 300000, () => request?.destroy(new UpstreamError('Upstream idle timeout.', 504)));

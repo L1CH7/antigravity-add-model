@@ -209,12 +209,15 @@ export async function runCustomModelRequest(
 
   const writeStreamPayload = (payload: Record<string, unknown>) => {
     if (signal.aborted || res.destroyed) throw new Error('Cancelled');
-    if (!res.headersSent)
+    if (!res.headersSent) {
+      res.socket?.setNoDelay(true);
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'X-Accel-Buffering': 'no',
       });
+      res.flushHeaders?.();
+    }
     res.write(`data: ${JSON.stringify(envelope(payload, cloudEnvelope))}\n\n`);
   };
   const writeCandidate = (candidate: unknown, meta?: Record<string, unknown>) => {
@@ -360,8 +363,15 @@ export async function runCustomModelRequest(
               },
               resolve,
             );
+            request.once('socket', (socket) => {
+              socket.setKeepAlive(true, 5000);
+            });
             request.once('error', (err) => {
-              log.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
+              if (signal.aborted && err.message === 'Cancelled') {
+                log.info(`[Proxy] Request cancelled by client for "${model.displayName}" (${url.toString()})`);
+              } else {
+                log.error(`[Proxy] Socket error for "${model.displayName}" (${url.toString()}):`, err);
+              }
               reject(err);
             });
             request.setTimeout(model.idleTimeout ?? 300_000, () =>

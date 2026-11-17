@@ -82,6 +82,7 @@ function fixture(fixed = true) {
     },
     './proxy/modelUtils': {},
     './proxy/customRequest': { stopCustomRequests: vi.fn(), getProxyMetrics: () => ({ requests: 0 }) },
+    './proxy/googleForwarder': { forwardToGoogle: vi.fn(), fetchGoogleBuffer: vi.fn(), stopGoogleForwarder: vi.fn() },
     './modelStore': {},
     './cryptoStore': {},
     // These are the production marker parser and listener, with only the socket mocked.
