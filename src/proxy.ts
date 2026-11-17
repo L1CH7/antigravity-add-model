@@ -289,12 +289,28 @@ function expandCustomModels(models: CustomModel[]): CustomModel[] {
 
 // ─── Model Loading ────────────────────────────────────────────────────────
 
+let customModelsCache: { filePath: string; statKey: string; models: CustomModel[] } | null = null;
+
+function buildFileStatKey(filePath: string): string | null {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
+  } catch {
+    return null;
+  }
+}
+
 function loadCustomModels(): CustomModel[] {
   const filePath = getCustomModelsPath();
+  const initialStatKey = buildFileStatKey(filePath);
+  if (initialStatKey && customModelsCache && customModelsCache.filePath === filePath && customModelsCache.statKey === initialStatKey) {
+    return customModelsCache.models.map((m) => ({ ...m }));
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { validateCustomModel } = require('./schemaValidator');
 
-  if (!fs.existsSync(filePath)) {
+  if (!initialStatKey) {
     const defaultModels = {
       models: [
         {
@@ -430,7 +446,12 @@ function loadCustomModels(): CustomModel[] {
       );
     }
 
-    return expandCustomModels(validModels);
+    const expanded = expandCustomModels(validModels);
+    const actualStatKey = buildFileStatKey(filePath);
+    if (actualStatKey) {
+      customModelsCache = { filePath, statKey: actualStatKey, models: expanded };
+    }
+    return expanded.map((m) => ({ ...m }));
   } catch (e) {
     log.error('[Proxy] Failed to parse custom_models.json', e);
     return [];
@@ -530,7 +551,7 @@ function handleCustomModelRequest(
     model,
     body as import('./proxy/requestOptions').GeminiBody,
     isStream,
-    loadCustomModels(),
+    [],
     cloudEnvelope,
   );
 }
@@ -961,9 +982,7 @@ export function mergeFetchAvailableModelsResponse(
     lastAssignedPlaceholderBySlug.set(slug, placeholderId);
   }
   const customSlugs = resolved.map((r) => r.slug);
-  const result: Record<string, unknown> = googleJson
-    ? (JSON.parse(JSON.stringify(googleJson)) as Record<string, unknown>)
-    : {};
+  const result: Record<string, unknown> = googleJson ? { ...googleJson } : {};
 
   const serverKey = result.models
     ? 'models'
@@ -1009,9 +1028,7 @@ export function mergeListModelsResponse(
     occupied.add(id);
   }
   const resolved = resolveCustomModelKeys(customModels, occupied);
-  const result: Record<string, unknown> = googleJson
-    ? (JSON.parse(JSON.stringify(googleJson)) as Record<string, unknown>)
-    : {};
+  const result: Record<string, unknown> = googleJson ? { ...googleJson } : {};
 
   if (Array.isArray(result.models)) {
     const existingNames = new Set(
@@ -1092,7 +1109,7 @@ function handleModelsListProxy(options: {
           throw new Error(`${statusErrorPrefix} ${statusCode}`);
         }
         const googleJson = JSON.parse(googleBody) as Record<string, unknown>;
-        setCached(JSON.parse(JSON.stringify(googleJson)) as Record<string, unknown>);
+        setCached(googleJson);
         const customModels = loadCustomModels();
         const result = merge(googleJson, customModels);
         log.info(`[Proxy] ${label} merged cleanly: custom=${customModels.length}`);
@@ -1234,7 +1251,6 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     if (bodyRejected) return;
 
     const fullBody = Buffer.concat(bodyChunks);
-    const bodyStr = fullBody.toString('utf-8');
 
     log.info(`[Proxy] Request: ${req.method} ${req.url}`);
 
@@ -1296,7 +1312,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       req.url!.includes('/v1internal:streamGenerateContent') || req.url!.includes('/v1internal:generateContent');
     if (req.method === 'POST' && isCloudCodeStream) {
       try {
-        const reqJson = JSON.parse(bodyStr) as Record<string, unknown>;
+        const reqJson = JSON.parse(fullBody.toString('utf-8')) as Record<string, unknown>;
         const modelName = reqJson.model as string | undefined;
         const modelId = (reqJson.modelId || reqJson.model_id) as string | undefined;
         log.info(
@@ -1354,7 +1370,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
       if (matchedCustomModel) {
         try {
-          const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
+          const geminiBody = JSON.parse(fullBody.toString('utf-8')) as GeminiRequestBody;
           dispatchCustomModelRequest(
             res,
             matchedCustomModel,
@@ -1387,6 +1403,9 @@ export async function startProxy(): Promise<number> {
 
   const requiredPort = getRequiredProxyPort(app.getAppPath());
   const newServer = http.createServer(handleRequest);
+  newServer.keepAliveTimeout = 60_000;
+  newServer.headersTimeout = 65_000;
+  newServer.requestTimeout = 0;
   server = newServer;
   startCleanupInterval();
   startingProxy = listenProxy(newServer, requiredPort ?? 50999, requiredPort === undefined)
@@ -1422,6 +1441,7 @@ export function stopProxy(): Promise<void> {
     stopCleanupInterval();
     stopCustomRequests();
     stopGoogleForwarder();
+    customModelsCache = null;
     if (server) {
       const closingServer = server;
       await new Promise<void>((resolve) => closingServer.close(() => resolve()));

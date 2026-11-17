@@ -277,6 +277,20 @@ function createSseKeepaliveTracker(
   };
 }
 
+function isSseKeepaliveEligible(
+  isGeneration: boolean,
+  statusCode: number,
+  headers: http2.IncomingHttpHeaders | http.IncomingHttpHeaders,
+): boolean {
+  if (!isGeneration || statusCode < 200 || statusCode >= 300) return false;
+  const contentType = String(headers['content-type'] || '');
+  if (!contentType.includes('text/event-stream')) return false;
+  // Сжатый поток (gzip/br/deflate) нельзя разбавлять сырыми \n\n, иначе сломается декомпрессия у клиента.
+  const rawEncoding = headers['content-encoding'];
+  const encoding = (Array.isArray(rawEncoding) ? rawEncoding[0] : rawEncoding || '').trim().toLowerCase();
+  return !encoding || encoding === 'identity';
+}
+
 function toOutgoingResponseHeaders(
   headers: http2.IncomingHttpHeaders | http.IncomingHttpHeaders,
 ): Record<string, string | string[]> {
@@ -401,8 +415,7 @@ function attemptHttp1Fallback(
         res.writeHead(statusCode, proxyRes.headers as Record<string, string>);
         res.flushHeaders?.();
       }
-      const contentType = String(proxyRes.headers['content-type'] || '');
-      const sseEnabled = isGeneration && statusCode >= 200 && statusCode < 300 && contentType.includes('text/event-stream');
+      const sseEnabled = isSseKeepaliveEligible(isGeneration, statusCode, proxyRes.headers);
       sseKeepalive = createSseKeepaliveTracker(res, sseEnabled, sseKeepaliveMs);
       proxyRes.on('data', (chunk: Buffer) => {
         proxyReq.setTimeout(timeoutMs);
@@ -586,8 +599,7 @@ function attemptHttp2Forward(
         res.writeHead(statusCode, outgoingHeaders);
         res.flushHeaders?.();
       }
-      const contentType = String(resHeaders['content-type'] || '');
-      const sseEnabled = isGeneration && statusCode >= 200 && statusCode < 300 && contentType.includes('text/event-stream');
+      const sseEnabled = isSseKeepaliveEligible(isGeneration, statusCode, resHeaders);
       sseKeepalive = createSseKeepaliveTracker(res, sseEnabled, sseKeepaliveMs);
       stream.on('data', (chunk: Buffer) => {
         stream.setTimeout(timeoutMs);

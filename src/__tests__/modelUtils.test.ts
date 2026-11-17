@@ -6,8 +6,8 @@ describe('detectModelCapabilities', () => {
     const result = detectModelCapabilities({ name: 'claude-3-5-sonnet', provider: 'anthropic' });
     expect(result.isThinking).toBe(true);
     expect(result.isClaude).toBe(true);
-    expect(result.maxTokens).toBe(200_000);
-    expect(result.maxOutputTokens).toBe(32_768);
+    expect(result.maxTokens).toBe(262_144);
+    expect(result.maxOutputTokens).toBe(65_536);
   });
 
   it('detects thinking for openai provider', () => {
@@ -31,7 +31,7 @@ describe('detectModelCapabilities', () => {
     });
     expect(result.isThinking).toBe(true);
     expect(result.isDeepSeek).toBe(true);
-    expect(result.maxOutputTokens).toBe(32_768);
+    expect(result.maxOutputTokens).toBe(65_536);
   });
 
   it('detects o1/o3 style reasoning models', () => {
@@ -50,7 +50,7 @@ describe('detectModelCapabilities', () => {
     expect(result.isDeepSeek).toBe(false);
     expect(result.isClaude).toBe(false);
     expect(result.maxTokens).toBe(1_048_576);
-    expect(result.maxOutputTokens).toBe(16_384);
+    expect(result.maxOutputTokens).toBe(65_536);
   });
 
   it('honors explicit thinking capabilities over provider and alias heuristics', () => {
@@ -85,7 +85,7 @@ describe('detectModelCapabilities', () => {
   it('detects deepseek by name', () => {
     const result = detectModelCapabilities({ name: 'deepseek-v3', provider: 'custom' });
     expect(result.isDeepSeek).toBe(true);
-    expect(result.maxOutputTokens).toBe(32_768);
+    expect(result.maxOutputTokens).toBe(65_536);
   });
 
   it('uses displayName for detection when includeDisplayName=true', () => {

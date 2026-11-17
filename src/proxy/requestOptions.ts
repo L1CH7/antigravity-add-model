@@ -1,5 +1,6 @@
 import type { CustomModel } from '../proxy';
 import type { ApiFormat } from '../providers';
+import { usesMaxCompletionTokens } from './translators/openai';
 
 export interface GeminiBody {
   contents?: { role?: string; parts?: { functionResponse?: unknown; [key: string]: unknown }[] }[];
@@ -11,21 +12,51 @@ export interface GeminiBody {
 export function trimContext(body: GeminiBody, contextWindow?: number, maxOutputTokens = 0): GeminiBody {
   if (!contextWindow) return body;
   const budget = contextWindow - maxOutputTokens;
-  const estimate = (value: unknown) => Math.ceil(Buffer.byteLength(JSON.stringify(value), 'utf8') / 3);
   const groups: NonNullable<GeminiBody['contents']>[] = [];
   for (const content of body.contents || []) {
     const startsTurn = content.role !== 'model' && !content.parts?.some((part) => part.functionResponse);
     if (!groups.length || startsTurn) groups.push([]);
     groups[groups.length - 1].push(content);
   }
-  const result = { ...body, contents: groups.flat() };
-  while (estimate(result) > budget && groups.length > 1) {
-    groups.shift();
-    result.contents = groups.flat();
+  if (groups.length === 0) {
+    const baseBytes = Buffer.byteLength(JSON.stringify({ ...body, contents: [] }), 'utf8');
+    if (Math.ceil(baseBytes / 3) > budget)
+      throw new Error('The latest turn, system instructions and tools exceed the configured contextWindow.');
+    return { ...body, contents: [] };
   }
-  if (estimate(result) > budget)
+
+  // Побайтовый подсчёт за O(N) без повторной сериализации всего диалога на каждом шаге отсечения.
+  const baseBytes = Buffer.byteLength(JSON.stringify({ ...body, contents: [] }), 'utf8');
+  const groupContentBytes = groups.map((group) => {
+    let bytes = 0;
+    for (const item of group) {
+      bytes += Buffer.byteLength(JSON.stringify(item), 'utf8');
+    }
+    return { bytes, items: group.length };
+  });
+
+  let totalElementBytes = 0;
+  let totalItems = 0;
+  for (const g of groupContentBytes) {
+    totalElementBytes += g.bytes;
+    totalItems += g.items;
+  }
+
+  let startGroup = 0;
+  while (startGroup < groups.length - 1) {
+    const totalBytes = baseBytes + totalElementBytes + Math.max(0, totalItems - 1);
+    if (Math.ceil(totalBytes / 3) <= budget) break;
+    totalElementBytes -= groupContentBytes[startGroup].bytes;
+    totalItems -= groupContentBytes[startGroup].items;
+    startGroup += 1;
+  }
+
+  const finalBytes = baseBytes + totalElementBytes + Math.max(0, totalItems - 1);
+  if (Math.ceil(finalBytes / 3) > budget)
     throw new Error('The latest turn, system instructions and tools exceed the configured contextWindow.');
-  return result;
+
+  const keptContents = startGroup === 0 ? groups.flat() : groups.slice(startGroup).flat();
+  return { ...body, contents: keptContents };
 }
 
 export function applyRequestOptions(
@@ -49,7 +80,8 @@ export function applyRequestOptions(
   } else {
     result.stream = stream;
     if (model.maxOutputTokens !== undefined) {
-      if (format === 'openai' && result.max_completion_tokens !== undefined)
+      const targetModelName = model.externalModelName || model.name || '';
+      if (format === 'openai' && (result.max_completion_tokens !== undefined || usesMaxCompletionTokens(targetModelName)))
         result.max_completion_tokens = model.maxOutputTokens;
       else result.max_tokens = model.maxOutputTokens;
     }

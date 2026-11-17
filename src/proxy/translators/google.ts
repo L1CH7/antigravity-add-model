@@ -60,14 +60,33 @@ interface GeminiRequestBody {
  * The caller handles URL routing (streamGenerateContent vs generateContent).
  */
 export function mapGeminiToGoogle(geminiBody: GeminiRequestBody, _modelName: string): GeminiRequestBody {
-  // Native Gemini identifies the model and streaming method in the URL.
-  const body = { ...geminiBody } as GeminiRequestBody & { stream?: boolean; model_id?: string; sessionId?: string; conversationId?: string };
+  // Удаляем внутренние метаданные Antigravity / Cloud Code, невалидные для чистого Gemini v1beta API.
+  const body = { ...geminiBody } as GeminiRequestBody & {
+    stream?: boolean;
+    model_id?: string;
+    sessionId?: string;
+    session_id?: string;
+    conversationId?: string;
+    conversation_id?: string;
+    user_prompt_id?: string;
+    requestId?: string;
+    request_id?: string;
+    traceId?: string;
+    metadata?: unknown;
+  };
   delete body.model;
   delete body.modelId;
   delete body.model_id;
   delete body.stream;
   delete body.sessionId;
+  delete body.session_id;
   delete body.conversationId;
+  delete body.conversation_id;
+  delete body.user_prompt_id;
+  delete body.requestId;
+  delete body.request_id;
+  delete body.traceId;
+  delete body.metadata;
   return body;
 }
 
@@ -118,9 +137,14 @@ export function mapGoogleChunkToGemini(chunk: unknown, _modelName: string): Gemi
     return null;
   }
 
+  const normalizedFinishReason =
+    candidate.finishReason && candidate.finishReason !== 'FINISH_REASON_UNSPECIFIED'
+      ? candidate.finishReason
+      : 'OTHER';
+
   return {
     content: candidate.content,
-    finishReason: candidate.finishReason || 'OTHER',
+    finishReason: normalizedFinishReason,
     index: candidate.index ?? 0,
     safetyRatings: candidate.safetyRatings,
     groundingMetadata: candidate.groundingMetadata,

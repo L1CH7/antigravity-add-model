@@ -59,7 +59,7 @@ export declare function normalizeJsonSchemaNode(schema: Record<string, unknown>,
 export declare function fixParamTypes(properties: Record<string, unknown> | undefined): void;
 /**
  * Извлекает декларации инструментов из Gemini tools в нормализованном виде
- * (с копированием схемы и нормализацией типов и числовых ограничений).
+ * (с однократным копированием схемы и нормализацией типов и числовых ограничений).
  */
 export declare function extractGeminiToolDeclarations(geminiTools: unknown): Array<{
     name: string;

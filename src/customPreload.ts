@@ -1590,7 +1590,7 @@ window.addEventListener('DOMContentLoaded', () => {
           displayName: m.displayName || m.name,
           recommended: true,
           maxTokens: m.contextWindow || 1048576,
-          maxOutputTokens: m.maxOutputTokens || 4096,
+          maxOutputTokens: m.maxOutputTokens || 65536,
           tokenizerType: 'LLAMA_WITH_SPECIAL',
           model: placeholderId,
           apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',

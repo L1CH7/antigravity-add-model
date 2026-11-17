@@ -242,11 +242,25 @@ function expandCustomModels(models) {
     return result;
 }
 // ─── Model Loading ────────────────────────────────────────────────────────
+let customModelsCache = null;
+function buildFileStatKey(filePath) {
+    try {
+        const stat = fs.statSync(filePath);
+        return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
+    }
+    catch {
+        return null;
+    }
+}
 function loadCustomModels() {
     const filePath = getCustomModelsPath();
+    const initialStatKey = buildFileStatKey(filePath);
+    if (initialStatKey && customModelsCache && customModelsCache.filePath === filePath && customModelsCache.statKey === initialStatKey) {
+        return customModelsCache.models.map((m) => ({ ...m }));
+    }
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { validateCustomModel } = require('./schemaValidator');
-    if (!fs.existsSync(filePath)) {
+    if (!initialStatKey) {
         const defaultModels = {
             models: [
                 {
@@ -381,7 +395,12 @@ function loadCustomModels() {
         if (validModels.length < decrypted.length) {
             electron_log_1.default.info(`[Proxy] Loaded ${validModels.length}/${decrypted.length} valid models (${decrypted.length - validModels.length} skipped)`);
         }
-        return expandCustomModels(validModels);
+        const expanded = expandCustomModels(validModels);
+        const actualStatKey = buildFileStatKey(filePath);
+        if (actualStatKey) {
+            customModelsCache = { filePath, statKey: actualStatKey, models: expanded };
+        }
+        return expanded.map((m) => ({ ...m }));
     }
     catch (e) {
         electron_log_1.default.error('[Proxy] Failed to parse custom_models.json', e);
@@ -476,7 +495,7 @@ function downloadFileContent(url, authHeader) {
 }
 // ─── Custom Model Request Handler ─────────────────────────────────────────
 function handleCustomModelRequest(res, model, body, isStream, cloudEnvelope = true) {
-    void (0, customRequest_1.runCustomModelRequest)(res, model, body, isStream, loadCustomModels(), cloudEnvelope);
+    void (0, customRequest_1.runCustomModelRequest)(res, model, body, isStream, [], cloudEnvelope);
 }
 function readVarint(buf, offset) {
     let result = 0;
@@ -858,9 +877,7 @@ function mergeFetchAvailableModelsResponse(googleJson, customModels) {
         lastAssignedPlaceholderBySlug.set(slug, placeholderId);
     }
     const customSlugs = resolved.map((r) => r.slug);
-    const result = googleJson
-        ? JSON.parse(JSON.stringify(googleJson))
-        : {};
+    const result = googleJson ? { ...googleJson } : {};
     const serverKey = result.models
         ? 'models'
         : result.availableModels
@@ -899,9 +916,7 @@ function mergeListModelsResponse(googleJson, customModels) {
         occupied.add(id);
     }
     const resolved = resolveCustomModelKeys(customModels, occupied);
-    const result = googleJson
-        ? JSON.parse(JSON.stringify(googleJson))
-        : {};
+    const result = googleJson ? { ...googleJson } : {};
     if (Array.isArray(result.models)) {
         const existingNames = new Set(result.models
             .filter((item) => Boolean(item && typeof item === 'object'))
@@ -959,7 +974,7 @@ function handleModelsListProxy(options) {
                 throw new Error(`${statusErrorPrefix} ${statusCode}`);
             }
             const googleJson = JSON.parse(googleBody);
-            setCached(JSON.parse(JSON.stringify(googleJson)));
+            setCached(googleJson);
             const customModels = loadCustomModels();
             const result = merge(googleJson, customModels);
             electron_log_1.default.info(`[Proxy] ${label} merged cleanly: custom=${customModels.length}`);
@@ -1083,7 +1098,6 @@ function handleRequest(req, res) {
         if (bodyRejected)
             return;
         const fullBody = Buffer.concat(bodyChunks);
-        const bodyStr = fullBody.toString('utf-8');
         electron_log_1.default.info(`[Proxy] Request: ${req.method} ${req.url}`);
         // 0. Intercept GetAvailableModels (redirected from Electron webRequest)
         if (req.url.startsWith('/GetAvailableModels')) {
@@ -1139,7 +1153,7 @@ function handleRequest(req, res) {
         const isCloudCodeStream = req.url.includes('/v1internal:streamGenerateContent') || req.url.includes('/v1internal:generateContent');
         if (req.method === 'POST' && isCloudCodeStream) {
             try {
-                const reqJson = JSON.parse(bodyStr);
+                const reqJson = JSON.parse(fullBody.toString('utf-8'));
                 const modelName = reqJson.model;
                 const modelId = (reqJson.modelId || reqJson.model_id);
                 electron_log_1.default.info(`[Proxy] Cloud Code generation request model: ${modelName}, modelId: ${modelId}, url: ${req.url}, bodyKeys: ${Object.keys(reqJson).join(',')}`);
@@ -1184,7 +1198,7 @@ function handleRequest(req, res) {
             const matchedCustomModel = findMatchedCustomModel(customModels, matchedModelName);
             if (matchedCustomModel) {
                 try {
-                    const geminiBody = JSON.parse(bodyStr);
+                    const geminiBody = JSON.parse(fullBody.toString('utf-8'));
                     dispatchCustomModelRequest(res, matchedCustomModel, geminiBody, req.headers, isStandardStream, false);
                     return;
                 }
@@ -1210,6 +1224,9 @@ async function startProxy() {
         return startingProxy;
     const requiredPort = (0, listen_1.getRequiredProxyPort)(electron_1.app.getAppPath());
     const newServer = http.createServer(handleRequest);
+    newServer.keepAliveTimeout = 60000;
+    newServer.headersTimeout = 65000;
+    newServer.requestTimeout = 0;
     server = newServer;
     (0, shared_1.startCleanupInterval)();
     startingProxy = (0, listen_1.listenProxy)(newServer, requiredPort ?? 50999, requiredPort === undefined)
@@ -1246,6 +1263,7 @@ function stopProxy() {
         (0, shared_1.stopCleanupInterval)();
         (0, customRequest_1.stopCustomRequests)();
         (0, googleForwarder_1.stopGoogleForwarder)();
+        customModelsCache = null;
         if (server) {
             const closingServer = server;
             await new Promise((resolve) => closingServer.close(() => resolve()));

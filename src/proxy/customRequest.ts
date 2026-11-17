@@ -12,8 +12,22 @@ import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTim
 import { collectToolSchemas } from './translators/utils';
 import log from 'electron-log';
 
-const keepAliveHttpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 5000 });
-const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 5000 });
+const keepAliveHttpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 5000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  autoSelectFamily: true,
+  autoSelectFamilyAttemptTimeout: 150,
+} as http.AgentOptions);
+const keepAliveHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 5000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  autoSelectFamily: true,
+  autoSelectFamilyAttemptTimeout: 150,
+} as https.AgentOptions);
 
 const circuits = new CircuitBreaker();
 const controllers = new Set<AbortController>();
@@ -171,13 +185,22 @@ function isPaidChannelUnavailableError(code: unknown, message: string): boolean 
   );
 }
 
-/** Проверяет, содержит ли переведённый кандидат значимый ответ, мысль или вызов инструмента. */
+/** Проверяет, содержит ли переведённый кандидат значимый ответ, мысль, вложение или вызов инструмента. */
 function hasSubstantiveCandidateContent(mapped: { content?: { parts?: unknown[] } } | null): boolean {
   const parts = mapped?.content?.parts;
   if (!Array.isArray(parts)) return false;
   return parts.some((rawPart) => {
-    const part = rawPart as { text?: string; thought?: boolean; functionCall?: unknown };
-    if (part.functionCall || part.thought) return true;
+    const part = rawPart as {
+      text?: string;
+      thought?: boolean;
+      functionCall?: unknown;
+      inlineData?: unknown;
+      executableCode?: unknown;
+      codeExecutionResult?: unknown;
+    };
+    if (part.functionCall || part.thought || part.inlineData || part.executableCode || part.codeExecutionResult) {
+      return true;
+    }
     return typeof part.text === 'string' && part.text.trim().length > 0;
   });
 }
@@ -260,6 +283,74 @@ export async function runCustomModelRequest(
         ? (model.googleAccounts || []).filter((account) => account.enabled !== false).length
         : 0;
       const attemptsAllowed = retries + Math.max(0, accountCount - 1);
+      const format = resolveApiFormat(model.provider, model.apiFormat);
+      const externalName = model.externalModelName || model.name.replace(/^models\//, '');
+
+      // Готовим тримминг, трансляцию, URL и общие заголовки один раз до цикла повторов.
+      let basePayload: Record<string, unknown>;
+      let baseUrl: URL;
+      let baseHeaders: registry.ProviderHeaders;
+      let staticBodyBuffer: Buffer | undefined;
+      try {
+        const requestedMaxOutput = Number(originalBody.generationConfig?.maxOutputTokens || 0);
+        const outputBudget =
+          model.maxOutputTokens ??
+          (requestedMaxOutput > 0
+            ? requestedMaxOutput
+            : model.contextWindow
+              ? Math.min(65_536, Math.max(1, Math.floor(model.contextWindow / 4)))
+              : 0);
+        const body = trimContext(originalBody, model.contextWindow, outputBudget);
+        basePayload = applyRequestOptions(
+          registry.translateRequest(model.provider, body, externalName, format, conversationKey) as Record<
+            string,
+            unknown
+          >,
+          model,
+          format,
+          isStream,
+        );
+        const target =
+          cloudCode || model.rawUrl
+            ? model.apiUrl
+            : registry.getProviderUrl(
+                model.apiUrl,
+                externalName,
+                isStream,
+                registry.getTranslator(model.provider, format),
+              );
+        baseUrl = new URL(target);
+        if (!['http:', 'https:'].includes(baseUrl.protocol)) throw new Error('Unsupported endpoint protocol');
+        baseHeaders = registry.getProviderHeaders(model.provider, cloudCode ? '' : model.apiKey, format);
+        if (['opencode', 'zen', 'opencode-go'].includes(model.provider)) {
+          const identity = originalBody.sessionId || originalBody.conversationId;
+          baseHeaders['x-opencode-session'] = typeof identity === 'string' ? identity : requestId;
+        }
+        if (model.gateway) {
+          const identity = originalBody.conversationId || originalBody.sessionId;
+          if (typeof identity === 'string' && identity.trim()) {
+            // Stable across turns and safe as a header, even when callers use Unicode/control characters.
+            baseHeaders['x-antigravity-conversation-id'] = createHash('sha256').update(identity).digest('hex');
+          }
+        }
+        for (const [key, value] of Object.entries(model.customHeaders || {})) {
+          if (/^(host|content-length|connection|transfer-encoding)$/i.test(key))
+            throw new Error('Reserved HTTP header');
+          if (cloudCode && /^authorization$/i.test(key))
+            throw new Error('Google pool authorization comes from the selected account');
+          http.validateHeaderName(key);
+          http.validateHeaderValue(key, value);
+          baseHeaders[key] = value;
+        }
+        if (!cloudCode) {
+          staticBodyBuffer = Buffer.from(JSON.stringify(basePayload), 'utf8');
+        }
+      } catch (error) {
+        failure = new UpstreamError(`Invalid model configuration: ${(error as Error).message}`, 400, false, 0, false);
+        circuits.cancel(circuitKey);
+        break modelBlock;
+      }
+
       for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
         const streamKey = randomUUID();
         const attemptStart = Date.now();
@@ -272,8 +363,9 @@ export async function runCustomModelRequest(
           if (signal.aborted) break;
           const remaining = deadline - Date.now();
           if (remaining <= 0) throw new UpstreamError('Request retry budget exhausted.', 504, false);
-          const format = resolveApiFormat(model.provider, model.apiFormat);
-          const externalName = model.externalModelName || model.name.replace(/^models\//, '');
+          let url = baseUrl;
+          let headers: registry.ProviderHeaders = baseHeaders;
+          let bodyBuffer = staticBodyBuffer;
           if (cloudCode) {
             const identity = originalBody.sessionId || originalBody.conversationId;
             accountLease = await acquireGoogleAccount(
@@ -283,75 +375,18 @@ export async function runCustomModelRequest(
               typeof identity === 'string' ? identity : undefined,
             );
             if (signal.aborted) break;
-          }
-          let payload: Record<string, unknown>;
-          let url: URL;
-          let headers: registry.ProviderHeaders;
-          try {
-            const outputBudget =
-              model.maxOutputTokens ??
-              Number(
-                originalBody.generationConfig?.maxOutputTokens ||
-                  (model.contextWindow ? Math.min(4000, Math.max(1, Math.floor(model.contextWindow / 4))) : 0),
-              );
-            const body = trimContext(originalBody, model.contextWindow, outputBudget);
-            const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
-            payload = applyRequestOptions(
-              registry.translateRequest(model.provider, body, externalName, format, conversationKey) as Record<
-                string,
-                unknown
-              >,
-              effectiveModel,
-              format,
-              isStream,
-            );
-            const target =
-              cloudCode || model.rawUrl
-                ? model.apiUrl
-                : registry.getProviderUrl(
-                    model.apiUrl,
-                    externalName,
-                    isStream,
-                    registry.getTranslator(model.provider, format),
-                  );
-            url = new URL(target);
-            if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported endpoint protocol');
-            headers = registry.getProviderHeaders(model.provider, cloudCode ? '' : model.apiKey, format);
-            if (accountLease) {
-              url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
-              url.search = isStream ? '?alt=sse' : '';
-              headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
-              if (!headers['User-Agent'] && !headers['user-agent']) {
-                headers['User-Agent'] = 'antigravity';
-              }
-              const project = accountLease.account.project || model.googleProject;
-              payload = { model: externalName, ...(project ? { project } : {}), request: payload };
+            url = new URL(baseUrl.toString());
+            url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
+            url.search = isStream ? '?alt=sse' : '';
+            headers = { ...baseHeaders, Authorization: `Bearer ${accountLease.account.accessToken}` };
+            if (!headers['User-Agent'] && !headers['user-agent']) {
+              headers['User-Agent'] = 'antigravity';
             }
-            if (['opencode', 'zen', 'opencode-go'].includes(model.provider)) {
-              const identity = originalBody.sessionId || originalBody.conversationId;
-              headers['x-opencode-session'] = typeof identity === 'string' ? identity : requestId;
-            }
-            if (model.gateway) {
-              const identity = originalBody.conversationId || originalBody.sessionId;
-              if (typeof identity === 'string' && identity.trim()) {
-                // Stable across turns and safe as a header, even when callers use Unicode/control characters.
-                headers['x-antigravity-conversation-id'] = createHash('sha256').update(identity).digest('hex');
-              }
-            }
-            for (const [key, value] of Object.entries(model.customHeaders || {})) {
-              if (/^(host|content-length|connection|transfer-encoding)$/i.test(key))
-                throw new Error('Reserved HTTP header');
-              if (cloudCode && /^authorization$/i.test(key))
-                throw new Error('Google pool authorization comes from the selected account');
-              http.validateHeaderName(key);
-              http.validateHeaderValue(key, value);
-              headers[key] = value;
-            }
-          } catch (error) {
-            throw new UpstreamError(`Invalid model configuration: ${(error as Error).message}`, 400, false, 0, false);
+            const project = accountLease.account.project || model.googleProject;
+            const envelopePayload = { model: externalName, ...(project ? { project } : {}), request: basePayload };
+            bodyBuffer = Buffer.from(JSON.stringify(envelopePayload), 'utf8');
           }
           counts.upstreamAttempts += 1;
-          const attemptStart = Date.now();
           const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
             request = (url.protocol === 'https:' ? https : http).request(
               url,
@@ -364,6 +399,7 @@ export async function runCustomModelRequest(
               resolve,
             );
             request.once('socket', (socket) => {
+              socket.setNoDelay(true);
               socket.setKeepAlive(true, 5000);
             });
             request.once('error', (err) => {
@@ -382,7 +418,7 @@ export async function runCustomModelRequest(
               Math.min(model.timeout ?? 600_000, remaining),
             );
             signal.addEventListener('abort', abort, { once: true });
-            request.end(JSON.stringify(payload));
+            request.end(bodyBuffer);
           });
           const status = upstream.statusCode || 502;
           if (status < 200 || status >= 300) {
@@ -516,10 +552,11 @@ export async function runCustomModelRequest(
                 hasVisibleCandidatePart
               )
                 upstreamOutput = true;
+              const candidateFinishReason = chunk.candidates?.[0]?.finishReason;
               if (
                 chunk.type === 'message_stop' ||
                 chunk.choices?.[0]?.finish_reason ||
-                chunk.candidates?.[0]?.finishReason
+                (candidateFinishReason && candidateFinishReason !== 'FINISH_REASON_UNSPECIFIED')
               )
                 terminal = true;
               if (
@@ -541,7 +578,11 @@ export async function runCustomModelRequest(
                 finishReason?: string;
               } | null;
               if (mapped) {
-                const isTerminalFinish = Boolean(mapped.finishReason && mapped.finishReason !== 'OTHER');
+                const isTerminalFinish = Boolean(
+                  mapped.finishReason &&
+                    mapped.finishReason !== 'OTHER' &&
+                    mapped.finishReason !== 'FINISH_REASON_UNSPECIFIED',
+                );
                 if (mapped.content?.parts?.length) {
                   emitted = true;
                   for (const part of mapped.content.parts as Array<{ text?: string; thought?: boolean; functionCall?: unknown }>) {
@@ -576,13 +617,16 @@ export async function runCustomModelRequest(
               }
             };
             const drain = () => {
+              let cursor = 0;
               let index: number;
-              while ((index = buffer.indexOf('\n')) >= 0) {
-                const line = buffer.slice(0, index).replace(/\r$/, '');
-                buffer = buffer.slice(index + 1);
+              while ((index = buffer.indexOf('\n', cursor)) >= 0) {
+                const lineEnd = index > cursor && buffer.charCodeAt(index - 1) === 0x0d ? index - 1 : index;
+                const line = buffer.slice(cursor, lineEnd);
+                cursor = index + 1;
                 if (!line) event();
                 else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
               }
+              if (cursor > 0) buffer = buffer.slice(cursor);
             };
             for await (const bytes of upstream) {
               if (signal.aborted) throw new Error('Cancelled');
@@ -674,6 +718,7 @@ export async function runCustomModelRequest(
             if (isStream) {
               for (const candidate of mapped.candidates) writeCandidate(candidate);
             } else {
+              res.socket?.setNoDelay(true);
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(envelope(mapped, cloudEnvelope)));
             }

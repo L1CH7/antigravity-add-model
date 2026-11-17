@@ -63,8 +63,8 @@ export function detectModelCapabilities(m: CustomModelConfig, includeDisplayName
 
   const isClaude = m.provider === 'anthropic' || CLAUDE_PATTERN.test(nameLower) || CLAUDE_PATTERN.test(extLower);
 
-  const maxTokens = m.contextWindow ?? (isClaude ? 200_000 : 1_048_576);
-  const maxOutputTokens = m.maxOutputTokens ?? (isDeepSeek ? 32_768 : isThinking ? 32_768 : 16_384);
+  const maxTokens = m.contextWindow ?? (isClaude ? 262_144 : 1_048_576);
+  const maxOutputTokens = m.maxOutputTokens ?? 65_536;
 
   // Image support: Claude, GPT-4o, Gemini always support images. DeepSeek, Ollama text models don't.
   const allNames = nameLower + ' ' + extLower + ' ' + displayLower;

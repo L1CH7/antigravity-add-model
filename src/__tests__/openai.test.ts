@@ -278,11 +278,31 @@ describe('mapGeminiToOpenAI', () => {
     expect(result.max_tokens).toBe(2000);
   });
 
-  it('should use defaults when generationConfig is missing', () => {
+  it('should omit temperature and max_tokens when generationConfig is missing', () => {
     const body = { contents: [] };
     const result = mapGeminiToOpenAI(body, 'gpt-4o');
-    expect(result.temperature).toBe(0.7);
-    expect(result.max_tokens).toBe(4000);
+    expect(result.temperature).toBeUndefined();
+    expect(result.max_tokens).toBeUndefined();
+    expect(result.max_completion_tokens).toBeUndefined();
+  });
+
+  it('should map inlineData images to OpenAI image_url multimodal blocks without dumping base64 text', () => {
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'Inspect screenshot' },
+            { inlineData: { mimeType: 'image/png', data: 'QUJDRA==' } },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToOpenAI(body, 'gpt-4o');
+    expect(result.messages[0].content).toEqual([
+      { type: 'text', text: 'Inspect screenshot' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJDRA==' } },
+    ]);
   });
 
   it('should convert Gemini tools to OpenAI format', () => {
@@ -762,5 +782,30 @@ describe('mapOpenAIChunkToGemini', () => {
     );
     expect(done?.finishReason).toBe('TOOL_CALL');
     expect(shared.modelReasoningContent.get('deepseek-v4')).toBe('Need to inspect file first');
+  });
+
+  it('does not drop zero-argument tool calls when stream finishes with stop', () => {
+    mapOpenAIChunkToGemini(
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [{ index: 0, id: 'call_zero_1', function: { name: 'list_tabs', arguments: '' } }],
+            },
+          },
+        ],
+      },
+      'gpt-4o',
+      'zero-arg-stream',
+    );
+    const done = mapOpenAIChunkToGemini(
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+      'gpt-4o',
+      'zero-arg-stream',
+    );
+    expect(done?.finishReason).toBe('TOOL_CALL');
+    expect(done?.content.parts).toEqual([
+      { functionCall: { name: 'list_tabs', args: {}, id: 'call_zero_1' } },
+    ]);
   });
 });

@@ -17,14 +17,21 @@ exports.getGoogleApiUrl = getGoogleApiUrl;
  * The caller handles URL routing (streamGenerateContent vs generateContent).
  */
 function mapGeminiToGoogle(geminiBody, _modelName) {
-    // Native Gemini identifies the model and streaming method in the URL.
+    // Удаляем внутренние метаданные Antigravity / Cloud Code, невалидные для чистого Gemini v1beta API.
     const body = { ...geminiBody };
     delete body.model;
     delete body.modelId;
     delete body.model_id;
     delete body.stream;
     delete body.sessionId;
+    delete body.session_id;
     delete body.conversationId;
+    delete body.conversation_id;
+    delete body.user_prompt_id;
+    delete body.requestId;
+    delete body.request_id;
+    delete body.traceId;
+    delete body.metadata;
     return body;
 }
 // ─── Response Translation (Passthrough) ───────────────────────────────────
@@ -68,9 +75,12 @@ function mapGoogleChunkToGemini(chunk, _modelName) {
         }
         return null;
     }
+    const normalizedFinishReason = candidate.finishReason && candidate.finishReason !== 'FINISH_REASON_UNSPECIFIED'
+        ? candidate.finishReason
+        : 'OTHER';
     return {
         content: candidate.content,
-        finishReason: candidate.finishReason || 'OTHER',
+        finishReason: normalizedFinishReason,
         index: candidate.index ?? 0,
         safetyRatings: candidate.safetyRatings,
         groundingMetadata: candidate.groundingMetadata,

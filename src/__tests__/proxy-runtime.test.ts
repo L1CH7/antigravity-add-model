@@ -6,7 +6,7 @@ import { getProxyMetrics, runCustomModelRequest, stopCustomRequests } from '../p
 import { stopCleanupInterval } from '../proxy/shared';
 import { CircuitBreaker } from '../proxy/circuitBreaker';
 import { applyRequestOptions, parseRetryAfter, trimContext } from '../proxy/requestOptions';
-import { getGoogleApiUrl } from '../proxy/translators/google';
+import { getGoogleApiUrl, mapGeminiToGoogle, mapGoogleChunkToGemini } from '../proxy/translators/google';
 import { getProviderHeaders, getProviderUrl, getTranslator, translateRequest } from '../proxy/registry';
 import { getProvider, PROVIDERS, resolveApiFormat } from '../providers';
 import { validateCustomModel } from '../schemaValidator';
@@ -838,5 +838,55 @@ describe('provider and configuration contracts', () => {
     expect(parseRetryAfter('2')).toBe(2000);
     expect(parseRetryAfter(new Date(5000).toUTCString(), 1000)).toBe(4000);
     expect(parseRetryAfter('999999')).toBe(30000);
+  });
+
+  it('does not force max_tokens=4000 when model omits maxOutputTokens, cleans Google metadata, and keeps unspecified finishReason non-terminal', async () => {
+    let forwardedBody: Record<string, unknown> | undefined;
+    const upstream = await serve(async (req, res) => {
+      forwardedBody = await body(req);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        }),
+      );
+    });
+    const configured = model(upstream, { provider: 'openai', contextWindow: 700_000 });
+    delete configured.maxOutputTokens;
+    const url = await serve(async (req, res) => {
+      const request = await body(req);
+      void runCustomModelRequest(res, configured, request, false, [], false);
+    });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(forwardedBody?.max_tokens).toBeUndefined();
+    expect(forwardedBody?.temperature).toBeUndefined();
+
+    const cleaned = mapGeminiToGoogle(
+      {
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+        user_prompt_id: 'u1',
+        requestId: 'r1',
+        traceId: 't1',
+        session_id: 's1',
+        metadata: { internal: true },
+      } as any,
+      'gemini-3.8-flash-high',
+    ) as Record<string, unknown>;
+    expect(cleaned.user_prompt_id).toBeUndefined();
+    expect(cleaned.requestId).toBeUndefined();
+    expect(cleaned.traceId).toBeUndefined();
+    expect(cleaned.session_id).toBeUndefined();
+    expect(cleaned.metadata).toBeUndefined();
+
+    const chunk = mapGoogleChunkToGemini(
+      { candidates: [{ content: { parts: [{ text: 'part' }], role: 'model' }, finishReason: 'FINISH_REASON_UNSPECIFIED' }] },
+      'gemini-3.8-flash-high',
+    );
+    expect(chunk?.finishReason).toBe('OTHER');
   });
 });

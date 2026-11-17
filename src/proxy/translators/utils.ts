@@ -476,9 +476,32 @@ export function fixParamTypes(properties: Record<string, unknown> | undefined): 
   }
 }
 
+function cloneJsonValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (let i = 0; i < value.length; i += 1) {
+      const item = value[i];
+      out.push(item === undefined ? null : cloneJsonValue(item, seen));
+    }
+    seen.delete(value);
+    return out;
+  }
+  const obj = value as Record<string, unknown>;
+  const copy: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(obj)) {
+    if (raw === undefined || typeof raw === 'function' || typeof raw === 'symbol') continue;
+    copy[key] = cloneJsonValue(raw, seen);
+  }
+  seen.delete(value);
+  return copy;
+}
+
 /**
  * Извлекает декларации инструментов из Gemini tools в нормализованном виде
- * (с копированием схемы и нормализацией типов и числовых ограничений).
+ * (с однократным копированием схемы и нормализацией типов и числовых ограничений).
  */
 export function extractGeminiToolDeclarations(
   geminiTools: unknown,
@@ -499,9 +522,11 @@ export function extractGeminiToolDeclarations(
       };
       if (!fn.name) continue;
       const declaration = fn.parametersJsonSchema ?? fn.parameters;
-      const params = declaration
-        ? (JSON.parse(JSON.stringify(declaration)) as Record<string, unknown>)
-        : { type: 'object', properties: {} };
+      const cloned = declaration ? cloneJsonValue(declaration) : undefined;
+      const params =
+        cloned && typeof cloned === 'object' && !Array.isArray(cloned)
+          ? (cloned as Record<string, unknown>)
+          : { type: 'object', properties: {} };
       normalizeJsonSchemaNode(params);
       extracted.push({
         name: fn.name,

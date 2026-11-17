@@ -257,6 +257,17 @@ function createSseKeepaliveTracker(res, enabled, intervalMs) {
         },
     };
 }
+function isSseKeepaliveEligible(isGeneration, statusCode, headers) {
+    if (!isGeneration || statusCode < 200 || statusCode >= 300)
+        return false;
+    const contentType = String(headers['content-type'] || '');
+    if (!contentType.includes('text/event-stream'))
+        return false;
+    // Сжатый поток (gzip/br/deflate) нельзя разбавлять сырыми \n\n, иначе сломается декомпрессия у клиента.
+    const rawEncoding = headers['content-encoding'];
+    const encoding = (Array.isArray(rawEncoding) ? rawEncoding[0] : rawEncoding || '').trim().toLowerCase();
+    return !encoding || encoding === 'identity';
+}
 function toOutgoingResponseHeaders(headers) {
     const result = {};
     for (const [rawKey, value] of Object.entries(headers)) {
@@ -363,8 +374,7 @@ function attemptHttp1Fallback(opts, parsedUrl, timeoutMs, attempt) {
                 res.writeHead(statusCode, proxyRes.headers);
                 res.flushHeaders?.();
             }
-            const contentType = String(proxyRes.headers['content-type'] || '');
-            const sseEnabled = isGeneration && statusCode >= 200 && statusCode < 300 && contentType.includes('text/event-stream');
+            const sseEnabled = isSseKeepaliveEligible(isGeneration, statusCode, proxyRes.headers);
             sseKeepalive = createSseKeepaliveTracker(res, sseEnabled, sseKeepaliveMs);
             proxyRes.on('data', (chunk) => {
                 proxyReq.setTimeout(timeoutMs);
@@ -532,8 +542,7 @@ function attemptHttp2Forward(opts, parsedUrl, timeoutMs, pingIntervalMs, warmIdl
                 res.writeHead(statusCode, outgoingHeaders);
                 res.flushHeaders?.();
             }
-            const contentType = String(resHeaders['content-type'] || '');
-            const sseEnabled = isGeneration && statusCode >= 200 && statusCode < 300 && contentType.includes('text/event-stream');
+            const sseEnabled = isSseKeepaliveEligible(isGeneration, statusCode, resHeaders);
             sseKeepalive = createSseKeepaliveTracker(res, sseEnabled, sseKeepaliveMs);
             stream.on('data', (chunk) => {
                 stream.setTimeout(timeoutMs);

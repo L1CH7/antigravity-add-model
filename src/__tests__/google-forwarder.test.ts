@@ -354,4 +354,29 @@ describe('googleForwarder', () => {
       }),
     ).rejects.toThrow(/timed out/i);
   });
+
+  it('never injects keepalive newlines into gzip-compressed SSE generation streams', async () => {
+    const { host } = await serveHttp2((stream) => {
+      stream.respond({ ':status': 200, 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+      setTimeout(() => {
+        const compressed = zlib.gzipSync(Buffer.from('data: {"ok":true}\n\n'));
+        stream.end(compressed);
+      }, 65);
+    });
+
+    const proxyUrl = await serveProxy(host, {
+      isGeneration: true,
+      pingIntervalMs: 200,
+      sseKeepaliveMs: 20,
+    });
+
+    const res = await fetch(`${proxyUrl}/sse-gz`, {
+      method: 'POST',
+      headers: { 'accept-encoding': 'gzip' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    const bodyText = await res.text();
+    expect(bodyText).toBe('data: {"ok":true}\n\n');
+  });
 });

@@ -63,9 +63,18 @@ interface GeminiRequestBody {
         maxOutputTokens?: number;
     };
 }
+type OpenAIContentPart = {
+    type: 'text';
+    text: string;
+} | {
+    type: 'image_url';
+    image_url: {
+        url: string;
+    };
+};
 interface OpenAIMessage {
     role: string;
-    content: string | null;
+    content: string | OpenAIContentPart[] | null;
     tool_calls?: OpenAIToolCall[];
     tool_call_id?: string;
     reasoning_content?: string;
@@ -136,6 +145,7 @@ interface GeminiUsageMetadata {
     totalTokenCount: number;
 }
 declare function mapGeminiToolsToOpenAI(geminiTools: GeminiTool[]): OpenAITool[];
+export declare function usesMaxCompletionTokens(modelName: string): boolean;
 export declare function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: string, stateKey?: string): OpenAIRequestBody;
 export declare function mapOpenAIToGemini(openAiRes: OpenAIResponse, modelName: string, toolSchemas?: ToolSchemas): GeminiGenerateContentResponse;
 export declare function mapOpenAIChunkToGemini(chunk: OpenAIResponse, modelName: string, streamKey?: string, toolSchemas?: ToolSchemas): GeminiCandidate | null;

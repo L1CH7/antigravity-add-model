@@ -422,9 +422,34 @@ function fixParamTypes(properties) {
         }
     }
 }
+function cloneJsonValue(value, seen = new WeakSet()) {
+    if (value === null || typeof value !== 'object')
+        return value;
+    if (seen.has(value))
+        return undefined;
+    seen.add(value);
+    if (Array.isArray(value)) {
+        const out = [];
+        for (let i = 0; i < value.length; i += 1) {
+            const item = value[i];
+            out.push(item === undefined ? null : cloneJsonValue(item, seen));
+        }
+        seen.delete(value);
+        return out;
+    }
+    const obj = value;
+    const copy = {};
+    for (const [key, raw] of Object.entries(obj)) {
+        if (raw === undefined || typeof raw === 'function' || typeof raw === 'symbol')
+            continue;
+        copy[key] = cloneJsonValue(raw, seen);
+    }
+    seen.delete(value);
+    return copy;
+}
 /**
  * Извлекает декларации инструментов из Gemini tools в нормализованном виде
- * (с копированием схемы и нормализацией типов и числовых ограничений).
+ * (с однократным копированием схемы и нормализацией типов и числовых ограничений).
  */
 function extractGeminiToolDeclarations(geminiTools) {
     if (!geminiTools || !Array.isArray(geminiTools))
@@ -443,8 +468,9 @@ function extractGeminiToolDeclarations(geminiTools) {
             if (!fn.name)
                 continue;
             const declaration = fn.parametersJsonSchema ?? fn.parameters;
-            const params = declaration
-                ? JSON.parse(JSON.stringify(declaration))
+            const cloned = declaration ? cloneJsonValue(declaration) : undefined;
+            const params = cloned && typeof cloned === 'object' && !Array.isArray(cloned)
+                ? cloned
                 : { type: 'object', properties: {} };
             normalizeJsonSchemaNode(params);
             extracted.push({

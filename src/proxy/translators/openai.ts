@@ -82,9 +82,13 @@ interface GeminiRequestBody {
   };
 }
 
+type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 interface OpenAIMessage {
   role: string;
-  content: string | null;
+  content: string | OpenAIContentPart[] | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
   reasoning_content?: string;
@@ -205,6 +209,16 @@ function buildGeminiToolCallPart(
   };
 }
 
+export function usesMaxCompletionTokens(modelName: string): boolean {
+  const lowerName = (modelName || '').toLowerCase();
+  const isThinkingModel = /thinking|reasoning/i.test(lowerName);
+  const isReasoningModel = /(^|\/|^openai\/)(o1|o3|o4)(-|$|mini|pro)/i.test(lowerName);
+  const is41Model = /(^|\/|^openai\/)(gpt-)?4\.1(-|mini|nano)/i.test(lowerName);
+  const is5Pro = /(^|\/|^openai\/)(gpt-)?5\.5-pro/i.test(lowerName);
+  const is5Thinking = /(^|\/|^openai\/)(gpt-)?5\.4/i.test(lowerName);
+  return isThinkingModel || isReasoningModel || is41Model || is5Pro || is5Thinking;
+}
+
 function saveModelReasoning(stateKey: string, reasoning: string): void {
   if (!reasoning) return;
   modelReasoningContent.set(stateKey, reasoning);
@@ -287,7 +301,7 @@ export function mapGeminiToOpenAI(
           }
         } else {
           const role = item.role === 'model' ? 'assistant' : item.role || 'user';
-          let content = '';
+          let content: string | OpenAIContentPart[] = '';
           let reasoning_content = '';
           if (role === 'assistant') {
             const regularParts = (item.parts || []).filter((p) => !p.thought);
@@ -296,10 +310,18 @@ export function mapGeminiToOpenAI(
             reasoning_content = thoughtParts.map((p) => p.text || '').join('');
           } else {
             const parts = item.parts || [];
-            const partsContent: string[] = [];
+            const textChunks: string[] = [];
+            const multiParts: OpenAIContentPart[] = [];
+            let hasImages = false;
+            const flushTextToMulti = () => {
+              if (textChunks.length > 0) {
+                multiParts.push({ type: 'text', text: textChunks.join('\n') });
+                textChunks.length = 0;
+              }
+            };
             for (const p of parts) {
               if (p.text) {
-                partsContent.push(p.text);
+                textChunks.push(p.text);
               } else if (p.fileData) {
                 const fd = p.fileData as { mimeType: string; fileUri: string };
                 // Try to read local files directly
@@ -311,23 +333,33 @@ export function mapGeminiToOpenAI(
                       url.pathname.replace(/^\//, '').replace(/\//g, path.sep),
                       'utf-8',
                     );
-                    partsContent.push(`[File content from ${fd.fileUri}]:\n${fileContent}`);
+                    textChunks.push(`[File content from ${fd.fileUri}]:\n${fileContent}`);
                   } else {
-                    partsContent.push(`[File reference: ${fd.fileUri} (${fd.mimeType})]`);
+                    textChunks.push(`[File reference: ${fd.fileUri} (${fd.mimeType})]`);
                   }
                 } catch {
-                  partsContent.push(`[File reference: ${fd.fileUri} (${fd.mimeType})]`);
+                  textChunks.push(`[File reference: ${fd.fileUri} (${fd.mimeType})]`);
                 }
               } else if (p.inlineData) {
                 const id = p.inlineData as { mimeType: string; data: string };
-                if (id.mimeType && id.mimeType.startsWith('image/')) {
-                  partsContent.push(`[Image: data:${id.mimeType};base64,${id.data}]`);
+                if (id.mimeType && id.mimeType.startsWith('image/') && id.data) {
+                  hasImages = true;
+                  flushTextToMulti();
+                  multiParts.push({
+                    type: 'image_url',
+                    image_url: { url: `data:${id.mimeType};base64,${id.data}` },
+                  });
                 } else {
-                  partsContent.push(`[Inline data: ${id.mimeType}, length: ${(id.data || '').length} chars]`);
+                  textChunks.push(`[Inline data: ${id.mimeType}, length: ${(id.data || '').length} chars]`);
                 }
               }
             }
-            content = partsContent.join('\n');
+            if (hasImages) {
+              flushTextToMulti();
+              content = multiParts;
+            } else {
+              content = textChunks.join('\n');
+            }
           }
           const msg: OpenAIMessage = { role, content };
           if (reasoning_content) msg.reasoning_content = reasoning_content;
@@ -357,26 +389,23 @@ export function mapGeminiToOpenAI(
     }
   }
 
-  // Models requiring max_completion_tokens instead of max_tokens:
-  // - Legacy o-series: o1, o3, o4-mini (any format: o1, o1-mini, openai/o3, etc.)
-  // - Legacy gpt-4.1 series: gpt-4.1, 4.1-mini, gpt-4.1-nano (any prefix)
-  // - GPT-5.x thinking/pro: gpt-5.4-thinking, gpt-5.5-pro, etc.
-  //   (OpenAI unified under GPT-5.x in Feb 2026, deprecated all previous models)
   const lowerName = modelName.toLowerCase();
   const isThinkingModel = /thinking|reasoning/i.test(lowerName);
   const isReasoningModel = /(^|\/|^openai\/)(o1|o3|o4)(-|$|mini|pro)/i.test(lowerName);
-  const is41Model = /(^|\/|^openai\/)(gpt-)?4\.1(-|mini|nano)/i.test(lowerName);
-  const is5Pro = /(^|\/|^openai\/)(gpt-)?5\.5-pro/i.test(lowerName);
-  const is5Thinking = /(^|\/|^openai\/)(gpt-)?5\.4/i.test(lowerName);
-  const needsCompletionTokens = isThinkingModel || isReasoningModel || is41Model || is5Pro || is5Thinking;
+  const needsCompletionTokens = usesMaxCompletionTokens(modelName);
   const needsNoTemperature = isThinkingModel || isReasoningModel;
 
-  const maxTokens = geminiBody.generationConfig?.maxOutputTokens ?? 4000;
+  const explicitTemp = geminiBody.generationConfig?.temperature;
+  const maxTokens = geminiBody.generationConfig?.maxOutputTokens;
   const payload: OpenAIRequestBody = {
     model: modelName,
     messages,
-    ...(needsNoTemperature ? {} : { temperature: geminiBody.generationConfig?.temperature ?? 0.7 }),
-    ...(needsCompletionTokens ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
+    ...(needsNoTemperature || explicitTemp === undefined ? {} : { temperature: explicitTemp }),
+    ...(maxTokens !== undefined
+      ? needsCompletionTokens
+        ? { max_completion_tokens: maxTokens }
+        : { max_tokens: maxTokens }
+      : {}),
   };
 
   if (geminiBody.tools && Array.isArray(geminiBody.tools)) {
@@ -547,7 +576,7 @@ export function mapOpenAIChunkToGemini(
   const finishReason = choice.finish_reason;
   if (finishReason === 'stop' || finishReason === 'length') {
     saveModelReasoning(modelName, context.accumulatedReasoning);
-    const pendingToolCalls = Object.values(context.toolCalls).filter((tc) => tc.name && tc.arguments);
+    const pendingToolCalls = Object.values(context.toolCalls).filter((tc) => Boolean(tc.name));
     if (pendingToolCalls.length > 0) {
       const parts: GeminiPart[] = pendingToolCalls.map((tc) =>
         buildGeminiToolCallPart(tc.name, tc.arguments, tc.id, modelName, toolSchemas),
