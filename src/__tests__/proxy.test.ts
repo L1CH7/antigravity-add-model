@@ -416,8 +416,12 @@ describe('image capability advertising and end-to-end fileData image delivery', 
     expect(openaiEntry.supportsImages).toBe(true);
     expect(openaiEntry.supportsVideo).toBe(false);
     expect(openaiEntry.supportedMimeTypes['image/png']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['image/svg+xml']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['text/x-python']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['application/typescript']).toBe(true);
     expect(openaiEntry.supportedMimeTypes['application/pdf']).toBe(true);
     expect(openaiEntry.supportedMimeTypes['audio/wav']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['audio/x-wav']).toBe(true);
     expect(openaiEntry.supportedMimeTypes['audio/mp3']).toBe(true);
     expect(openaiEntry.supportedMimeTypes['video/mp4']).toBeUndefined();
 

@@ -5,6 +5,8 @@ import { ApiFormat } from '../providers';
  */
 export declare const DEFAULT_CONTEXT_WINDOW = 1048576;
 export declare const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
+export declare const TEXTUAL_APPLICATION_MIMES: readonly ["application/json", "application/ld+json", "application/xml", "application/xhtml+xml", "application/yaml", "application/x-yaml", "application/javascript", "application/x-javascript", "application/typescript", "application/x-typescript", "application/x-python-code", "application/x-ipynb+json", "application/x-sh", "application/toml", "application/sql", "application/graphql"];
+export declare function isTextualInlineMime(rawMime: string | undefined): boolean;
 export interface CustomModelConfig {
     name: string;
     provider: string;

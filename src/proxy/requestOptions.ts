@@ -1,5 +1,6 @@
 import type { CustomModel } from '../proxy';
 import type { ApiFormat } from '../providers';
+import { isTextualInlineMime } from './modelUtils';
 import { usesMaxCompletionTokens } from './translators/openai';
 
 export interface GeminiBody {
@@ -8,21 +9,9 @@ export interface GeminiBody {
   [key: string]: unknown;
 }
 
-const INLINE_TEXTUAL_MIMES = new Set([
-  'application/json',
-  'application/xml',
-  'application/javascript',
-  'application/x-javascript',
-  'application/x-typescript',
-  'application/x-python-code',
-  'application/x-ipynb+json',
-  'application/yaml',
-  'application/x-yaml',
-]);
-
 function estimateInlineDataBytes(mimeType: string | undefined, base64Len: number): number {
   const mime = (mimeType || '').split(';')[0].trim().toLowerCase();
-  if (mime.startsWith('text/') || INLINE_TEXTUAL_MIMES.has(mime)) {
+  if (isTextualInlineMime(mime)) {
     return Math.ceil(base64Len * 0.75);
   }
   if (mime.startsWith('image/')) {
@@ -52,9 +41,12 @@ function stripAndEstimateParts(
       if (part.inline_data) clone.inline_data = { ...(part.inline_data as Record<string, unknown>), data: '' };
       return clone;
     }
-    const fnResp = part.functionResponse as { parts?: Record<string, unknown>[] } | undefined;
+    const fnResp = (part.functionResponse || part.function_response) as
+      | { parts?: Record<string, unknown>[] }
+      | undefined;
     if (fnResp && Array.isArray(fnResp.parts)) {
-      return { ...part, functionResponse: { ...fnResp, parts: stripAndEstimateParts(fnResp.parts, binaryByteBudget) } };
+      const key = part.functionResponse ? 'functionResponse' : 'function_response';
+      return { ...part, [key]: { ...fnResp, parts: stripAndEstimateParts(fnResp.parts, binaryByteBudget) } };
     }
     return part;
   });
@@ -64,7 +56,8 @@ function estimateContentBytes(content: NonNullable<GeminiBody['contents']>[numbe
   const parts = content.parts as Record<string, unknown>[] | undefined;
   const hasInline = parts?.some((p) => {
     if (p.inlineData || p.inline_data) return true;
-    const fnParts = (p.functionResponse as { parts?: Record<string, unknown>[] } | undefined)?.parts;
+    const fnParts = ((p.functionResponse || p.function_response) as { parts?: Record<string, unknown>[] } | undefined)
+      ?.parts;
     return Array.isArray(fnParts) && fnParts.some((fp) => Boolean(fp.inlineData || fp.inline_data));
   });
   if (!hasInline || !parts) {

@@ -33,6 +33,7 @@ interface GeminiPart {
     thought?: boolean;
     functionCall?: GeminiFunctionCall;
     functionResponse?: GeminiFunctionResponse;
+    function_response?: GeminiFunctionResponse;
     fileData?: {
         mimeType?: string;
         fileUri?: string;

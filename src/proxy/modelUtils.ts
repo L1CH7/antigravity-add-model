@@ -8,6 +8,32 @@ import { ApiFormat, resolveApiFormat } from '../providers';
 export const DEFAULT_CONTEXT_WINDOW = 1_048_576;
 export const DEFAULT_MAX_OUTPUT_TOKENS = 65_536;
 
+export const TEXTUAL_APPLICATION_MIMES = [
+  'application/json',
+  'application/ld+json',
+  'application/xml',
+  'application/xhtml+xml',
+  'application/yaml',
+  'application/x-yaml',
+  'application/javascript',
+  'application/x-javascript',
+  'application/typescript',
+  'application/x-typescript',
+  'application/x-python-code',
+  'application/x-ipynb+json',
+  'application/x-sh',
+  'application/toml',
+  'application/sql',
+  'application/graphql',
+] as const;
+
+const TEXTUAL_INLINE_MIME_SET = new Set<string>([...TEXTUAL_APPLICATION_MIMES, 'image/svg+xml']);
+
+export function isTextualInlineMime(rawMime: string | undefined): boolean {
+  const mime = (rawMime || '').split(';')[0].trim().toLowerCase();
+  return mime.startsWith('text/') || TEXTUAL_INLINE_MIME_SET.has(mime);
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────
 
 export interface CustomModelConfig {

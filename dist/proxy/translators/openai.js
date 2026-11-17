@@ -14,6 +14,7 @@ exports.mapOpenAIChunkToGemini = mapOpenAIChunkToGemini;
 exports.mapGeminiToolsToOpenAI = mapGeminiToolsToOpenAI;
 const electron_log_1 = __importDefault(require("electron-log"));
 const utils_1 = require("./utils");
+const modelUtils_1 = require("../modelUtils");
 const shared_1 = require("../shared");
 // ─── REQUEST: Gemini → OpenAI ──────────────────────────────────────────────
 function mapGeminiToolsToOpenAI(geminiTools) {
@@ -58,16 +59,6 @@ function saveModelReasoning(stateKey, reasoning) {
     shared_1.modelReasoningContent.set(stateKey, reasoning);
     (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.reasoning, stateKey);
 }
-const TEXTUAL_INLINE_MIMES = new Set([
-    'application/json',
-    'application/xml',
-    'application/yaml',
-    'application/x-yaml',
-    'application/x-javascript',
-    'application/x-typescript',
-    'application/x-python-code',
-    'application/x-ipynb+json',
-]);
 function readInlinePart(part) {
     const inline = part.inlineData || part.inline_data;
     if (!inline)
@@ -112,7 +103,12 @@ function buildOpenAIUserContent(parts) {
         const inline = readInlinePart(p);
         if (inline) {
             const { mime, data } = inline;
-            if (mime.startsWith('image/')) {
+            if ((0, modelUtils_1.isTextualInlineMime)(mime)) {
+                const decodedText = Buffer.from(stripDataUrlPrefix(data), 'base64').toString('utf-8');
+                if (decodedText)
+                    textChunks.push(decodedText);
+            }
+            else if (mime.startsWith('image/')) {
                 hasMediaParts = true;
                 flushTextToMulti();
                 mediaParts.push({ type: 'image_url', image_url: { url: toDataUrl(mime, data) } });
@@ -142,11 +138,6 @@ function buildOpenAIUserContent(parts) {
             }
             else if (mime.startsWith('video/')) {
                 textChunks.push(`[Video attachment (${mime}) is not supported by OpenAI Chat Completions; switch to a Google Gemini model to inspect video]`);
-            }
-            else if (mime.startsWith('text/') || TEXTUAL_INLINE_MIMES.has(mime)) {
-                const decodedText = Buffer.from(stripDataUrlPrefix(data), 'base64').toString('utf-8');
-                if (decodedText)
-                    textChunks.push(decodedText);
             }
             else {
                 textChunks.push(`[Inline data: ${mime}, length: ${data.length} chars]`);
@@ -193,7 +184,7 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
         for (const item of geminiBody.contents) {
             if (item.parts) {
                 const hasFunctionCall = item.parts.some((p) => p.functionCall);
-                const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+                const hasFunctionResponse = item.parts.some((p) => p.functionResponse || p.function_response);
                 if (!hasFunctionResponse)
                     flushToolResponseExtras();
                 if (hasFunctionCall && item.role === 'model') {
@@ -224,21 +215,22 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
                 }
                 else if (hasFunctionResponse) {
                     for (const p of item.parts) {
-                        if (p.functionResponse) {
-                            const funcName = p.functionResponse.name || '';
+                        const fnResp = p.functionResponse || p.function_response;
+                        if (fnResp) {
+                            const funcName = fnResp.name || '';
                             const modelTCIds = shared_1.modelToolCallIds.get(stateKey) || {};
                             const ids = historyCallIds.get(funcName) || [];
-                            const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
-                            if (p.functionResponse.id) {
-                                const matched = ids.indexOf(p.functionResponse.id);
+                            const toolCallId = fnResp.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+                            if (fnResp.id) {
+                                const matched = ids.indexOf(fnResp.id);
                                 if (matched >= 0)
                                     ids.splice(matched, 1);
                             }
-                            const responseData = p.functionResponse.response;
+                            const responseData = fnResp.response;
                             const contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
                             messages.push({ role: 'tool', content: contentStr, tool_call_id: toolCallId });
-                            if (Array.isArray(p.functionResponse.parts)) {
-                                for (const nestedPart of p.functionResponse.parts) {
+                            if (Array.isArray(fnResp.parts)) {
+                                for (const nestedPart of fnResp.parts) {
                                     if (!nestedPart.thought &&
                                         (nestedPart.text ||
                                             nestedPart.inlineData ||

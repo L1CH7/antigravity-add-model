@@ -89,7 +89,7 @@ import {
 } from './proxy/shared';
 
 // Model configuration & capability detection
-import { detectModelCapabilities, isNativeGoogleModelName } from './proxy/modelUtils';
+import { detectModelCapabilities, isNativeGoogleModelName, TEXTUAL_APPLICATION_MIMES } from './proxy/modelUtils';
 export { NATIVE_GOOGLE_MODELS, isNativeGoogleModelName } from './proxy/modelUtils';
 
 // Custom request transport and model storage
@@ -518,7 +518,7 @@ function resolveBinaryAttachmentMime(declaredMime: string | undefined, uri: stri
   for (const candidate of [declaredMime, httpContentType]) {
     const clean = (candidate || '').split(';')[0].trim().toLowerCase();
     if (
-      clean.startsWith('image/') ||
+      (clean.startsWith('image/') && clean !== 'image/svg+xml') ||
       clean.startsWith('audio/') ||
       clean.startsWith('video/') ||
       clean === 'application/pdf'
@@ -976,18 +976,24 @@ const BASE_MIME_TYPES: Record<string, boolean> = {
   'text/css': true,
   'text/xml': true,
   'text/csv': true,
+  'text/tab-separated-values': true,
   'text/javascript': true,
   'text/typescript': true,
   'text/yaml': true,
-  'application/json': true,
-  'application/xml': true,
-  'application/yaml': true,
-  'application/x-yaml': true,
+  'text/x-python': true,
+  'text/x-go': true,
+  'text/x-rust': true,
+  'text/x-c': true,
+  'text/x-csrc': true,
+  'text/x-c++src': true,
+  'text/x-java-source': true,
+  'text/x-sh': true,
+  'text/x-shellscript': true,
+  'text/x-toml': true,
+  'text/x-sql': true,
+  'image/svg+xml': true,
   'application/pdf': true,
-  'application/x-javascript': true,
-  'application/x-typescript': true,
-  'application/x-python-code': true,
-  'application/x-ipynb+json': true,
+  ...Object.fromEntries((TEXTUAL_APPLICATION_MIMES || []).map((mime) => [mime, true])),
 };
 
 const IMAGE_MIME_TYPES: Record<string, boolean> = {
@@ -1005,6 +1011,7 @@ const IMAGE_MIME_TYPES: Record<string, boolean> = {
 const OPENAI_AUDIO_MIME_TYPES: Record<string, boolean> = {
   'audio/wav': true,
   'audio/wave': true,
+  'audio/x-wav': true,
   'audio/mp3': true,
   'audio/mpeg': true,
 };

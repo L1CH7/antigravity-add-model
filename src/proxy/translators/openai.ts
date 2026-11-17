@@ -10,6 +10,7 @@ import {
   parseToolCallArgs,
   ToolSchemas,
 } from './utils';
+import { isTextualInlineMime } from '../modelUtils';
 import {
   modelToolCallIds,
   modelReasoningContent,
@@ -55,6 +56,7 @@ interface GeminiPart {
   thought?: boolean;
   functionCall?: GeminiFunctionCall;
   functionResponse?: GeminiFunctionResponse;
+  function_response?: GeminiFunctionResponse;
   fileData?: { mimeType?: string; fileUri?: string };
   file_data?: { mime_type?: string; file_uri?: string };
   inlineData?: { mimeType?: string; data?: string };
@@ -233,17 +235,6 @@ function saveModelReasoning(stateKey: string, reasoning: string): void {
   touchStateTimestamp(stateTimestamps.reasoning, stateKey);
 }
 
-const TEXTUAL_INLINE_MIMES = new Set([
-  'application/json',
-  'application/xml',
-  'application/yaml',
-  'application/x-yaml',
-  'application/x-javascript',
-  'application/x-typescript',
-  'application/x-python-code',
-  'application/x-ipynb+json',
-]);
-
 function readInlinePart(part: GeminiPart): { mime: string; data: string } | null {
   const inline = part.inlineData || part.inline_data;
   if (!inline) return null;
@@ -292,7 +283,10 @@ function buildOpenAIUserContent(parts: GeminiPart[]): string | OpenAIContentPart
     const inline = readInlinePart(p);
     if (inline) {
       const { mime, data } = inline;
-      if (mime.startsWith('image/')) {
+      if (isTextualInlineMime(mime)) {
+        const decodedText = Buffer.from(stripDataUrlPrefix(data), 'base64').toString('utf-8');
+        if (decodedText) textChunks.push(decodedText);
+      } else if (mime.startsWith('image/')) {
         hasMediaParts = true;
         flushTextToMulti();
         mediaParts.push({ type: 'image_url', image_url: { url: toDataUrl(mime, data) } });
@@ -320,9 +314,6 @@ function buildOpenAIUserContent(parts: GeminiPart[]): string | OpenAIContentPart
         textChunks.push(
           `[Video attachment (${mime}) is not supported by OpenAI Chat Completions; switch to a Google Gemini model to inspect video]`,
         );
-      } else if (mime.startsWith('text/') || TEXTUAL_INLINE_MIMES.has(mime)) {
-        const decodedText = Buffer.from(stripDataUrlPrefix(data), 'base64').toString('utf-8');
-        if (decodedText) textChunks.push(decodedText);
       } else {
         textChunks.push(`[Inline data: ${mime}, length: ${data.length} chars]`);
       }
@@ -375,7 +366,7 @@ export function mapGeminiToOpenAI(
     for (const item of geminiBody.contents) {
       if (item.parts) {
         const hasFunctionCall = item.parts.some((p) => p.functionCall);
-        const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
+        const hasFunctionResponse = item.parts.some((p) => p.functionResponse || p.function_response);
         if (!hasFunctionResponse) flushToolResponseExtras();
 
         if (hasFunctionCall && item.role === 'model') {
@@ -406,20 +397,21 @@ export function mapGeminiToOpenAI(
           messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
         } else if (hasFunctionResponse) {
           for (const p of item.parts) {
-            if (p.functionResponse) {
-              const funcName = p.functionResponse.name || '';
+            const fnResp = p.functionResponse || p.function_response;
+            if (fnResp) {
+              const funcName = fnResp.name || '';
               const modelTCIds = modelToolCallIds.get(stateKey) || {};
               const ids = historyCallIds.get(funcName) || [];
-              const toolCallId = p.functionResponse.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
-              if (p.functionResponse.id) {
-                const matched = ids.indexOf(p.functionResponse.id);
+              const toolCallId = fnResp.id || ids.shift() || modelTCIds[funcName] || 'call_' + funcName;
+              if (fnResp.id) {
+                const matched = ids.indexOf(fnResp.id);
                 if (matched >= 0) ids.splice(matched, 1);
               }
-              const responseData = p.functionResponse.response;
+              const responseData = fnResp.response;
               const contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
               messages.push({ role: 'tool', content: contentStr, tool_call_id: toolCallId });
-              if (Array.isArray(p.functionResponse.parts)) {
-                for (const nestedPart of p.functionResponse.parts) {
+              if (Array.isArray(fnResp.parts)) {
+                for (const nestedPart of fnResp.parts) {
                   if (
                     !nestedPart.thought &&
                     (nestedPart.text ||

@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.NATIVE_GOOGLE_MODELS = exports.DEFAULT_MAX_OUTPUT_TOKENS = exports.DEFAULT_CONTEXT_WINDOW = void 0;
+exports.NATIVE_GOOGLE_MODELS = exports.TEXTUAL_APPLICATION_MIMES = exports.DEFAULT_MAX_OUTPUT_TOKENS = exports.DEFAULT_CONTEXT_WINDOW = void 0;
+exports.isTextualInlineMime = isTextualInlineMime;
 exports.detectModelCapabilities = detectModelCapabilities;
 exports.detectModelCapabilitiesByName = detectModelCapabilitiesByName;
 exports.isNativeGoogleModelName = isNativeGoogleModelName;
@@ -11,6 +12,29 @@ const providers_1 = require("../providers");
  */
 exports.DEFAULT_CONTEXT_WINDOW = 1048576;
 exports.DEFAULT_MAX_OUTPUT_TOKENS = 65536;
+exports.TEXTUAL_APPLICATION_MIMES = [
+    'application/json',
+    'application/ld+json',
+    'application/xml',
+    'application/xhtml+xml',
+    'application/yaml',
+    'application/x-yaml',
+    'application/javascript',
+    'application/x-javascript',
+    'application/typescript',
+    'application/x-typescript',
+    'application/x-python-code',
+    'application/x-ipynb+json',
+    'application/x-sh',
+    'application/toml',
+    'application/sql',
+    'application/graphql',
+];
+const TEXTUAL_INLINE_MIME_SET = new Set([...exports.TEXTUAL_APPLICATION_MIMES, 'image/svg+xml']);
+function isTextualInlineMime(rawMime) {
+    const mime = (rawMime || '').split(';')[0].trim().toLowerCase();
+    return mime.startsWith('text/') || TEXTUAL_INLINE_MIME_SET.has(mime);
+}
 // ─── Capabilities ─────────────────────────────────────────────────────────
 const CLAUDE_THINKING_PATTERN = /opus-4|sonnet-4|claude-4|claude-3-5|claude-3-7/i;
 const THINKING_MODEL_PATTERN = /opus-4|sonnet-4|claude-4/i;

@@ -408,6 +408,45 @@ describe('mapGeminiToOpenAI', () => {
     ]);
   });
 
+  it('should decode image/svg+xml, shell/code application mimes, and snake_case function_response.parts with audio', () => {
+    const svgB64 = Buffer.from('<svg><rect/></svg>', 'utf-8').toString('base64');
+    const shB64 = Buffer.from('#!/bin/sh\necho ok\n', 'utf-8').toString('base64');
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              function_response: {
+                id: 'call_multi',
+                name: 'read_file',
+                response: { output: 'Showing binary file' },
+                parts: [
+                  { inlineData: { mimeType: 'image/svg+xml', data: svgB64 } },
+                  { inlineData: { mimeType: 'application/x-sh', data: shB64 } },
+                  { inlineData: { mimeType: 'audio/x-wav', data: 'UklGRg==' } },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToOpenAI(body as any, 'gpt-6.1-sol');
+    expect(result.messages[0]).toEqual({
+      role: 'tool',
+      content: '{"output":"Showing binary file"}',
+      tool_call_id: 'call_multi',
+    });
+    expect(result.messages[1]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: '<svg><rect/></svg>\n#!/bin/sh\necho ok\n' },
+        { type: 'input_audio', input_audio: { data: 'UklGRg==', format: 'wav' } },
+      ],
+    });
+  });
+
   it('should convert Gemini tools to OpenAI format', () => {
     const body = {
       contents: [],

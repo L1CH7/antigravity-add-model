@@ -460,7 +460,7 @@ const BINARY_EXT_MIME = {
 function resolveBinaryAttachmentMime(declaredMime, uri, httpContentType) {
     for (const candidate of [declaredMime, httpContentType]) {
         const clean = (candidate || '').split(';')[0].trim().toLowerCase();
-        if (clean.startsWith('image/') ||
+        if ((clean.startsWith('image/') && clean !== 'image/svg+xml') ||
             clean.startsWith('audio/') ||
             clean.startsWith('video/') ||
             clean === 'application/pdf') {
@@ -853,18 +853,24 @@ const BASE_MIME_TYPES = {
     'text/css': true,
     'text/xml': true,
     'text/csv': true,
+    'text/tab-separated-values': true,
     'text/javascript': true,
     'text/typescript': true,
     'text/yaml': true,
-    'application/json': true,
-    'application/xml': true,
-    'application/yaml': true,
-    'application/x-yaml': true,
+    'text/x-python': true,
+    'text/x-go': true,
+    'text/x-rust': true,
+    'text/x-c': true,
+    'text/x-csrc': true,
+    'text/x-c++src': true,
+    'text/x-java-source': true,
+    'text/x-sh': true,
+    'text/x-shellscript': true,
+    'text/x-toml': true,
+    'text/x-sql': true,
+    'image/svg+xml': true,
     'application/pdf': true,
-    'application/x-javascript': true,
-    'application/x-typescript': true,
-    'application/x-python-code': true,
-    'application/x-ipynb+json': true,
+    ...Object.fromEntries((modelUtils_1.TEXTUAL_APPLICATION_MIMES || []).map((mime) => [mime, true])),
 };
 const IMAGE_MIME_TYPES = {
     'image/png': true,
@@ -880,6 +886,7 @@ const IMAGE_MIME_TYPES = {
 const OPENAI_AUDIO_MIME_TYPES = {
     'audio/wav': true,
     'audio/wave': true,
+    'audio/x-wav': true,
     'audio/mp3': true,
     'audio/mpeg': true,
 };
