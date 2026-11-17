@@ -100,30 +100,63 @@ if (typeof process !== 'undefined' && process.platform === 'win32' && typeof chi
     if (typeof process === 'undefined') return false;
     const env = process.env || {};
     const argv = Array.isArray(process.argv) ? process.argv : [];
+    const hasEmptyWslDistro = argv.some(
+      (arg, idx) =>
+        typeof arg === 'string' &&
+        (arg === '--wsl-distro=' || (arg === '--wsl-distro' && argv[idx + 1] === '')),
+    );
     return (
       env.ANTIGRAVITY_DISABLE_WSL === '1' ||
       env.AG_DISABLE_WSL === '1' ||
       argv.includes('--no-wsl') ||
-      argv.some((arg) => typeof arg === 'string' && arg.startsWith('--wsl-distro='))
+      hasEmptyWslDistro
     );
   };
+
+  // Матч строго по имени файла wsl.exe, чтобы не задевать пути с такой подстрокой в имени каталога
+  const isWslExecutable = (file: unknown): file is string =>
+    typeof file === 'string' && /(?:^|[\\/])wsl\.exe$/i.test(file.trim());
 
   const originalExecFile = childProcess.execFile;
 
   const getEmptyOutput = (options?: ExecFileOptions | null) =>
     options && options.encoding === 'buffer' ? Buffer.alloc(0) : '';
 
+  const createNoopStream = () =>
+    Object.assign(new childProcess.ChildProcess(), {
+      setEncoding() {
+        return this;
+      },
+      resume() {
+        return this;
+      },
+    });
+
+  const createStubWslProcess = () => {
+    const child = new childProcess.ChildProcess();
+    child.stdout = createNoopStream();
+    child.stderr = createNoopStream();
+    return child;
+  };
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (childProcess as any).execFile = function (file: string, ...args: any[]) {
-    if (isWslDisabled() && typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+    if (isWslDisabled() && isWslExecutable(file)) {
       const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
       const options = args.find((a) => a && typeof a === 'object' && !Array.isArray(a)) as ExecFileOptions | undefined;
       const empty = getEmptyOutput(options);
+      const stubChild = createStubWslProcess();
 
-      if (callback) {
-        process.nextTick(() => callback(null, empty, empty));
-        return new childProcess.ChildProcess();
-      }
+      process.nextTick(() => {
+        stubChild.stdout.emit('end');
+        stubChild.stderr.emit('end');
+        if (callback) {
+          callback(null, empty, empty);
+        }
+        stubChild.emit('exit', 0, null);
+        stubChild.emit('close', 0, null);
+      });
+      return stubChild;
     }
     return originalExecFile.apply(this, [file, ...args]);
   };
@@ -132,7 +165,7 @@ if (typeof process !== 'undefined' && process.platform === 'win32' && typeof chi
   if ((originalExecFile as any)[promisifyCustom]) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (childProcess as any).execFile[promisifyCustom] = function (file: string, ...args: any[]) {
-      if (isWslDisabled() && typeof file === 'string' && file.toLowerCase().includes('wsl.exe')) {
+      if (isWslDisabled() && isWslExecutable(file)) {
         const options = args.find((a) => a && typeof a === 'object' && !Array.isArray(a)) as ExecFileOptions | undefined;
         const empty = getEmptyOutput(options);
         return Promise.resolve({ stdout: empty, stderr: empty });

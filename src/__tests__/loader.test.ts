@@ -216,6 +216,36 @@ describe('modular loader', () => {
     // 4. When WSL is NOT disabled -> passes through to originalExecFile
     fakeProcess.env.ANTIGRAVITY_DISABLE_WSL = '0';
     (mockChildProcess.execFile as any)('C:\\Windows\\System32\\wsl.exe', ['--list'], () => {});
-    expect(originalExecFile).toHaveBeenCalled();
+    expect(originalExecFile).toHaveBeenCalledTimes(1);
+
+    // 5. Explicit distro flag does NOT disable WSL, whereas empty --wsl-distro= does
+    fakeProcess.argv = ['node', 'loader.js', '--wsl-distro=Ubuntu-22.04'];
+    (mockChildProcess.execFile as any)('wsl.exe', ['--list'], () => {});
+    expect(originalExecFile).toHaveBeenCalledTimes(2);
+
+    fakeProcess.argv = ['node', 'loader.js', '--wsl-distro='];
+    await new Promise<void>((resolve) => {
+      const child = (mockChildProcess.execFile as any)('wsl.exe', ['--list']);
+      let stdoutEnded = false;
+      let exitedCode: number | null = null;
+      child.stdout.on('end', () => {
+        stdoutEnded = true;
+      });
+      child.on('exit', (code: number) => {
+        exitedCode = code;
+      });
+      child.on('close', (code: number) => {
+        expect(stdoutEnded).toBe(true);
+        expect(exitedCode).toBe(0);
+        expect(code).toBe(0);
+        resolve();
+      });
+    });
+    expect(originalExecFile).toHaveBeenCalledTimes(2);
+
+    // 6. Executable in a directory containing "wsl.exe" in its path is NOT treated as wsl.exe
+    fakeProcess.env.ANTIGRAVITY_DISABLE_WSL = '1';
+    (mockChildProcess.execFile as any)('C:\\wsl.exe-tools\\helper.exe', ['--version'], () => {});
+    expect(originalExecFile).toHaveBeenCalledTimes(3);
   });
 });
