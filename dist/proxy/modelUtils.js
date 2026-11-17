@@ -1,13 +1,14 @@
 "use strict";
-/**
- * Глобальные дефолты и чтение возможностей модели строго из конфигурации,
- * без эвристик и угадывания по имени модели.
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.NATIVE_GOOGLE_MODELS = exports.DEFAULT_MAX_OUTPUT_TOKENS = exports.DEFAULT_CONTEXT_WINDOW = void 0;
 exports.detectModelCapabilities = detectModelCapabilities;
 exports.detectModelCapabilitiesByName = detectModelCapabilitiesByName;
 exports.isNativeGoogleModelName = isNativeGoogleModelName;
+const providers_1 = require("../providers");
+/**
+ * Глобальные дефолты и чтение возможностей модели строго из конфигурации,
+ * без эвристик и угадывания по имени модели.
+ */
 exports.DEFAULT_CONTEXT_WINDOW = 1048576;
 exports.DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 // ─── Capabilities ─────────────────────────────────────────────────────────
@@ -17,12 +18,15 @@ const THINKING_MODEL_PATTERN = /opus-4|sonnet-4|claude-4/i;
  * Возвращает возможности модели из её конфигурации с глобальными дефолтами.
  */
 function detectModelCapabilities(m, _includeDisplayName = true) {
+    const isGoogleFormat = (0, providers_1.resolveApiFormat)(m.provider, m.apiFormat) === 'google';
     const hasReasoning = Boolean(m.reasoningEffort || (Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0));
     const isThinking = m.supportsThinking ?? hasReasoning;
     const maxTokens = m.contextWindow ?? exports.DEFAULT_CONTEXT_WINDOW;
     const maxOutputTokens = m.maxOutputTokens ?? exports.DEFAULT_MAX_OUTPUT_TOKENS;
     const supportsImages = m.supportsVision ?? true;
-    return { isThinking, maxTokens, maxOutputTokens, supportsImages };
+    const supportsAudio = m.supportsAudio ?? true;
+    const supportsVideo = m.supportsVideo ?? isGoogleFormat;
+    return { isThinking, isGoogleFormat, maxTokens, maxOutputTokens, supportsImages, supportsAudio, supportsVideo };
 }
 /**
  * Simplified detection for Gemini↔Anthropic translation (checks modelName string only).

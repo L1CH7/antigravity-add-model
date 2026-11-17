@@ -79,6 +79,18 @@ type OpenAIContentPart = {
     image_url: {
         url: string;
     };
+} | {
+    type: 'file';
+    file: {
+        filename: string;
+        file_data: string;
+    };
+} | {
+    type: 'input_audio';
+    input_audio: {
+        data: string;
+        format: 'wav' | 'mp3';
+    };
 };
 interface OpenAIMessage {
     role: string;

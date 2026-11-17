@@ -34,6 +34,8 @@ export interface CustomModel {
     gateway?: boolean;
     supportsVision?: boolean;
     supportsThinking?: boolean;
+    supportsAudio?: boolean;
+    supportsVideo?: boolean;
     googleProject?: string;
     googleAccounts?: import('./googleAccounts').GoogleAccount[];
     googlePool?: import('./googleAccounts').GooglePoolOptions;

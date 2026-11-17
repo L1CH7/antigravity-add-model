@@ -1,3 +1,5 @@
+import { ApiFormat, resolveApiFormat } from '../providers';
+
 /**
  * Глобальные дефолты и чтение возможностей модели строго из конфигурации,
  * без эвристик и угадывания по имени модели.
@@ -11,21 +13,27 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 65_536;
 export interface CustomModelConfig {
   name: string;
   provider: string;
+  apiFormat?: ApiFormat;
   externalModelName?: string;
   displayName?: string;
   contextWindow?: number;
   maxOutputTokens?: number;
   supportsVision?: boolean;
   supportsThinking?: boolean;
+  supportsAudio?: boolean;
+  supportsVideo?: boolean;
   reasoningEffort?: string;
   reasoningEfforts?: string[];
 }
 
 export interface ModelCapabilities {
   isThinking: boolean;
+  isGoogleFormat: boolean;
   maxTokens: number;
   maxOutputTokens: number;
   supportsImages: boolean;
+  supportsAudio: boolean;
+  supportsVideo: boolean;
 }
 
 export interface ModelNameCapabilities {
@@ -42,13 +50,16 @@ const THINKING_MODEL_PATTERN = /opus-4|sonnet-4|claude-4/i;
  * Возвращает возможности модели из её конфигурации с глобальными дефолтами.
  */
 export function detectModelCapabilities(m: CustomModelConfig, _includeDisplayName = true): ModelCapabilities {
+  const isGoogleFormat = resolveApiFormat(m.provider, m.apiFormat) === 'google';
   const hasReasoning = Boolean(m.reasoningEffort || (Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length > 0));
   const isThinking = m.supportsThinking ?? hasReasoning;
   const maxTokens = m.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const maxOutputTokens = m.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const supportsImages = m.supportsVision ?? true;
+  const supportsAudio = m.supportsAudio ?? true;
+  const supportsVideo = m.supportsVideo ?? isGoogleFormat;
 
-  return { isThinking, maxTokens, maxOutputTokens, supportsImages };
+  return { isThinking, isGoogleFormat, maxTokens, maxOutputTokens, supportsImages, supportsAudio, supportsVideo };
 }
 
 /**

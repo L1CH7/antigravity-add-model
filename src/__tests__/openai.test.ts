@@ -335,6 +335,39 @@ describe('mapGeminiToOpenAI', () => {
     });
   });
 
+  it('should map PDF, wav/mp3 input_audio, textual inlineData, and safely reject video base64 bloat', () => {
+    const codeText = Buffer.from('print("hello")', 'utf-8').toString('base64');
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'Analyze attachments' },
+            { inlineData: { mimeType: 'application/pdf', data: 'JVBERi0xLjU=' } },
+            { inlineData: { mimeType: 'audio/wav', data: 'data:audio/wav;base64,UklGRg==' } },
+            { inlineData: { mimeType: 'audio/mpeg', data: 'SUQz' } },
+            { inlineData: { mimeType: 'application/x-python-code', data: codeText } },
+            { inlineData: { mimeType: 'video/mp4', data: 'AAAAIGZ0eXBtcDQy' } },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToOpenAI(body as any, 'gpt-6.1-sol');
+    expect(result.messages[0].content).toEqual([
+      { type: 'text', text: 'Analyze attachments' },
+      {
+        type: 'file',
+        file: { filename: 'document-1.pdf', file_data: 'data:application/pdf;base64,JVBERi0xLjU=' },
+      },
+      { type: 'input_audio', input_audio: { data: 'UklGRg==', format: 'wav' } },
+      { type: 'input_audio', input_audio: { data: 'SUQz', format: 'mp3' } },
+      {
+        type: 'text',
+        text: 'print("hello")\n[Video attachment (video/mp4) is not supported by OpenAI Chat Completions; switch to a Google Gemini model to inspect video]',
+      },
+    ]);
+  });
+
   it('should convert Gemini tools to OpenAI format', () => {
     const body = {
       contents: [],

@@ -433,7 +433,7 @@ function proxyToGoogle(req, res, reqBody) {
     });
 }
 // ─── File Data Resolver ────────────────────────────────────────────────────
-const FILE_IMAGE_EXT_MIME = {
+const BINARY_EXT_MIME = {
     '.png': 'image/png',
     '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg',
@@ -441,14 +441,35 @@ const FILE_IMAGE_EXT_MIME = {
     '.gif': 'image/gif',
     '.heic': 'image/heic',
     '.heif': 'image/heif',
+    '.avif': 'image/avif',
+    '.apng': 'image/apng',
+    '.tif': 'image/tiff',
+    '.tiff': 'image/tiff',
+    '.pdf': 'application/pdf',
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mp3',
+    '.ogg': 'audio/ogg',
+    '.m4a': 'audio/m4a',
+    '.aac': 'audio/aac',
+    '.flac': 'audio/flac',
+    '.opus': 'audio/opus',
+    '.mp4': 'video/mp4',
+    '.webm': 'video/webm',
+    '.ogv': 'video/ogg',
 };
-function resolveFileImageMime(declaredMime, uri) {
-    const clean = (declaredMime || '').split(';')[0].trim().toLowerCase();
-    if (clean.startsWith('image/'))
-        return clean;
+function resolveBinaryAttachmentMime(declaredMime, uri, httpContentType) {
+    for (const candidate of [declaredMime, httpContentType]) {
+        const clean = (candidate || '').split(';')[0].trim().toLowerCase();
+        if (clean.startsWith('image/') ||
+            clean.startsWith('audio/') ||
+            clean.startsWith('video/') ||
+            clean === 'application/pdf') {
+            return clean;
+        }
+    }
     try {
         const ext = path.extname(new URL(uri).pathname).toLowerCase();
-        return FILE_IMAGE_EXT_MIME[ext];
+        return BINARY_EXT_MIME[ext];
     }
     catch {
         return undefined;
@@ -482,19 +503,22 @@ async function resolveFileData(body, reqHeaders) {
             tasks.push((async () => {
                 try {
                     let fileBuf = null;
+                    let remoteContentType;
                     if (uri.startsWith('file://')) {
                         const fp = fileUriToLocalPath(uri);
                         fileBuf = await fs.promises.readFile(fp);
                     }
                     else if (authHeader && uri.startsWith('https://')) {
-                        fileBuf = await downloadFileBuffer(uri, authHeader);
+                        const downloaded = await downloadFileBuffer(uri, authHeader);
+                        fileBuf = downloaded.buffer;
+                        remoteContentType = downloaded.contentType;
                     }
                     if (!fileBuf || fileBuf.length === 0)
                         return;
-                    const imageMime = resolveFileImageMime(declaredMime, uri);
-                    if (imageMime) {
+                    const binaryMime = resolveBinaryAttachmentMime(declaredMime, uri, remoteContentType);
+                    if (binaryMime) {
                         item.parts[partIdx] = {
-                            inlineData: { mimeType: imageMime, data: fileBuf.toString('base64') },
+                            inlineData: { mimeType: binaryMime, data: fileBuf.toString('base64') },
                         };
                     }
                     else {
@@ -524,9 +548,11 @@ function downloadFileBuffer(url, authHeader) {
                 reject(new Error('HTTP ' + res.statusCode));
                 return;
             }
+            const rawCt = res.headers['content-type'];
+            const contentType = Array.isArray(rawCt) ? rawCt[0] : rawCt;
             const chunks = [];
             res.on('data', (c) => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType }));
         }).on('error', reject).end();
     });
 }
@@ -820,7 +846,13 @@ const BASE_MIME_TYPES = {
     'text/css': true,
     'text/xml': true,
     'text/csv': true,
+    'text/javascript': true,
+    'text/typescript': true,
+    'text/yaml': true,
     'application/json': true,
+    'application/xml': true,
+    'application/yaml': true,
+    'application/x-yaml': true,
     'application/pdf': true,
     'application/x-javascript': true,
     'application/x-typescript': true,
@@ -834,10 +866,39 @@ const IMAGE_MIME_TYPES = {
     'image/gif': true,
     'image/heic': true,
     'image/heif': true,
-    ...BASE_MIME_TYPES,
+    'image/avif': true,
+    'image/apng': true,
+    'image/tiff': true,
+};
+const OPENAI_AUDIO_MIME_TYPES = {
+    'audio/wav': true,
+    'audio/wave': true,
+    'audio/mp3': true,
+    'audio/mpeg': true,
+};
+const GOOGLE_AUDIO_MIME_TYPES = {
+    ...OPENAI_AUDIO_MIME_TYPES,
+    'audio/ogg': true,
+    'audio/m4a': true,
+    'audio/aac': true,
+    'audio/flac': true,
+    'audio/opus': true,
+    'audio/webm': true,
+    'audio/l16': true,
+};
+const VIDEO_MIME_TYPES = {
+    'video/mp4': true,
+    'video/webm': true,
+    'video/ogg': true,
 };
 function buildCustomCloudCodeEntry(m, placeholderId) {
     const cap = (0, modelUtils_1.detectModelCapabilities)(m, true);
+    const supportedMimeTypes = {
+        ...BASE_MIME_TYPES,
+        ...(cap.supportsImages ? IMAGE_MIME_TYPES : {}),
+        ...(cap.supportsAudio ? (cap.isGoogleFormat ? GOOGLE_AUDIO_MIME_TYPES : OPENAI_AUDIO_MIME_TYPES) : {}),
+        ...(cap.supportsVideo ? VIDEO_MIME_TYPES : {}),
+    };
     return {
         displayName: m.displayName,
         supportsImages: cap.supportsImages,
@@ -849,8 +910,8 @@ function buildCustomCloudCodeEntry(m, placeholderId) {
         model: placeholderId,
         apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
         modelProvider: 'MODEL_PROVIDER_GOOGLE',
-        supportsVideo: false,
-        supportedMimeTypes: cap.supportsImages ? IMAGE_MIME_TYPES : BASE_MIME_TYPES,
+        supportsVideo: cap.supportsVideo,
+        supportedMimeTypes,
     };
 }
 function buildCustomV1BetaEntry(m, placeholderId) {

@@ -391,8 +391,8 @@ describe('schemaValidator with reasoningEfforts and max', () => {
 });
 
 describe('image capability advertising and end-to-end fileData image delivery', () => {
-  it('advertises image support and image/png mime type for arbitrary OpenAI models like gpt-6.1-sol', () => {
-    const m = {
+  it('advertises multimodal capabilities appropriately for Google and OpenAI models', () => {
+    const openaiModel = {
       name: 'models/gpt-6.1-sol',
       displayName: 'GPT-6.1 Sol',
       description: '',
@@ -402,46 +402,114 @@ describe('image capability advertising and end-to-end fileData image delivery', 
       externalModelName: 'gpt-6.1-sol',
       supportsThinking: true,
     };
-    const merged = mergeFetchAvailableModelsResponse({ availableModels: {} }, [m]) as any;
-    const entry = merged.availableModels['custom-gpt-6-1-sol'];
-    expect(entry.supportsImages).toBe(true);
-    expect(entry.supportedMimeTypes['image/png']).toBe(true);
+    const googleModel = {
+      name: 'models/gemini-4-argon-high',
+      displayName: 'Gemini 4 Argon High',
+      description: '',
+      provider: 'google',
+      apiKey: 'test-key',
+      apiUrl: 'http://127.0.0.1:8045/v1beta',
+      externalModelName: 'gemini-4-argon-high',
+    };
+    const merged = mergeFetchAvailableModelsResponse({ availableModels: {} }, [openaiModel, googleModel]) as any;
+    const openaiEntry = merged.availableModels['custom-gpt-6-1-sol'];
+    expect(openaiEntry.supportsImages).toBe(true);
+    expect(openaiEntry.supportsVideo).toBe(false);
+    expect(openaiEntry.supportedMimeTypes['image/png']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['application/pdf']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['audio/wav']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['audio/mp3']).toBe(true);
+    expect(openaiEntry.supportedMimeTypes['video/mp4']).toBeUndefined();
+
+    const googleEntry = merged.availableModels['custom-gemini-4-argon-high'];
+    expect(googleEntry.supportsImages).toBe(true);
+    expect(googleEntry.supportsVideo).toBe(true);
+    expect(googleEntry.supportedMimeTypes['application/pdf']).toBe(true);
+    expect(googleEntry.supportedMimeTypes['audio/ogg']).toBe(true);
+    expect(googleEntry.supportedMimeTypes['video/mp4']).toBe(true);
   });
 
-  it('converts local file:// PNG attachments into base64 inlineData and OpenAI image_url parts', async () => {
+  it('converts local file:// PNG, PDF, WAV, MP4 and text/code attachments for both Google and OpenAI pipelines', async () => {
     const fs = await import('fs');
     const os = await import('os');
     const { pathToFileURL } = await import('url');
     const { resolveFileData } = await import('../proxy');
     const { mapGeminiToOpenAI } = await import('../proxy/translators/openai');
 
-    const tmpFile = path.join(os.tmpdir(), `agy-img-test-${Date.now()}.png`);
-    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-    fs.writeFileSync(tmpFile, pngBytes);
+    const suffix = Date.now();
+    const tmpPng = path.join(os.tmpdir(), `agy-test-${suffix}.png`);
+    const tmpPdf = path.join(os.tmpdir(), `agy-test-${suffix}.pdf`);
+    const tmpWav = path.join(os.tmpdir(), `agy-test-${suffix}.wav`);
+    const tmpMp4 = path.join(os.tmpdir(), `agy-test-${suffix}.mp4`);
+    const tmpPy = path.join(os.tmpdir(), `agy-test-${suffix}.py`);
+
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const pdfBytes = Buffer.from('%PDF-1.7\n');
+    const wavBytes = Buffer.from('RIFF\x00\x00\x00\x00WAVE');
+    const mp4Bytes = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
+
+    fs.writeFileSync(tmpPng, pngBytes);
+    fs.writeFileSync(tmpPdf, pdfBytes);
+    fs.writeFileSync(tmpWav, wavBytes);
+    fs.writeFileSync(tmpMp4, mp4Bytes);
+    fs.writeFileSync(tmpPy, 'x = 42\n', 'utf-8');
+
     try {
       const geminiBody: any = {
         contents: [
           {
             role: 'user',
             parts: [
-              { text: 'Read table from screenshot' },
-              { fileData: { mimeType: 'image/png', fileUri: pathToFileURL(tmpFile).toString() } },
+              { text: 'Check all attachments' },
+              { fileData: { mimeType: 'image/png', fileUri: pathToFileURL(tmpPng).toString() } },
+              { fileData: { mimeType: 'application/pdf', fileUri: pathToFileURL(tmpPdf).toString() } },
+              { fileData: { mimeType: 'audio/wav', fileUri: pathToFileURL(tmpWav).toString() } },
+              { fileData: { mimeType: 'video/mp4', fileUri: pathToFileURL(tmpMp4).toString() } },
+              { fileData: { mimeType: 'application/x-python-code', fileUri: pathToFileURL(tmpPy).toString() } },
             ],
           },
         ],
       };
       await resolveFileData(geminiBody, {});
+
+      // Google-формат получает бинарники в inlineData, а код — текстом
       expect(geminiBody.contents[0].parts[1]).toEqual({
         inlineData: { mimeType: 'image/png', data: pngBytes.toString('base64') },
       });
+      expect(geminiBody.contents[0].parts[2]).toEqual({
+        inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') },
+      });
+      expect(geminiBody.contents[0].parts[3]).toEqual({
+        inlineData: { mimeType: 'audio/wav', data: wavBytes.toString('base64') },
+      });
+      expect(geminiBody.contents[0].parts[4]).toEqual({
+        inlineData: { mimeType: 'video/mp4', data: mp4Bytes.toString('base64') },
+      });
+      expect(geminiBody.contents[0].parts[5]).toEqual({
+        text: '[File content]:\n\nx = 42\n',
+      });
 
+      // OpenAI-формат переводит картинки/PDF/WAV/код в нативные блоки и не дампит base64 видео
       const openAiReq = mapGeminiToOpenAI(geminiBody, 'gpt-6.1-sol');
       expect(openAiReq.messages[0].content).toEqual([
-        { type: 'text', text: 'Read table from screenshot' },
+        { type: 'text', text: 'Check all attachments' },
         { type: 'image_url', image_url: { url: `data:image/png;base64,${pngBytes.toString('base64')}` } },
+        {
+          type: 'file',
+          file: { filename: 'document-1.pdf', file_data: `data:application/pdf;base64,${pdfBytes.toString('base64')}` },
+        },
+        { type: 'input_audio', input_audio: { data: wavBytes.toString('base64'), format: 'wav' } },
+        {
+          type: 'text',
+          text:
+            '[Video attachment (video/mp4) is not supported by OpenAI Chat Completions; switch to a Google Gemini model to inspect video]\n' +
+            '[File content]:\n\nx = 42\n',
+        },
       ]);
     } finally {
-      fs.unlinkSync(tmpFile);
+      for (const f of [tmpPng, tmpPdf, tmpWav, tmpMp4, tmpPy]) {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      }
     }
   });
 });

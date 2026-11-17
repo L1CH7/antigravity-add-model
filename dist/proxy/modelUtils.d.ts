@@ -1,3 +1,4 @@
+import { ApiFormat } from '../providers';
 /**
  * Глобальные дефолты и чтение возможностей модели строго из конфигурации,
  * без эвристик и угадывания по имени модели.
@@ -7,20 +8,26 @@ export declare const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 export interface CustomModelConfig {
     name: string;
     provider: string;
+    apiFormat?: ApiFormat;
     externalModelName?: string;
     displayName?: string;
     contextWindow?: number;
     maxOutputTokens?: number;
     supportsVision?: boolean;
     supportsThinking?: boolean;
+    supportsAudio?: boolean;
+    supportsVideo?: boolean;
     reasoningEffort?: string;
     reasoningEfforts?: string[];
 }
 export interface ModelCapabilities {
     isThinking: boolean;
+    isGoogleFormat: boolean;
     maxTokens: number;
     maxOutputTokens: number;
     supportsImages: boolean;
+    supportsAudio: boolean;
+    supportsVideo: boolean;
 }
 export interface ModelNameCapabilities {
     isClaudeThinkingModel: boolean;

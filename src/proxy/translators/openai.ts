@@ -85,7 +85,9 @@ interface GeminiRequestBody {
 
 type OpenAIContentPart =
   | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } };
+  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'file'; file: { filename: string; file_data: string } }
+  | { type: 'input_audio'; input_audio: { data: string; format: 'wav' | 'mp3' } };
 
 interface OpenAIMessage {
   role: string;
@@ -230,22 +232,52 @@ function saveModelReasoning(stateKey: string, reasoning: string): void {
   touchStateTimestamp(stateTimestamps.reasoning, stateKey);
 }
 
-function extractInlineImageUrl(part: GeminiPart): string | null {
+const TEXTUAL_INLINE_MIMES = new Set([
+  'application/json',
+  'application/xml',
+  'application/yaml',
+  'application/x-yaml',
+  'application/x-javascript',
+  'application/x-typescript',
+  'application/x-python-code',
+  'application/x-ipynb+json',
+]);
+
+function readInlinePart(part: GeminiPart): { mime: string; data: string } | null {
   const inline = part.inlineData || part.inline_data;
   if (!inline) return null;
-  const mime = ('mimeType' in inline ? inline.mimeType : undefined) || ('mime_type' in inline ? inline.mime_type : undefined) || '';
+  const rawMime =
+    ('mimeType' in inline ? inline.mimeType : undefined) || ('mime_type' in inline ? inline.mime_type : undefined) || '';
+  const mime = rawMime.split(';')[0].trim().toLowerCase();
   const data = inline.data || '';
-  if (!mime.toLowerCase().startsWith('image/') || !data) return null;
+  if (!mime || !data) return null;
+  return { mime, data };
+}
+
+function stripDataUrlPrefix(data: string): string {
+  const match = /^data:[^;]+;base64,(.*)$/is.exec(data);
+  return match ? match[1] : data;
+}
+
+function toDataUrl(mime: string, data: string): string {
   return data.startsWith('data:') ? data : `data:${mime};base64,${data}`;
+}
+
+function resolveOpenAIAudioFormat(mime: string): 'wav' | 'mp3' | null {
+  if (mime === 'audio/wav' || mime === 'audio/wave' || mime === 'audio/x-wav') return 'wav';
+  if (mime === 'audio/mp3' || mime === 'audio/mpeg') return 'mp3';
+  return null;
 }
 
 function buildOpenAIUserContent(parts: GeminiPart[]): string | OpenAIContentPart[] {
   const textChunks: string[] = [];
-  const multiParts: OpenAIContentPart[] = [];
-  let hasImages = false;
+  const mediaParts: OpenAIContentPart[] = [];
+  let hasMediaParts = false;
+  let pdfCounter = 0;
+
   const flushTextToMulti = () => {
     if (textChunks.length > 0) {
-      multiParts.push({ type: 'text', text: textChunks.join('\n') });
+      mediaParts.push({ type: 'text', text: textChunks.join('\n') });
       textChunks.length = 0;
     }
   };
@@ -255,19 +287,47 @@ function buildOpenAIUserContent(parts: GeminiPart[]): string | OpenAIContentPart
       textChunks.push(p.text);
       continue;
     }
-    const imageUrl = extractInlineImageUrl(p);
-    if (imageUrl) {
-      hasImages = true;
-      flushTextToMulti();
-      multiParts.push({ type: 'image_url', image_url: { url: imageUrl } });
-      continue;
-    }
-    const inline = p.inlineData || p.inline_data;
+
+    const inline = readInlinePart(p);
     if (inline) {
-      const mime = ('mimeType' in inline ? inline.mimeType : undefined) || ('mime_type' in inline ? inline.mime_type : undefined) || 'application/octet-stream';
-      textChunks.push(`[Inline data: ${mime}, length: ${(inline.data || '').length} chars]`);
+      const { mime, data } = inline;
+      if (mime.startsWith('image/')) {
+        hasMediaParts = true;
+        flushTextToMulti();
+        mediaParts.push({ type: 'image_url', image_url: { url: toDataUrl(mime, data) } });
+      } else if (mime === 'application/pdf') {
+        hasMediaParts = true;
+        pdfCounter += 1;
+        flushTextToMulti();
+        mediaParts.push({
+          type: 'file',
+          file: { filename: `document-${pdfCounter}.pdf`, file_data: toDataUrl('application/pdf', data) },
+        });
+      } else if (mime.startsWith('audio/')) {
+        const audioFormat = resolveOpenAIAudioFormat(mime);
+        if (audioFormat) {
+          hasMediaParts = true;
+          flushTextToMulti();
+          mediaParts.push({
+            type: 'input_audio',
+            input_audio: { data: stripDataUrlPrefix(data), format: audioFormat },
+          });
+        } else {
+          textChunks.push(`[Unsupported audio format for OpenAI Chat Completions (${mime}): supports wav and mp3]`);
+        }
+      } else if (mime.startsWith('video/')) {
+        textChunks.push(
+          `[Video attachment (${mime}) is not supported by OpenAI Chat Completions; switch to a Google Gemini model to inspect video]`,
+        );
+      } else if (mime.startsWith('text/') || TEXTUAL_INLINE_MIMES.has(mime)) {
+        const decodedText = Buffer.from(stripDataUrlPrefix(data), 'base64').toString('utf-8');
+        if (decodedText) textChunks.push(decodedText);
+      } else {
+        textChunks.push(`[Inline data: ${mime}, length: ${data.length} chars]`);
+      }
       continue;
     }
+
     const fd = p.fileData || p.file_data;
     if (fd) {
       const uri = ('fileUri' in fd ? fd.fileUri : undefined) || ('file_uri' in fd ? fd.file_uri : undefined) || '';
@@ -276,9 +336,9 @@ function buildOpenAIUserContent(parts: GeminiPart[]): string | OpenAIContentPart
     }
   }
 
-  if (hasImages) {
+  if (hasMediaParts) {
     flushTextToMulti();
-    return multiParts;
+    return mediaParts;
   }
   return textChunks.join('\n');
 }
