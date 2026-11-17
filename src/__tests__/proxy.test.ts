@@ -506,6 +506,55 @@ describe('image capability advertising and end-to-end fileData image delivery', 
             '[File content]:\n\nx = 42\n',
         },
       ]);
+
+      // Вложенные в functionResponse.parts (read_file) PDF и PNG также разрешаются и транслируются в OpenAI
+      const nestedToolBody: any = {
+        contents: [
+          { role: 'model', parts: [{ functionCall: { id: 'call_read', name: 'read_file', args: { Path: tmpPdf } } }] },
+          {
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  id: 'call_read',
+                  name: 'read_file',
+                  response: { output: 'Showing binary file of type application/pdf' },
+                  parts: [
+                    { fileData: { mimeType: 'application/pdf', fileUri: pathToFileURL(tmpPdf).toString() } },
+                    { fileData: { mimeType: 'image/png', fileUri: pathToFileURL(tmpPng).toString() } },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      };
+      await resolveFileData(nestedToolBody, {});
+      expect(nestedToolBody.contents[1].parts[0].functionResponse.parts[0]).toEqual({
+        inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') },
+      });
+      const nestedOpenAi = mapGeminiToOpenAI(nestedToolBody, 'gpt-6.1-sol');
+      expect(nestedOpenAi.messages[1]).toEqual({
+        role: 'tool',
+        tool_call_id: 'call_read',
+        content: '{"output":"Showing binary file of type application/pdf"}',
+      });
+      expect(nestedOpenAi.messages[2]).toEqual({
+        role: 'user',
+        content: [
+          {
+            type: 'file',
+            file: {
+              filename: 'document-1.pdf',
+              file_data: `data:application/pdf;base64,${pdfBytes.toString('base64')}`,
+            },
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:image/png;base64,${pngBytes.toString('base64')}` },
+          },
+        ],
+      });
     } finally {
       for (const f of [tmpPng, tmpPdf, tmpWav, tmpMp4, tmpPy]) {
         if (fs.existsSync(f)) fs.unlinkSync(f);

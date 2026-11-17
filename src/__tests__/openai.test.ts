@@ -335,6 +335,46 @@ describe('mapGeminiToOpenAI', () => {
     });
   });
 
+  it('should extract PDF, images and text nested inside functionResponse.parts (read_file)', () => {
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              functionResponse: {
+                id: 'call_pdf',
+                name: 'read_file',
+                response: { output: 'Showing binary file of type application/pdf' },
+                parts: [
+                  { inlineData: { mimeType: 'application/pdf', data: 'JVBERi0xLjU=' } },
+                  { text: '==Start of OCR==\nTable I' },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToOpenAI(body as any, 'gpt-6.1-sol');
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toEqual({
+      role: 'tool',
+      content: '{"output":"Showing binary file of type application/pdf"}',
+      tool_call_id: 'call_pdf',
+    });
+    expect(result.messages[1]).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'file',
+          file: { filename: 'document-1.pdf', file_data: 'data:application/pdf;base64,JVBERi0xLjU=' },
+        },
+        { type: 'text', text: '==Start of OCR==\nTable I' },
+      ],
+    });
+  });
+
   it('should map PDF, wav/mp3 input_audio, textual inlineData, and safely reject video base64 bloat', () => {
     const codeText = Buffer.from('print("hello")', 'utf-8').toString('base64');
     const body = {

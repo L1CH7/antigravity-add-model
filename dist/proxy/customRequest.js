@@ -88,6 +88,51 @@ function stopCustomRequests() {
     for (const controller of controllers)
         controller.abort();
 }
+function logOutboundPayloadSummary(displayName, format, payload, byteLen) {
+    if (format === 'openai') {
+        const msgs = Array.isArray(payload.messages) ? payload.messages : [];
+        const tally = {};
+        for (const msg of msgs) {
+            if (msg.role === 'tool') {
+                tally.tool = (tally.tool || 0) + 1;
+                continue;
+            }
+            if (Array.isArray(msg.content)) {
+                for (const part of msg.content) {
+                    const kind = part?.type || 'unknown';
+                    tally[kind] = (tally[kind] || 0) + 1;
+                }
+            }
+            else if (typeof msg.content === 'string' && msg.content) {
+                tally.text = (tally.text || 0) + 1;
+            }
+        }
+        electron_log_1.default.info(`[Proxy] Outbound "${displayName}" (${format}, msgs=${msgs.length}, parts=${JSON.stringify(tally)}, bytes=${byteLen ?? 0})`);
+        return;
+    }
+    const contents = Array.isArray(payload.contents)
+        ? payload.contents
+        : [];
+    const tally = {};
+    for (const item of contents) {
+        for (const part of item.parts || []) {
+            if (part.text)
+                tally.text = (tally.text || 0) + 1;
+            if (part.inlineData || part.inline_data)
+                tally.inlineData = (tally.inlineData || 0) + 1;
+            if (part.fileData || part.file_data)
+                tally.fileData = (tally.fileData || 0) + 1;
+            const fnResp = part.functionResponse;
+            if (fnResp) {
+                tally.functionResponse = (tally.functionResponse || 0) + 1;
+                if (Array.isArray(fnResp.parts) && fnResp.parts.length > 0) {
+                    tally.fnParts = (tally.fnParts || 0) + fnResp.parts.length;
+                }
+            }
+        }
+    }
+    electron_log_1.default.info(`[Proxy] Outbound "${displayName}" (${format}, contents=${contents.length}, parts=${JSON.stringify(tally)}, bytes=${byteLen ?? 0})`);
+}
 class UpstreamError extends Error {
     constructor(message, status = 502, retryable = true, retryAfter = 0, mayFallback = true) {
         super(message);
@@ -358,6 +403,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, cloud
                 if (!cloudCode) {
                     staticBodyBuffer = Buffer.from(JSON.stringify(basePayload), 'utf8');
                 }
+                logOutboundPayloadSummary(model.displayName, format, basePayload, staticBodyBuffer?.length);
             }
             catch (error) {
                 failure = new UpstreamError(`Invalid model configuration: ${error.message}`, 400, false, 0, false);

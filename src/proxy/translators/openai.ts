@@ -71,6 +71,7 @@ interface GeminiFunctionResponse {
   name: string;
   response: unknown;
   id?: string;
+  parts?: GeminiPart[];
 }
 
 interface GeminiRequestBody {
@@ -417,6 +418,20 @@ export function mapGeminiToOpenAI(
               const responseData = p.functionResponse.response;
               const contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
               messages.push({ role: 'tool', content: contentStr, tool_call_id: toolCallId });
+              if (Array.isArray(p.functionResponse.parts)) {
+                for (const nestedPart of p.functionResponse.parts) {
+                  if (
+                    !nestedPart.thought &&
+                    (nestedPart.text ||
+                      nestedPart.inlineData ||
+                      nestedPart.inline_data ||
+                      nestedPart.fileData ||
+                      nestedPart.file_data)
+                  ) {
+                    pendingToolResponseParts.push(nestedPart);
+                  }
+                }
+              }
             } else if (!p.thought && (p.text || p.inlineData || p.inline_data || p.fileData || p.file_data)) {
               pendingToolResponseParts.push(p);
             }

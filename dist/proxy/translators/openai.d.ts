@@ -59,6 +59,7 @@ interface GeminiFunctionResponse {
     name: string;
     response: unknown;
     id?: string;
+    parts?: GeminiPart[];
 }
 interface GeminiRequestBody {
     systemInstruction?: {

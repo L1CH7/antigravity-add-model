@@ -483,6 +483,52 @@ function fileUriToLocalPath(uri) {
     }
     return path.normalize(fp);
 }
+function collectFileDataTasks(parts, authHeader, tasks) {
+    for (let i = 0; i < parts.length; i++) {
+        const partIdx = i;
+        const p = parts[partIdx];
+        const fnResp = (p.functionResponse || p.function_response);
+        if (fnResp && Array.isArray(fnResp.parts)) {
+            collectFileDataTasks(fnResp.parts, authHeader, tasks);
+        }
+        const fd = (p.fileData || p.file_data);
+        const uri = fd?.fileUri || fd?.file_uri;
+        if (!uri)
+            continue;
+        const declaredMime = fd?.mimeType || fd?.mime_type;
+        tasks.push((async () => {
+            try {
+                let fileBuf = null;
+                let remoteContentType;
+                if (uri.startsWith('file://')) {
+                    const fp = fileUriToLocalPath(uri);
+                    fileBuf = await fs.promises.readFile(fp);
+                }
+                else if (authHeader && uri.startsWith('https://')) {
+                    const downloaded = await downloadFileBuffer(uri, authHeader);
+                    fileBuf = downloaded.buffer;
+                    remoteContentType = downloaded.contentType;
+                }
+                if (!fileBuf || fileBuf.length === 0)
+                    return;
+                const binaryMime = resolveBinaryAttachmentMime(declaredMime, uri, remoteContentType);
+                if (binaryMime) {
+                    parts[partIdx] = {
+                        inlineData: { mimeType: binaryMime, data: fileBuf.toString('base64') },
+                    };
+                }
+                else {
+                    parts[partIdx] = {
+                        text: '[File content]:\n\n' + fileBuf.toString('utf-8'),
+                    };
+                }
+            }
+            catch (e) {
+                electron_log_1.default.warn('[Proxy] File resolve failed:', e.message);
+            }
+        })());
+    }
+}
 async function resolveFileData(body, reqHeaders) {
     const contents = body.contents;
     if (!contents)
@@ -492,46 +538,7 @@ async function resolveFileData(body, reqHeaders) {
     for (const item of contents) {
         if (!item.parts)
             continue;
-        for (let i = 0; i < item.parts.length; i++) {
-            const partIdx = i;
-            const p = item.parts[partIdx];
-            const fd = (p.fileData || p.file_data);
-            const uri = fd?.fileUri || fd?.file_uri;
-            if (!uri)
-                continue;
-            const declaredMime = fd?.mimeType || fd?.mime_type;
-            tasks.push((async () => {
-                try {
-                    let fileBuf = null;
-                    let remoteContentType;
-                    if (uri.startsWith('file://')) {
-                        const fp = fileUriToLocalPath(uri);
-                        fileBuf = await fs.promises.readFile(fp);
-                    }
-                    else if (authHeader && uri.startsWith('https://')) {
-                        const downloaded = await downloadFileBuffer(uri, authHeader);
-                        fileBuf = downloaded.buffer;
-                        remoteContentType = downloaded.contentType;
-                    }
-                    if (!fileBuf || fileBuf.length === 0)
-                        return;
-                    const binaryMime = resolveBinaryAttachmentMime(declaredMime, uri, remoteContentType);
-                    if (binaryMime) {
-                        item.parts[partIdx] = {
-                            inlineData: { mimeType: binaryMime, data: fileBuf.toString('base64') },
-                        };
-                    }
-                    else {
-                        item.parts[partIdx] = {
-                            text: '[File content]:\n\n' + fileBuf.toString('utf-8'),
-                        };
-                    }
-                }
-                catch (e) {
-                    electron_log_1.default.warn('[Proxy] File resolve failed:', e.message);
-                }
-            })());
-        }
+        collectFileDataTasks(item.parts, authHeader, tasks);
     }
     if (tasks.length > 0) {
         await Promise.all(tasks);
