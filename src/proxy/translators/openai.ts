@@ -604,6 +604,75 @@ export function mapOpenAIToGemini(
 
 // ─── STREAM CHUNK: OpenAI → Gemini ────────────────────────────────────────
 
+function flushOpenAIContext(
+  context: { accumulatedText: string; accumulatedReasoning: string; toolCalls: Record<number, { id: string; name: string; arguments: string }> },
+  streamId: string,
+  modelName: string,
+  toolSchemas: ToolSchemas | undefined,
+  inlineReasoning: string,
+  upstreamFinishReason?: string,
+): GeminiCandidate {
+  saveModelReasoning(modelName, context.accumulatedReasoning);
+  const pendingToolCalls = Object.values(context.toolCalls).filter((tc) => Boolean(tc.name));
+  const remainingText = context.accumulatedText;
+  context.accumulatedText = '';
+  activeStreamContexts.delete(streamId);
+
+  const isToolFinish =
+    pendingToolCalls.length > 0 ||
+    upstreamFinishReason === 'tool_calls' ||
+    upstreamFinishReason === 'tool_call' ||
+    upstreamFinishReason === 'function_call';
+
+  if (isToolFinish) {
+    const parts: GeminiPart[] = pendingToolCalls.map((tc) =>
+      buildGeminiToolCallPart(tc.name, tc.arguments, tc.id, modelName, toolSchemas),
+    );
+    if (remainingText) parts.unshift({ text: remainingText });
+    if (inlineReasoning) parts.unshift({ text: inlineReasoning, thought: true });
+    return { content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 };
+  }
+
+  const parts: GeminiPart[] = [];
+  if (inlineReasoning) parts.push({ text: inlineReasoning, thought: true });
+  if (remainingText) parts.push({ text: remainingText });
+  return { content: { parts, role: 'model' }, finishReason: 'STOP', index: 0 };
+}
+
+/**
+ * Дожимает оставшиеся в буфере SSE-стрима toolCalls, DSML-теги или текст,
+ * если апстрим закрыл поток по [DONE]/EOF без финального finish_reason.
+ */
+export function flushOpenAIStreamRemainder(
+  streamKey: string,
+  modelName: string,
+  toolSchemas?: ToolSchemas,
+): GeminiCandidate | null {
+  const context = activeStreamContexts.get(streamKey);
+  if (!context) return null;
+
+  const dsml = parseDSMLToolCalls(context.accumulatedText);
+  if (dsml && dsml.functionCalls.length > 0) {
+    const parts: GeminiPart[] = dsml.functionCalls.map((fc) =>
+      buildGeminiToolCallPart(fc.name, fc.args, undefined, modelName, toolSchemas),
+    );
+    if (dsml.cleanText) parts.unshift({ text: dsml.cleanText });
+    context.accumulatedText = '';
+    saveModelReasoning(modelName, context.accumulatedReasoning);
+    activeStreamContexts.delete(streamKey);
+    return { content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 };
+  }
+
+  const hasToolCalls = Object.values(context.toolCalls).some((tc) => Boolean(tc.name));
+  if (!hasToolCalls && !context.accumulatedText) {
+    saveModelReasoning(modelName, context.accumulatedReasoning);
+    activeStreamContexts.delete(streamKey);
+    return null;
+  }
+
+  return flushOpenAIContext(context, streamKey, modelName, toolSchemas, '');
+}
+
 export function mapOpenAIChunkToGemini(
   chunk: OpenAIResponse,
   modelName: string,
@@ -652,34 +721,8 @@ export function mapOpenAIChunkToGemini(
   }
 
   const finishReason = choice.finish_reason;
-  if (finishReason === 'stop' || finishReason === 'length') {
-    saveModelReasoning(modelName, context.accumulatedReasoning);
-    const pendingToolCalls = Object.values(context.toolCalls).filter((tc) => Boolean(tc.name));
-    if (pendingToolCalls.length > 0) {
-      const parts: GeminiPart[] = pendingToolCalls.map((tc) =>
-        buildGeminiToolCallPart(tc.name, tc.arguments, tc.id, modelName, toolSchemas),
-      );
-      if (reasoning) parts.unshift({ text: reasoning, thought: true });
-      activeStreamContexts.delete(streamId);
-      return { content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 };
-    }
-    const remainingText = context.accumulatedText;
-    context.accumulatedText = '';
-    activeStreamContexts.delete(streamId);
-    const parts: GeminiPart[] = [];
-    if (reasoning) parts.push({ text: reasoning, thought: true });
-    if (remainingText) parts.push({ text: remainingText });
-    return { content: { parts, role: 'model' }, finishReason: 'STOP', index: 0 };
-  }
-
-  if (finishReason === 'tool_calls') {
-    saveModelReasoning(modelName, context.accumulatedReasoning);
-    const parts: GeminiPart[] = Object.values(context.toolCalls).map((tc) =>
-      buildGeminiToolCallPart(tc.name, tc.arguments, tc.id, modelName, toolSchemas),
-    );
-    if (reasoning) parts.unshift({ text: reasoning, thought: true });
-    activeStreamContexts.delete(streamId);
-    return { content: { parts, role: 'model' }, finishReason: 'TOOL_CALL', index: 0 };
+  if (finishReason) {
+    return flushOpenAIContext(context, streamId, modelName, toolSchemas, reasoning, finishReason);
   }
 
   const streamParts: GeminiPart[] = [];

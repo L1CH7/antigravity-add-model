@@ -59,6 +59,20 @@ export function translateStreamChunk(
   return openai.mapOpenAIChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas);
 }
 
+export function flushStreamRemainder(
+  provider: string,
+  apiFormat: ApiFormat | undefined,
+  streamKey: string,
+  stateKey: string,
+  toolSchemas?: ToolSchemas,
+): unknown {
+  const format = resolveApiFormat(provider, apiFormat);
+  if (format === 'openai') {
+    return openai.flushOpenAIStreamRemainder(streamKey, stateKey, toolSchemas);
+  }
+  return null;
+}
+
 export function getProviderHeaders(provider: string, apiKey = '', apiFormat?: ApiFormat): ProviderHeaders {
   const headers: ProviderHeaders = { 'Content-Type': 'application/json' };
   const format = resolveApiFormat(provider, apiFormat);

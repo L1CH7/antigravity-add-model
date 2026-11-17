@@ -3,7 +3,12 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import * as shared from '../proxy/shared';
-import { mapGeminiToOpenAI, mapOpenAIToGemini, mapOpenAIChunkToGemini } from '../proxy/translators/openai';
+import {
+  flushOpenAIStreamRemainder,
+  mapGeminiToOpenAI,
+  mapOpenAIToGemini,
+  mapOpenAIChunkToGemini,
+} from '../proxy/translators/openai';
 
 const toolArgumentCases: Array<{
   name: string;
@@ -949,5 +954,65 @@ describe('mapOpenAIChunkToGemini', () => {
     expect(done?.content.parts).toEqual([
       { functionCall: { name: 'list_tabs', args: {}, id: 'call_zero_1' } },
     ]);
+  });
+
+  it('flushes buffered toolCalls on stream EOF when upstream omits finish_reason and handles singular tool_call', () => {
+    mapOpenAIChunkToGemini(
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                { index: 0, id: 'call_ask_1', function: { name: 'ask_question', arguments: '{"questions":[' } },
+              ],
+            },
+          },
+        ],
+      },
+      'gpt-6.1-sol',
+      'eof-tool-stream',
+    );
+    mapOpenAIChunkToGemini(
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [{ index: 0, function: { arguments: '{"question":"Pick one","options":["A","B"]}]}' } }],
+            },
+          },
+        ],
+      },
+      'gpt-6.1-sol',
+      'eof-tool-stream',
+    );
+    const flushed = flushOpenAIStreamRemainder('eof-tool-stream', 'gpt-6.1-sol');
+    expect(flushed?.finishReason).toBe('TOOL_CALL');
+    expect(flushed?.content.parts).toEqual([
+      {
+        functionCall: {
+          name: 'ask_question',
+          args: { questions: [{ question: 'Pick one', options: ['A', 'B'] }] },
+          id: 'call_ask_1',
+        },
+      },
+    ]);
+    expect(flushOpenAIStreamRemainder('eof-tool-stream', 'gpt-6.1-sol')).toBeNull();
+
+    mapOpenAIChunkToGemini(
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [{ index: 0, id: 'call_sing_1', function: { name: 'ping', arguments: '{}' } }],
+            },
+            finish_reason: 'tool_call',
+          },
+        ],
+      },
+      'gpt-6.1-sol',
+      'singular-tool-stream',
+    );
+    // Ensure flushOpenAIStreamRemainder also handles empty context cleanly after singular finish_reason
+    expect(flushOpenAIStreamRemainder('singular-tool-stream', 'gpt-6.1-sol')).toBeNull();
   });
 });

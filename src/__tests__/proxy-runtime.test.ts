@@ -913,4 +913,82 @@ describe('provider and configuration contracts', () => {
     );
     expect(chunk?.finishReason).toBe('OTHER');
   });
+
+  it('recovers buffered OpenAI tool calls when upstream sends choices:[] usage and [DONE] without finish_reason', async () => {
+    const upstream = await serve((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            id: 'cmpl-eof-tc',
+            choices: [{ index: 0, delta: { content: 'Выберите варианты ниже' }, finish_reason: null }],
+          }) +
+          '\n\n',
+      );
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            id: 'cmpl-eof-tc',
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_ask_eof',
+                      function: { name: 'ask_question', arguments: '{"questions":[{"question":"Q1","options":["A"]}]}' },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          }) +
+          '\n\n',
+      );
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            id: 'cmpl-eof-tc',
+            choices: [],
+            usage: { prompt_tokens: 100, completion_tokens: 45, total_tokens: 145 },
+          }) +
+          '\n\n',
+      );
+      res.end('data: [DONE]\n\n');
+    });
+
+    const configured = model(upstream, { provider: 'openai', contextWindow: 700_000 });
+    const url = await serve(async (req, res) => {
+      const request = await body(req);
+      void runCustomModelRequest(res, configured, request, true, false);
+    });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+    });
+    expect(res.status).toBe(200);
+    const events = (await res.text())
+      .split('\n\n')
+      .filter((chunk) => chunk.startsWith('data: '))
+      .map((chunk) => JSON.parse(chunk.slice(6)));
+    const toolEvent = events.find((e) => e.candidates?.[0]?.finishReason === 'TOOL_CALL');
+    expect(toolEvent).toBeDefined();
+    expect(toolEvent.candidates[0].content.parts).toEqual([
+      {
+        functionCall: {
+          name: 'ask_question',
+          args: { questions: [{ question: 'Q1', options: ['A'] }] },
+          id: 'call_ask_eof',
+        },
+      },
+    ]);
+    expect(toolEvent.usageMetadata).toEqual({
+      promptTokenCount: 100,
+      candidatesTokenCount: 45,
+      totalTokenCount: 145,
+    });
+  });
 });

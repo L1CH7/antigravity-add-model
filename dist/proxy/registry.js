@@ -37,6 +37,7 @@ exports.getTranslator = getTranslator;
 exports.translateRequest = translateRequest;
 exports.translateResponse = translateResponse;
 exports.translateStreamChunk = translateStreamChunk;
+exports.flushStreamRemainder = flushStreamRemainder;
 exports.getProviderHeaders = getProviderHeaders;
 exports.supportsStreaming = supportsStreaming;
 exports.getProviderUrl = getProviderUrl;
@@ -72,6 +73,13 @@ function translateStreamChunk(provider, chunk, stateKey, apiFormat, streamKey, t
     if (format === 'anthropic')
         return anthropic.mapAnthropicChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
     return openai.mapOpenAIChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
+}
+function flushStreamRemainder(provider, apiFormat, streamKey, stateKey, toolSchemas) {
+    const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
+    if (format === 'openai') {
+        return openai.flushOpenAIStreamRemainder(streamKey, stateKey, toolSchemas);
+    }
+    return null;
 }
 function getProviderHeaders(provider, apiKey = '', apiFormat) {
     const headers = { 'Content-Type': 'application/json' };

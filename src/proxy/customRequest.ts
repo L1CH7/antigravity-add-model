@@ -11,6 +11,13 @@ import { applyRequestOptions, GeminiBody, parseRetryAfter, trimContext } from '.
 import { DEFAULT_MAX_OUTPUT_TOKENS } from './modelUtils';
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
 import { collectToolSchemas } from './translators/utils';
+import {
+  sanitizeTraceHeaders,
+  sanitizeTracePayload,
+  startTraceCleanup,
+  stopTraceCleanup,
+  writeTraceEvent,
+} from './traceLog';
 import log from 'electron-log';
 
 const keepAliveHttpAgent = new http.Agent({
@@ -47,7 +54,62 @@ export function getProxyMetrics() {
   return { ...counts, circuits: circuits.snapshot() };
 }
 export function stopCustomRequests(): void {
+  stopTraceCleanup();
   for (const controller of controllers) controller.abort();
+}
+
+interface ResponseTraceAcc {
+  text: string;
+  reasoning: string;
+  tools: Array<{ name: string; id?: string; args: unknown; argsBytes: number }>;
+  emittedFinishReasons: string[];
+}
+
+function createResponseTraceAcc(): ResponseTraceAcc {
+  return { text: '', reasoning: '', tools: [], emittedFinishReasons: [] };
+}
+
+function recordTraceCandidate(candidate: unknown, acc: ResponseTraceAcc): void {
+  if (!candidate || typeof candidate !== 'object') return;
+  const c = candidate as {
+    finishReason?: string;
+    content?: { parts?: Array<{ text?: string; thought?: boolean; functionCall?: { name?: string; id?: string; args?: unknown } }> };
+  };
+  if (c.finishReason && !acc.emittedFinishReasons.includes(c.finishReason)) {
+    acc.emittedFinishReasons.push(c.finishReason);
+  }
+  for (const part of c.content?.parts || []) {
+    if (typeof part.text === 'string') {
+      if (part.thought) acc.reasoning += part.text;
+      else acc.text += part.text;
+    }
+    if (part.functionCall?.name) {
+      let argsBytes = 0;
+      try {
+        argsBytes = Buffer.byteLength(JSON.stringify(part.functionCall.args ?? {}), 'utf8');
+      } catch {
+        argsBytes = 0;
+      }
+      acc.tools.push({
+        name: part.functionCall.name,
+        id: part.functionCall.id,
+        args: part.functionCall.args ?? {},
+        argsBytes,
+      });
+    }
+  }
+}
+
+function snapshotBufferedContext(streamKey: string): Record<string, unknown> | null {
+  const ctx = activeStreamContexts.get(streamKey);
+  if (!ctx) return null;
+  const pendingTools = Object.values(ctx.toolCalls || {}).filter((t) => Boolean(t.name || t.arguments));
+  if (!ctx.accumulatedText && !ctx.accumulatedReasoning && pendingTools.length === 0) return null;
+  return {
+    accumulatedText: ctx.accumulatedText,
+    accumulatedReasoning: ctx.accumulatedReasoning,
+    toolCalls: pendingTools,
+  };
 }
 
 function logOutboundPayloadSummary(
@@ -273,6 +335,7 @@ export async function runCustomModelRequest(
   cloudEnvelope = true,
 ): Promise<void> {
   const toolSchemas = collectToolSchemas(originalBody);
+  startTraceCleanup();
   const controller = new AbortController();
   const { signal } = controller;
   const requestId = randomUUID();
@@ -413,6 +476,14 @@ export async function runCustomModelRequest(
       for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
         const streamKey = randomUUID();
         const attemptStart = Date.now();
+        const traceAcc = createResponseTraceAcc();
+        const rawFinishReasons: string[] = [];
+        let rawUsage: unknown = undefined;
+        let recoveredRemainder = false;
+        let receivedChunks = 0;
+        let receivedBytes = 0;
+        let firstContentAt = 0;
+        let firstReasoningAt = 0;
         let request: http.ClientRequest | undefined;
         let accountLease: GoogleAccountLease | undefined;
         let totalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -425,6 +496,7 @@ export async function runCustomModelRequest(
           let url = baseUrl;
           let headers: registry.ProviderHeaders = baseHeaders;
           let bodyBuffer = staticBodyBuffer;
+          let tracePayloadObj: unknown = basePayload;
           if (cloudCode) {
             const identity = originalBody.sessionId || originalBody.conversationId;
             accountLease = await acquireGoogleAccount(
@@ -443,8 +515,24 @@ export async function runCustomModelRequest(
             }
             const project = accountLease.account.project || model.googleProject;
             const envelopePayload = { model: externalName, ...(project ? { project } : {}), request: basePayload };
+            tracePayloadObj = envelopePayload;
             bodyBuffer = Buffer.from(JSON.stringify(envelopePayload), 'utf8');
           }
+          writeTraceEvent({
+            phase: 'request',
+            requestId,
+            conversationKey,
+            model: model.name,
+            externalModel: externalName,
+            displayName: model.displayName,
+            provider: model.provider,
+            format,
+            attempt: attempt + 1,
+            stream: isStream,
+            url: url.toString(),
+            headers: sanitizeTraceHeaders(headers),
+            payload: sanitizeTracePayload(tracePayloadObj),
+          });
           counts.upstreamAttempts += 1;
           const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
             request = (url.protocol === 'https:' ? https : http).request(
@@ -518,18 +606,19 @@ export async function runCustomModelRequest(
             const pendingWhitespace: Array<{ candidate: unknown; meta?: Record<string, unknown> }> = [];
             let finalReason = false;
             let terminal = false;
-            let receivedChunks = 0;
-            let receivedBytes = 0;
-            let firstContentAt = 0;
-            let firstReasoningAt = 0;
             let pendingMeta: Record<string, unknown> | null = null;
             let usageEmitted = false;
+
+            const emitCandidate = (candidate: unknown, meta?: Record<string, unknown>) => {
+              recordTraceCandidate(candidate, traceAcc);
+              writeCandidate(candidate, meta);
+            };
 
             const flushWhitespace = () => {
               while (pendingWhitespace.length > 0) {
                 const item = pendingWhitespace.shift()!;
                 if (item.meta?.usageMetadata) usageEmitted = true;
-                writeCandidate(item.candidate, item.meta);
+                emitCandidate(item.candidate, item.meta);
               }
             };
 
@@ -591,6 +680,9 @@ export async function runCustomModelRequest(
                 if (!firstReasoningAt) firstReasoningAt = Date.now() - attemptStart;
               }
               const chunkMeta = extractChunkMetadata(chunk, format);
+              if (chunk.usage || chunk.usageMetadata || chunk.message?.usage) {
+                rawUsage = chunk.usage ?? chunk.usageMetadata ?? chunk.message?.usage;
+              }
               if (chunkMeta.usageMetadata) {
                 pendingMeta = chunkMeta;
               }
@@ -612,6 +704,15 @@ export async function runCustomModelRequest(
               )
                 upstreamOutput = true;
               const candidateFinishReason = chunk.candidates?.[0]?.finishReason;
+              const upstreamFinish =
+                chunk.choices?.[0]?.finish_reason ||
+                (chunk.type === 'message_delta' ? chunk.delta?.stop_reason : undefined) ||
+                (candidateFinishReason && candidateFinishReason !== 'FINISH_REASON_UNSPECIFIED'
+                  ? candidateFinishReason
+                  : undefined);
+              if (upstreamFinish && !rawFinishReasons.includes(String(upstreamFinish))) {
+                rawFinishReasons.push(String(upstreamFinish));
+              }
               if (
                 chunk.type === 'message_stop' ||
                 chunk.choices?.[0]?.finish_reason ||
@@ -667,7 +768,7 @@ export async function runCustomModelRequest(
                   // A role-only or empty completion must not commit headers and prevent fallback.
                   if (emitted && hasSubstantiveOutput) {
                     if (emitMeta?.usageMetadata) usageEmitted = true;
-                    writeCandidate(mapped, emitMeta);
+                    emitCandidate(mapped, emitMeta);
                   }
                 }
               } else if (pendingMeta?.usageMetadata && res.headersSent && terminal) {
@@ -704,6 +805,34 @@ export async function runCustomModelRequest(
               clearInterval(heartbeatTimer);
               heartbeatTimer = undefined;
             }
+            if (!finalReason) {
+              const remainder = registry.flushStreamRemainder(
+                model.provider,
+                model.apiFormat,
+                streamKey,
+                conversationKey,
+                toolSchemas,
+              ) as { content?: { parts?: Array<{ text?: string; thought?: boolean; functionCall?: { args?: unknown } }> }; finishReason?: string } | null;
+              if (remainder) {
+                for (const part of remainder.content?.parts || []) {
+                  if (part.functionCall) validateToolArguments(part.functionCall.args);
+                }
+                recoveredRemainder = true;
+                emitted = true;
+                hasVisibleContent = true;
+                hasSubstantiveOutput = true;
+                upstreamOutput = true;
+                finalReason = true;
+                if (!firstContentAt) firstContentAt = Date.now() - attemptStart;
+                flushWhitespace();
+                const tailMeta = !usageEmitted && pendingMeta ? pendingMeta : undefined;
+                if (tailMeta?.usageMetadata) usageEmitted = true;
+                emitCandidate(remainder, tailMeta);
+                log.warn(
+                  `[Proxy] Flushed buffered stream remainder at end of SSE for "${model.displayName}" (upstreamFinish=${JSON.stringify(rawFinishReasons)})`,
+                );
+              }
+            }
             if (!emitted) throw new UpstreamError('Upstream returned an empty stream.');
             if (!terminal) throw new UpstreamError('Upstream stream ended before completion.', 502, false);
             if (!hasVisibleContent && !finalReason) {
@@ -720,11 +849,42 @@ export async function runCustomModelRequest(
             if (!finalReason) {
               const tailMeta = !usageEmitted && pendingMeta ? pendingMeta : undefined;
               if (tailMeta?.usageMetadata) usageEmitted = true;
-              writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 }, tailMeta);
+              emitCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 }, tailMeta);
             } else if (!usageEmitted && pendingMeta?.usageMetadata && res.headersSent) {
               usageEmitted = true;
               writeStreamPayload({ candidates: [], ...pendingMeta });
             }
+            const leftoverBuffer = snapshotBufferedContext(streamKey);
+            const completedDurationMs = Date.now() - attemptStart;
+            const toolSummary = traceAcc.tools.map((t) => `${t.name}(${t.argsBytes}b)`);
+            log.info(
+              `[Proxy] Completed "${model.displayName}" (${format}, status=200, dur=${completedDurationMs}ms, chunks=${receivedChunks}, bytes=${receivedBytes}, upstreamFinish=${JSON.stringify(rawFinishReasons)}, emittedFinish=${JSON.stringify(traceAcc.emittedFinishReasons)}, tools=${JSON.stringify(toolSummary)}, usage=${JSON.stringify(rawUsage ?? pendingMeta?.usageMetadata ?? null)})`,
+            );
+            writeTraceEvent({
+              phase: 'stream_end',
+              requestId,
+              conversationKey,
+              model: model.name,
+              displayName: model.displayName,
+              provider: model.provider,
+              format,
+              attempt: attempt + 1,
+              status,
+              durationMs: completedDurationMs,
+              firstReasoningAtMs: firstReasoningAt || null,
+              firstContentAtMs: firstContentAt || null,
+              receivedChunks,
+              receivedBytes,
+              recoveredRemainder,
+              rawFinishReasons,
+              emittedFinishReasons: traceAcc.emittedFinishReasons,
+              text: traceAcc.text,
+              reasoning: traceAcc.reasoning,
+              tools: traceAcc.tools,
+              usageMetadata: pendingMeta?.usageMetadata ?? null,
+              rawUsage: rawUsage ?? null,
+              leftoverBuffer,
+            });
           } else {
             let size = 0;
             const chunks: Buffer[] = [];
@@ -770,10 +930,42 @@ export async function runCustomModelRequest(
               for (const tool of parsed.choices[0].message.tool_calls) validateToolArguments(tool.function?.arguments);
             }
             // Some compatible endpoints return a complete JSON response even when stream=true.
+            const nonStreamFinish =
+              parsed.choices?.[0]?.finish_reason ||
+              parsed.stop_reason ||
+              parsed.candidates?.[0]?.finishReason;
+            if (nonStreamFinish) rawFinishReasons.push(String(nonStreamFinish));
+            rawUsage = parsed.usage ?? parsed.usageMetadata;
             const mapped = registry.translateResponse(model.provider, parsed, conversationKey, format, toolSchemas) as {
               candidates?: unknown[];
+              usageMetadata?: unknown;
             };
             if (!mapped?.candidates?.length) throw new UpstreamError('Upstream returned no candidates.');
+            for (const candidate of mapped.candidates) recordTraceCandidate(candidate, traceAcc);
+            const respDurationMs = Date.now() - attemptStart;
+            const toolSummary = traceAcc.tools.map((t) => `${t.name}(${t.argsBytes}b)`);
+            log.info(
+              `[Proxy] Completed "${model.displayName}" (${format}, status=200, nonStream=true, dur=${respDurationMs}ms, upstreamFinish=${JSON.stringify(rawFinishReasons)}, emittedFinish=${JSON.stringify(traceAcc.emittedFinishReasons)}, tools=${JSON.stringify(toolSummary)}, usage=${JSON.stringify(rawUsage ?? mapped.usageMetadata ?? null)})`,
+            );
+            writeTraceEvent({
+              phase: 'response',
+              requestId,
+              conversationKey,
+              model: model.name,
+              displayName: model.displayName,
+              provider: model.provider,
+              format,
+              attempt: attempt + 1,
+              status,
+              durationMs: respDurationMs,
+              rawFinishReasons,
+              emittedFinishReasons: traceAcc.emittedFinishReasons,
+              text: traceAcc.text,
+              reasoning: traceAcc.reasoning,
+              tools: traceAcc.tools,
+              usageMetadata: mapped.usageMetadata ?? null,
+              rawUsage: rawUsage ?? null,
+            });
             if (isStream) {
               for (const candidate of mapped.candidates) writeCandidate(candidate);
             } else {
@@ -789,6 +981,28 @@ export async function runCustomModelRequest(
           return;
         } catch (error) {
           failure = asUpstreamError(error);
+          writeTraceEvent({
+            phase: 'error',
+            requestId,
+            conversationKey,
+            model: model.name,
+            displayName: model.displayName,
+            provider: model.provider,
+            format,
+            attempt: attempt + 1,
+            status: failure.status,
+            upstreamStatus: failure.upstreamStatus ?? null,
+            durationMs: Date.now() - attemptStart,
+            receivedChunks,
+            receivedBytes,
+            rawFinishReasons,
+            errorMessage: failure.message,
+            upstreamBody: failure.upstreamBody ?? null,
+            partialText: traceAcc.text || null,
+            partialReasoning: traceAcc.reasoning || null,
+            partialTools: traceAcc.tools,
+            leftoverBuffer: snapshotBufferedContext(streamKey),
+          });
           log.warn(
             `[Proxy] Request attempt ${attempt + 1}/${attemptsAllowed + 1} for "${model.displayName}" failed after ${Date.now() - attemptStart}ms: ${failure.message}`,
           );

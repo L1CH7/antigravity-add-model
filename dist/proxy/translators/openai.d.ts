@@ -174,6 +174,11 @@ declare function mapGeminiToolsToOpenAI(geminiTools: GeminiTool[]): OpenAITool[]
 export declare function usesMaxCompletionTokens(modelName: string): boolean;
 export declare function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: string, stateKey?: string): OpenAIRequestBody;
 export declare function mapOpenAIToGemini(openAiRes: OpenAIResponse, modelName: string, toolSchemas?: ToolSchemas): GeminiGenerateContentResponse;
+/**
+ * Дожимает оставшиеся в буфере SSE-стрима toolCalls, DSML-теги или текст,
+ * если апстрим закрыл поток по [DONE]/EOF без финального finish_reason.
+ */
+export declare function flushOpenAIStreamRemainder(streamKey: string, modelName: string, toolSchemas?: ToolSchemas): GeminiCandidate | null;
 export declare function mapOpenAIChunkToGemini(chunk: OpenAIResponse, modelName: string, streamKey?: string, toolSchemas?: ToolSchemas): GeminiCandidate | null;
 export { mapGeminiToolsToOpenAI };
 //# sourceMappingURL=openai.d.ts.map
