@@ -124,6 +124,31 @@ function recordTraceCandidate(candidate, acc) {
         }
     }
 }
+function findEmptyRequiredToolCall(candidates, toolSchemas) {
+    if (!toolSchemas || toolSchemas.size === 0)
+        return null;
+    for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== 'object')
+            continue;
+        const parts = candidate.content?.parts;
+        for (const part of parts || []) {
+            const fnName = part.functionCall?.name;
+            if (!fnName)
+                continue;
+            const schema = toolSchemas.get(fnName);
+            const req = Array.isArray(schema?.required)
+                ? schema.required.filter((k) => typeof k === 'string')
+                : [];
+            if (req.length === 0)
+                continue;
+            const args = part.functionCall?.args;
+            if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).length === 0) {
+                return { name: fnName, missing: req };
+            }
+        }
+    }
+    return null;
+}
 function snapshotBufferedContext(streamKey) {
     const ctx = shared_1.activeStreamContexts.get(streamKey);
     if (!ctx)
@@ -503,7 +528,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, cloud
                         tracePayloadObj = envelopePayload;
                         bodyBuffer = Buffer.from(JSON.stringify(envelopePayload), 'utf8');
                     }
-                    (0, traceLog_1.writeTraceEvent)({
+                    const traceRequestEvent = {
                         phase: 'request',
                         requestId,
                         conversationKey,
@@ -516,8 +541,9 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, cloud
                         stream: isStream,
                         url: url.toString(),
                         headers: (0, traceLog_1.sanitizeTraceHeaders)(headers),
-                        payload: (0, traceLog_1.sanitizeTracePayload)(tracePayloadObj),
-                    });
+                        payload: tracePayloadObj,
+                    };
+                    setImmediate(() => (0, traceLog_1.writeTraceEvent)(traceRequestEvent));
                     counts.upstreamAttempts += 1;
                     const upstream = await new Promise((resolve, reject) => {
                         request = (url.protocol === 'https:' ? https : http).request(url, {
@@ -687,6 +713,14 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, cloud
                             }
                             const mapped = registry.translateStreamChunk(model.provider, chunk, conversationKey, format, streamKey, toolSchemas);
                             if (mapped) {
+                                const emptyReqTool = findEmptyRequiredToolCall([mapped], toolSchemas);
+                                if (emptyReqTool) {
+                                    electron_log_1.default.warn(`[Proxy] Upstream "${model.displayName}" returned empty arguments "{}" for tool "${emptyReqTool.name}" (required: ${emptyReqTool.missing.join(', ')})`);
+                                    if (!res.headersSent && attempt < retries) {
+                                        upstreamOutput = false;
+                                        throw new UpstreamError(`Upstream returned empty arguments for tool "${emptyReqTool.name}".`, 502, true);
+                                    }
+                                }
                                 const isTerminalFinish = Boolean(mapped.finishReason &&
                                     mapped.finishReason !== 'OTHER' &&
                                     mapped.finishReason !== 'FINISH_REASON_UNSPECIFIED');
@@ -766,6 +800,14 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, cloud
                                 for (const part of remainder.content?.parts || []) {
                                     if (part.functionCall)
                                         validateToolArguments(part.functionCall.args);
+                                }
+                                const emptyReqTool = findEmptyRequiredToolCall([remainder], toolSchemas);
+                                if (emptyReqTool) {
+                                    electron_log_1.default.warn(`[Proxy] Upstream "${model.displayName}" returned empty arguments "{}" for tool "${emptyReqTool.name}" (required: ${emptyReqTool.missing.join(', ')})`);
+                                    if (!res.headersSent && attempt < retries) {
+                                        upstreamOutput = false;
+                                        throw new UpstreamError(`Upstream returned empty arguments for tool "${emptyReqTool.name}".`, 502, true);
+                                    }
                                 }
                                 recoveredRemainder = true;
                                 emitted = true;
@@ -886,6 +928,14 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, cloud
                         const mapped = registry.translateResponse(model.provider, parsed, conversationKey, format, toolSchemas);
                         if (!mapped?.candidates?.length)
                             throw new UpstreamError('Upstream returned no candidates.');
+                        const emptyReqTool = findEmptyRequiredToolCall(mapped.candidates, toolSchemas);
+                        if (emptyReqTool) {
+                            electron_log_1.default.warn(`[Proxy] Upstream "${model.displayName}" returned empty arguments "{}" for tool "${emptyReqTool.name}" (required: ${emptyReqTool.missing.join(', ')})`);
+                            if (!res.headersSent && attempt < retries) {
+                                upstreamOutput = false;
+                                throw new UpstreamError(`Upstream returned empty arguments for tool "${emptyReqTool.name}".`, 502, true);
+                            }
+                        }
                         for (const candidate of mapped.candidates)
                             recordTraceCandidate(candidate, traceAcc);
                         const respDurationMs = Date.now() - attemptStart;

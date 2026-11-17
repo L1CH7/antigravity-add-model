@@ -991,4 +991,64 @@ describe('provider and configuration contracts', () => {
       totalTokenCount: 145,
     });
   });
+
+  it('retries when upstream returns empty arguments for a tool with required schema fields before headers commit', async () => {
+    let attempts = 0;
+    const upstream = await serve((_req, res) => {
+      attempts += 1;
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      const args = attempts === 1 ? '{}' : '{"Path":"/tmp/demo.txt"}';
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            id: `cmpl-retry-${attempts}`,
+            choices: [
+              {
+                index: 0,
+                delta: { tool_calls: [{ index: 0, id: 'call_r1', function: { name: 'read_file', arguments: args } }] },
+                finish_reason: null,
+              },
+            ],
+          }) +
+          '\n\n',
+      );
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            id: `cmpl-retry-${attempts}`,
+            choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          }) +
+          '\n\n',
+      );
+      res.end('data: [DONE]\n\n');
+    });
+
+    const configured = model(upstream, { provider: 'openai', contextWindow: 700_000, maxRetries: 1 });
+    const url = await serve(async (req, res) => {
+      const request = await body(req);
+      void runCustomModelRequest(res, configured, request, true, false);
+    });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: 'read it' }] }],
+        tools: [
+          {
+            functionDeclarations: [
+              { name: 'read_file', parameters: { type: 'object', properties: { Path: { type: 'string' } }, required: ['Path'] } },
+            ],
+          },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(attempts).toBe(2);
+    const events = (await res.text())
+      .split('\n\n')
+      .filter((chunk) => chunk.startsWith('data: '))
+      .map((chunk) => JSON.parse(chunk.slice(6)));
+    const toolEvent = events.find((e) => e.candidates?.[0]?.finishReason === 'TOOL_CALL');
+    expect(toolEvent.candidates[0].content.parts[0].functionCall.args).toEqual({ Path: '/tmp/demo.txt' });
+  });
 });

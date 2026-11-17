@@ -1,18 +1,22 @@
 /**
  * Суточное трассировочное логирование запросов и ответов прокси в формате JSONL.
  * Хранит полные тексты, мысли, вызовы инструментов и диагностику без обрезки,
- * маскируя лишь середину секретов в заголовках и заменяя длинные base64-блобы на метаданные.
+ * убирая повторную запись неизменного префикса истории/инструментов в наглядном виде
+ * и сжимая завершённые суточные файлы через zstd.
  */
 
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as zlib from 'zlib';
+import { pipeline } from 'stream/promises';
 import { createHash } from 'crypto';
 
 export const TRACE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const TRACE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
-const TRACE_FILE_PATTERN = /^trace-(\d{4}-\d{2}-\d{2})\.jsonl$/;
+const TRACE_FILE_PATTERN = /^trace-(\d{4}-\d{2}-\d{2})\.jsonl(\.zst)?$/;
 const BASE64_OMIT_THRESHOLD = 256;
+const MAX_CONVO_SNAPSHOTS = 128;
 
 const SENSITIVE_HEADERS = new Set([
   'authorization',
@@ -28,10 +32,50 @@ export interface TraceWriteOptions {
   dir?: string;
   now?: number;
   retentionMs?: number;
+  sanitizePayload?: boolean;
+}
+
+interface ConversationTraceSnapshot {
+  requestId: string;
+  toolsAnchorId?: string;
+  toolsRaw?: string;
+  systemAnchorId?: string;
+  systemRaw?: string;
+  itemsAnchorId?: string;
+  itemsRaw?: string[];
 }
 
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 let lastCleanupAt = 0;
+let writeQueue: Promise<void> = Promise.resolve();
+const ensuredDirs = new Set<string>();
+const convoSnapshots = new Map<string, ConversationTraceSnapshot>();
+
+function enqueueTraceTask<T>(task: () => Promise<T>): Promise<T> {
+  const next = writeQueue.then(task, task);
+  writeQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+/** Ожидает завершения всех поставленных в очередь операций записи и сжатия trace-логов. */
+export function flushTraceWrites(): Promise<void> {
+  return writeQueue;
+}
+
+/** Сбрасывает кэш снимков диалогов и каталогов (преимущественно для тестов). */
+export function resetTraceLogState(): void {
+  convoSnapshots.clear();
+  ensuredDirs.clear();
+}
+
+async function ensureTraceDir(dir: string): Promise<void> {
+  if (ensuredDirs.has(dir)) return;
+  await fs.promises.mkdir(dir, { recursive: true });
+  ensuredDirs.add(dir);
+}
 
 /** Определяет каталог для trace-логов; в тестовом окружении Vitest отключает запись без явного dir. */
 export function resolveTraceDir(explicitDir?: string): string | null {
@@ -124,6 +168,127 @@ export function sanitizeTracePayload(value: unknown): unknown {
   return out;
 }
 
+function safeJsonStringify(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function setConvoSnapshot(key: string, snap: ConversationTraceSnapshot): void {
+  if (convoSnapshots.has(key)) convoSnapshots.delete(key);
+  convoSnapshots.set(key, snap);
+  while (convoSnapshots.size > MAX_CONVO_SNAPSHOTS) {
+    const oldestKey = convoSnapshots.keys().next().value;
+    if (oldestKey === undefined) break;
+    convoSnapshots.delete(oldestKey);
+  }
+}
+
+/**
+ * Убирает повторное дублирование неизменных инструкций, инструментов и совпавшего префикса
+ * сообщений внутри одного файла и диалога, заменяя их наглядными ссылками на запрос-источник.
+ * Не мутирует исходный объект запроса.
+ */
+function compactAndSanitizeRequestPayload(
+  payload: unknown,
+  filePath: string,
+  conversationKey: string,
+  requestId: string,
+  shouldSanitize: boolean,
+): unknown {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return shouldSanitize ? sanitizeTracePayload(payload) : payload;
+  }
+
+  const rawPayload = payload as Record<string, unknown>;
+  const targetObj =
+    rawPayload.request && typeof rawPayload.request === 'object' && !Array.isArray(rawPayload.request)
+      ? (rawPayload.request as Record<string, unknown>)
+      : rawPayload;
+  const isWrapped = targetObj !== rawPayload;
+
+  const snapKey = `${filePath}::${conversationKey}`;
+  const prev = convoSnapshots.get(snapKey);
+  const nextSnap: ConversationTraceSnapshot = { requestId };
+  const compactedTarget: Record<string, unknown> = {};
+
+  for (const [key, val] of Object.entries(targetObj)) {
+    if (key === 'tools' && Array.isArray(val)) {
+      const toolsRaw = safeJsonStringify(val);
+      if (toolsRaw !== undefined) {
+        if (prev?.toolsRaw === toolsRaw && prev.toolsAnchorId) {
+          nextSnap.toolsRaw = toolsRaw;
+          nextSnap.toolsAnchorId = prev.toolsAnchorId;
+          compactedTarget[key] = `[без изменений — как в req ${prev.toolsAnchorId} (${val.length} шт.)]`;
+          continue;
+        }
+        nextSnap.toolsRaw = toolsRaw;
+        nextSnap.toolsAnchorId = requestId;
+      }
+      compactedTarget[key] = shouldSanitize ? sanitizeTracePayload(val) : val;
+      continue;
+    }
+
+    if ((key === 'system' || key === 'systemInstruction') && val !== undefined) {
+      const sysRaw = safeJsonStringify(val);
+      if (sysRaw !== undefined) {
+        if (prev?.systemRaw === sysRaw && prev.systemAnchorId) {
+          nextSnap.systemRaw = sysRaw;
+          nextSnap.systemAnchorId = prev.systemAnchorId;
+          compactedTarget[key] = `[без изменений — как в req ${prev.systemAnchorId} (${sysRaw.length} симв.)]`;
+          continue;
+        }
+        nextSnap.systemRaw = sysRaw;
+        nextSnap.systemAnchorId = requestId;
+      }
+      compactedTarget[key] = shouldSanitize ? sanitizeTracePayload(val) : val;
+      continue;
+    }
+
+    if ((key === 'messages' || key === 'contents') && Array.isArray(val)) {
+      const itemLabel = key === 'contents' ? 'элемент(ов)' : 'сообщ.';
+      const itemsRaw = val.map((item) => safeJsonStringify(item) ?? '');
+      nextSnap.itemsRaw = itemsRaw;
+      nextSnap.itemsAnchorId = requestId;
+
+      let prefixLen = 0;
+      if (prev?.itemsRaw && prev.itemsAnchorId) {
+        const limit = Math.min(prev.itemsRaw.length, itemsRaw.length);
+        while (prefixLen < limit && prev.itemsRaw[prefixLen] && prev.itemsRaw[prefixLen] === itemsRaw[prefixLen]) {
+          prefixLen += 1;
+        }
+      }
+
+      if (prefixLen >= 1 && prev?.itemsAnchorId) {
+        const tail = val.slice(prefixLen);
+        const sanitizedTail = shouldSanitize ? (sanitizeTracePayload(tail) as unknown[]) : tail;
+        compactedTarget[key] = [
+          { _reusedPrefix: `первые ${prefixLen} ${itemLabel} без изменений — см. req ${prev.itemsAnchorId}` },
+          ...sanitizedTail,
+        ];
+      } else {
+        compactedTarget[key] = shouldSanitize ? sanitizeTracePayload(val) : val;
+      }
+      continue;
+    }
+
+    compactedTarget[key] = shouldSanitize ? sanitizeTracePayload(val) : val;
+  }
+
+  setConvoSnapshot(snapKey, nextSnap);
+
+  if (!isWrapped) return compactedTarget;
+
+  const compactedEnvelope: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rawPayload)) {
+    if (k === 'request') compactedEnvelope[k] = compactedTarget;
+    else compactedEnvelope[k] = shouldSanitize ? sanitizeTracePayload(v) : v;
+  }
+  return compactedEnvelope;
+}
+
 export function formatTraceDate(now = Date.now()): string {
   const d = new Date(now);
   const year = d.getFullYear();
@@ -136,7 +301,48 @@ export function getTraceFilePath(dir: string, now = Date.now()): string {
   return path.join(dir, `trace-${formatTraceDate(now)}.jsonl`);
 }
 
-/** Удаляет устаревшие trace-*.jsonl старше retentionMs (по умолчанию 24 ч), не трогая сегодняшний файл. */
+/** Сжимает завершённый файл трассировки в `.jsonl.zst` потоково с длинным окном и сохранением `mtime`. */
+export async function compressTraceFileToZstd(filePath: string): Promise<string | null> {
+  const zstdFactory = (zlib as unknown as {
+    createZstdCompress?: (options?: Record<string, unknown>) => NodeJS.ReadWriteStream;
+  }).createZstdCompress;
+  if (typeof zstdFactory !== 'function') return null;
+
+  const targetPath = `${filePath}.zst`;
+  const tmpPath = `${targetPath}.tmp`;
+  try {
+    const stat = await fs.promises.stat(filePath);
+    if (!stat.isFile()) return null;
+
+    const zstdConsts = (zlib as unknown as { constants?: Record<string, number> }).constants || {};
+    const params: Record<number, number> = {};
+    if (typeof zstdConsts.ZSTD_c_compressionLevel === 'number') {
+      params[zstdConsts.ZSTD_c_compressionLevel] = 6;
+    }
+    if (typeof zstdConsts.ZSTD_c_windowLog === 'number') {
+      params[zstdConsts.ZSTD_c_windowLog] = 25;
+    }
+
+    const compressor = zstdFactory(Object.keys(params).length > 0 ? { params } : undefined);
+    await pipeline(fs.createReadStream(filePath), compressor, fs.createWriteStream(tmpPath));
+    await fs.promises.utimes(tmpPath, stat.atime, stat.mtime);
+    await fs.promises.rename(tmpPath, targetPath);
+    await fs.promises.unlink(filePath);
+    return targetPath;
+  } catch {
+    try {
+      await fs.promises.unlink(tmpPath);
+    } catch {
+      // Игнорируем ошибку очистки временного файла.
+    }
+    return null;
+  }
+}
+
+/**
+ * Сжимает в zstd завершённые прошлые суточные `trace-*.jsonl` и удаляет файлы старше retentionMs,
+ * не трогая сегодняшний активный файл.
+ */
 export async function cleanupExpiredTraces(options?: TraceWriteOptions): Promise<number> {
   const dir = resolveTraceDir(options?.dir);
   if (!dir) return 0;
@@ -153,9 +359,12 @@ export async function cleanupExpiredTraces(options?: TraceWriteOptions): Promise
       const fullPath = path.join(dir, name);
       try {
         const stat = await fs.promises.stat(fullPath);
-        if (stat.isFile() && now - stat.mtimeMs > retentionMs) {
-          await fs.promises.unlink(fullPath);
+        if (!stat.isFile()) continue;
+        if (now - stat.mtimeMs > retentionMs) {
+          await enqueueTraceTask(() => fs.promises.unlink(fullPath));
           removed += 1;
+        } else if (!name.endsWith('.zst')) {
+          await enqueueTraceTask(() => compressTraceFileToZstd(fullPath));
         }
       } catch {
         // Игнорируем гонку удаления или временную блокировку файла.
@@ -168,7 +377,7 @@ export async function cleanupExpiredTraces(options?: TraceWriteOptions): Promise
   return removed;
 }
 
-/** Запускает периодическую фоновую очистку trace-логов (раз в час, не удерживает процесс). */
+/** Запускает периодическую фоновую очистку и сжатие trace-логов (раз в час, не удерживает процесс). */
 export function startTraceCleanup(options?: TraceWriteOptions): void {
   if (cleanupTimer) return;
   lastCleanupAt = Date.now();
@@ -189,14 +398,35 @@ export function stopTraceCleanup(): void {
   }
 }
 
-/** Асинхронно дописывает событие трассировки в суточный JSONL-файл и при необходимости запускает ротационную очистку. */
+/** Асинхронно и последовательно дописывает событие трассировки в суточный JSONL-файл. */
 export function writeTraceEvent(event: Record<string, unknown>, options?: TraceWriteOptions): void {
   const dir = resolveTraceDir(options?.dir);
   if (!dir) return;
 
   const now = options?.now ?? Date.now();
   const filePath = getTraceFilePath(dir, now);
-  const record = { ts: new Date(now).toISOString(), ...event };
+  let record: Record<string, unknown> = { ts: new Date(now).toISOString(), ...event };
+
+  if (
+    record.phase === 'request' &&
+    'payload' in record &&
+    typeof record.conversationKey === 'string' &&
+    typeof record.requestId === 'string'
+  ) {
+    record = {
+      ...record,
+      payload: compactAndSanitizeRequestPayload(
+        record.payload,
+        filePath,
+        record.conversationKey,
+        record.requestId,
+        options?.sanitizePayload !== false,
+      ),
+    };
+  } else if (options?.sanitizePayload && 'payload' in record) {
+    record = { ...record, payload: sanitizeTracePayload(record.payload) };
+  }
+
   let line: string;
   try {
     line = JSON.stringify(record) + '\n';
@@ -209,10 +439,8 @@ export function writeTraceEvent(event: Record<string, unknown>, options?: TraceW
     void cleanupExpiredTraces({ dir, now, retentionMs: options?.retentionMs });
   }
 
-  void fs.promises
-    .mkdir(dir, { recursive: true })
-    .then(() => fs.promises.appendFile(filePath, line, 'utf8'))
-    .catch(() => {
-      // Логирование не должно нарушать обработку запросов прокси.
-    });
+  void enqueueTraceTask(async () => {
+    await ensureTraceDir(dir);
+    await fs.promises.appendFile(filePath, line, 'utf8');
+  });
 }

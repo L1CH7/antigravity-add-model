@@ -10,10 +10,9 @@ import { CircuitBreaker } from './circuitBreaker';
 import { applyRequestOptions, GeminiBody, parseRetryAfter, trimContext } from './requestOptions';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from './modelUtils';
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
-import { collectToolSchemas } from './translators/utils';
+import { collectToolSchemas, type ToolSchemas } from './translators/utils';
 import {
   sanitizeTraceHeaders,
-  sanitizeTracePayload,
   startTraceCleanup,
   stopTraceCleanup,
   writeTraceEvent,
@@ -98,6 +97,31 @@ function recordTraceCandidate(candidate: unknown, acc: ResponseTraceAcc): void {
       });
     }
   }
+}
+
+function findEmptyRequiredToolCall(
+  candidates: unknown[],
+  toolSchemas?: ToolSchemas,
+): { name: string; missing: string[] } | null {
+  if (!toolSchemas || toolSchemas.size === 0) return null;
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const parts = (candidate as { content?: { parts?: Array<{ functionCall?: { name?: string; args?: unknown } }> } }).content?.parts;
+    for (const part of parts || []) {
+      const fnName = part.functionCall?.name;
+      if (!fnName) continue;
+      const schema = toolSchemas.get(fnName) as { required?: unknown } | undefined;
+      const req = Array.isArray(schema?.required)
+        ? (schema.required as unknown[]).filter((k): k is string => typeof k === 'string')
+        : [];
+      if (req.length === 0) continue;
+      const args = part.functionCall?.args;
+      if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).length === 0) {
+        return { name: fnName, missing: req };
+      }
+    }
+  }
+  return null;
 }
 
 function snapshotBufferedContext(streamKey: string): Record<string, unknown> | null {
@@ -518,7 +542,7 @@ export async function runCustomModelRequest(
             tracePayloadObj = envelopePayload;
             bodyBuffer = Buffer.from(JSON.stringify(envelopePayload), 'utf8');
           }
-          writeTraceEvent({
+          const traceRequestEvent = {
             phase: 'request',
             requestId,
             conversationKey,
@@ -531,8 +555,9 @@ export async function runCustomModelRequest(
             stream: isStream,
             url: url.toString(),
             headers: sanitizeTraceHeaders(headers),
-            payload: sanitizeTracePayload(tracePayloadObj),
-          });
+            payload: tracePayloadObj,
+          };
+          setImmediate(() => writeTraceEvent(traceRequestEvent));
           counts.upstreamAttempts += 1;
           const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
             request = (url.protocol === 'https:' ? https : http).request(
@@ -738,6 +763,20 @@ export async function runCustomModelRequest(
                 finishReason?: string;
               } | null;
               if (mapped) {
+                const emptyReqTool = findEmptyRequiredToolCall([mapped], toolSchemas);
+                if (emptyReqTool) {
+                  log.warn(
+                    `[Proxy] Upstream "${model.displayName}" returned empty arguments "{}" for tool "${emptyReqTool.name}" (required: ${emptyReqTool.missing.join(', ')})`,
+                  );
+                  if (!res.headersSent && attempt < retries) {
+                    upstreamOutput = false;
+                    throw new UpstreamError(
+                      `Upstream returned empty arguments for tool "${emptyReqTool.name}".`,
+                      502,
+                      true,
+                    );
+                  }
+                }
                 const isTerminalFinish = Boolean(
                   mapped.finishReason &&
                     mapped.finishReason !== 'OTHER' &&
@@ -816,6 +855,20 @@ export async function runCustomModelRequest(
               if (remainder) {
                 for (const part of remainder.content?.parts || []) {
                   if (part.functionCall) validateToolArguments(part.functionCall.args);
+                }
+                const emptyReqTool = findEmptyRequiredToolCall([remainder], toolSchemas);
+                if (emptyReqTool) {
+                  log.warn(
+                    `[Proxy] Upstream "${model.displayName}" returned empty arguments "{}" for tool "${emptyReqTool.name}" (required: ${emptyReqTool.missing.join(', ')})`,
+                  );
+                  if (!res.headersSent && attempt < retries) {
+                    upstreamOutput = false;
+                    throw new UpstreamError(
+                      `Upstream returned empty arguments for tool "${emptyReqTool.name}".`,
+                      502,
+                      true,
+                    );
+                  }
                 }
                 recoveredRemainder = true;
                 emitted = true;
@@ -941,6 +994,20 @@ export async function runCustomModelRequest(
               usageMetadata?: unknown;
             };
             if (!mapped?.candidates?.length) throw new UpstreamError('Upstream returned no candidates.');
+            const emptyReqTool = findEmptyRequiredToolCall(mapped.candidates, toolSchemas);
+            if (emptyReqTool) {
+              log.warn(
+                `[Proxy] Upstream "${model.displayName}" returned empty arguments "{}" for tool "${emptyReqTool.name}" (required: ${emptyReqTool.missing.join(', ')})`,
+              );
+              if (!res.headersSent && attempt < retries) {
+                upstreamOutput = false;
+                throw new UpstreamError(
+                  `Upstream returned empty arguments for tool "${emptyReqTool.name}".`,
+                  502,
+                  true,
+                );
+              }
+            }
             for (const candidate of mapped.candidates) recordTraceCandidate(candidate, traceAcc);
             const respDurationMs = Date.now() - attemptStart;
             const toolSummary = traceAcc.tools.map((t) => `${t.name}(${t.argsBytes}b)`);

@@ -1,11 +1,15 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   cleanupExpiredTraces,
+  compressTraceFileToZstd,
+  flushTraceWrites,
   formatTraceDate,
   maskSecretValue,
+  resetTraceLogState,
   sanitizeTraceHeaders,
   sanitizeTracePayload,
   TRACE_RETENTION_MS,
@@ -14,7 +18,9 @@ import {
 
 const createdDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await flushTraceWrites();
+  resetTraceLogState();
   for (const dir of createdDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -73,26 +79,103 @@ describe('traceLog', () => {
     expect(sanitized.smallDataUrl).toBe('data:image/png;base64,QUJDRA==');
   });
 
-  it('writes daily JSONL trace file and cleans up files older than 24h while keeping today and recent files', async () => {
+  it('serializes concurrent large writes without interleaving JSONL lines', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-trace-race-'));
+    createdDirs.push(dir);
+    const now = new Date('2026-11-18T01:10:00Z').getTime();
+
+    const bigText = 'x'.repeat(200_000);
+    for (let i = 0; i < 8; i++) {
+      writeTraceEvent(
+        {
+          phase: 'request',
+          requestId: `req-${i}`,
+          conversationKey: `conv-${i}`,
+          payload: { messages: [{ role: 'user', content: `${i}:${bigText}` }] },
+        },
+        { dir, now },
+      );
+    }
+    await flushTraceWrites();
+
+    const todayPath = path.join(dir, `trace-${formatTraceDate(now)}.jsonl`);
+    const lines = fs.readFileSync(todayPath, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(8);
+    lines.forEach((line, idx) => {
+      const parsed = JSON.parse(line);
+      expect(parsed.requestId).toBe(`req-${idx}`);
+    });
+  });
+
+  it('compacts unchanged tools, system instructions, and message prefix in human-readable form without hashes', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-trace-delta-'));
+    createdDirs.push(dir);
+    const now = new Date('2026-11-18T01:20:00Z').getTime();
+
+    const tools = [
+      { type: 'function', function: { name: 'run_command', parameters: { type: 'object', required: ['CommandLine'] } } },
+    ];
+    const systemMsg = { role: 'system', content: 'Большая системная инструкция '.repeat(200) };
+    const user1 = { role: 'user', content: 'Первый вопрос' };
+    const assistant1 = { role: 'assistant', content: 'Первый ответ' };
+    const user2 = { role: 'user', content: 'Второй вопрос' };
+
+    writeTraceEvent(
+      {
+        phase: 'request',
+        requestId: 'req-1',
+        conversationKey: 'conv-alpha',
+        payload: { model: 'gpt-6.1-sol', system: 'Sys', tools, messages: [systemMsg, user1] },
+      },
+      { dir, now },
+    );
+    writeTraceEvent(
+      {
+        phase: 'request',
+        requestId: 'req-2',
+        conversationKey: 'conv-alpha',
+        payload: { model: 'gpt-6.1-sol', system: 'Sys', tools, messages: [systemMsg, user1, assistant1, user2] },
+      },
+      { dir, now: now + 1000 },
+    );
+    await flushTraceWrites();
+
+    const todayPath = path.join(dir, `trace-${formatTraceDate(now)}.jsonl`);
+    const [first, second] = fs
+      .readFileSync(todayPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+
+    expect(first.payload.tools).toEqual(tools);
+    expect(first.payload.messages).toHaveLength(2);
+
+    expect(second.payload.tools).toBe('[без изменений — как в req req-1 (1 шт.)]');
+    expect(second.payload.system).toBe('[без изменений — как в req req-1 (5 симв.)]');
+    expect(second.payload.messages).toEqual([
+      { _reusedPrefix: 'первые 2 сообщ. без изменений — см. req req-1' },
+      assistant1,
+      user2,
+    ]);
+  });
+
+  it('compresses past daily trace files with zstd and cleans up expired .jsonl and .jsonl.zst files', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-trace-test-'));
     createdDirs.push(dir);
-    const now = new Date('2026-11-17T20:00:00Z').getTime();
+    const now = new Date('2026-11-18T10:00:00Z').getTime();
 
     writeTraceEvent({ phase: 'request', model: 'gpt-6.1-sol', text: 'hello' }, { dir, now });
-    await new Promise((r) => setTimeout(r, 40));
+    await flushTraceWrites();
 
-    const todayName = `trace-${formatTraceDate(now)}.jsonl`;
-    const todayPath = path.join(dir, todayName);
+    const todayPath = path.join(dir, `trace-${formatTraceDate(now)}.jsonl`);
     expect(fs.existsSync(todayPath)).toBe(true);
-    const lines = fs.readFileSync(todayPath, 'utf8').trim().split('\n');
-    expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0]).model).toBe('gpt-6.1-sol');
 
-    const stalePath = path.join(dir, `trace-${formatTraceDate(now - 2 * TRACE_RETENTION_MS)}.jsonl`);
+    const stalePath = path.join(dir, `trace-${formatTraceDate(now - 2 * TRACE_RETENTION_MS)}.jsonl.zst`);
     const freshYesterdayPath = path.join(dir, `trace-${formatTraceDate(now - TRACE_RETENTION_MS + 3_600_000)}.jsonl`);
     const unrelatedPath = path.join(dir, 'notes.txt');
-    fs.writeFileSync(stalePath, '{"stale":true}\n');
-    fs.writeFileSync(freshYesterdayPath, '{"fresh":true}\n');
+    fs.writeFileSync(stalePath, 'stale-zst');
+    const freshBody = '{"fresh":true}\n'.repeat(20);
+    fs.writeFileSync(freshYesterdayPath, freshBody);
     fs.writeFileSync(unrelatedPath, 'keep');
 
     const staleTime = new Date(now - TRACE_RETENTION_MS - 60_000);
@@ -101,10 +184,24 @@ describe('traceLog', () => {
     fs.utimesSync(freshYesterdayPath, recentTime, recentTime);
 
     const removed = await cleanupExpiredTraces({ dir, now });
+    await flushTraceWrites();
+
     expect(removed).toBe(1);
     expect(fs.existsSync(stalePath)).toBe(false);
-    expect(fs.existsSync(freshYesterdayPath)).toBe(true);
     expect(fs.existsSync(todayPath)).toBe(true);
     expect(fs.existsSync(unrelatedPath)).toBe(true);
+
+    const zstdCompressSupported = typeof (zlib as unknown as { createZstdCompress?: unknown }).createZstdCompress === 'function';
+    if (zstdCompressSupported) {
+      expect(fs.existsSync(freshYesterdayPath)).toBe(false);
+      const zstPath = `${freshYesterdayPath}.zst`;
+      expect(fs.existsSync(zstPath)).toBe(true);
+      const decompressed = (zlib as unknown as { zstdDecompressSync: (buf: Buffer) => Buffer })
+        .zstdDecompressSync(fs.readFileSync(zstPath))
+        .toString('utf8');
+      expect(decompressed).toBe(freshBody);
+    } else {
+      expect(await compressTraceFileToZstd(freshYesterdayPath)).toBeNull();
+    }
   });
 });
